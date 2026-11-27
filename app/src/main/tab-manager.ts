@@ -129,6 +129,9 @@ interface ManagedTab {
   devtoolsTarget: ViewportRole;
   audioSource: ViewportRole | 'muted';
   navSuppressUntil: { portrait: number; landscape: number };
+  navSuppressUrl: { portrait: string | null; landscape: string | null };
+  spaSyncChain: { count: number; lastTs: number };
+  spaSyncInFlight: { portrait: boolean; landscape: boolean };
   launchConvergence: LaunchRedirectConvergence | null;
   lastActiveAt: number;
   skipNextRestoreHistoryCommit: boolean;
@@ -234,6 +237,7 @@ export class TabManager implements MirrorViewportLookup {
     }
   >();
   private readonly pendingReloads = new Map<string, Promise<void>>();
+  private readonly pendingInPageSyncTimers = new Map<string, ReturnType<typeof setTimeout>>();
   private readonly beforeReloadHooks = new Set<(tabId: string) => void>();
   private readonly observedViewports = new Map<
     number,
@@ -509,6 +513,23 @@ export class TabManager implements MirrorViewportLookup {
     } catch {
       // Ignore partition cleanup errors on shutdown.
     }
+  }
+
+  private clearInPageSyncTimer(tabId: string): void {
+    const t = this.pendingInPageSyncTimers.get(tabId);
+    if (t) {
+      clearTimeout(t);
+      this.pendingInPageSyncTimers.delete(tabId);
+    }
+  }
+
+  private setInPageSyncTimer(tabId: string, timer: ReturnType<typeof setTimeout>): void {
+    this.clearInPageSyncTimer(tabId);
+    this.pendingInPageSyncTimers.set(tabId, timer);
+  }
+
+  private resetSpaSyncChain(tab: ManagedTab): void {
+    tab.spaSyncChain = { count: 0, lastTs: 0 };
   }
 
   private ensureSessionDownloadHandler(sess: Session | undefined | null): void {
@@ -805,6 +826,9 @@ export class TabManager implements MirrorViewportLookup {
       const visibleNow = role === 'landscape' ? isTabActive : isTabActive && tab.mode === 'dual';
       if (!wc.isDestroyed()) {
         wc.setBackgroundThrottling(!visibleNow);
+        if (!this.wcLoadStates.get(wc.id)?.primingAboutBlank && !wc.isLoading()) {
+          tab.navSuppressUrl[role] = wc.getURL();
+        }
       }
       void this.applyViewportEmulation(tab, role);
       this.emitState(false);
@@ -838,6 +862,9 @@ export class TabManager implements MirrorViewportLookup {
       this.emitState();
 
       if (tab.mode !== 'dual' || !tab.mirror) return;
+      if (isInPage && tab.spaSyncInFlight[role]) {
+        return;
+      }
       const now = Date.now();
       const isHttpNav = navUrl.startsWith('http://') || navUrl.startsWith('https://');
 
@@ -856,6 +883,7 @@ export class TabManager implements MirrorViewportLookup {
               const pView = tab.portraitView;
               if (pView && !pView.webContents.isDestroyed() && pView.webContents.getURL() !== navUrl) {
                 tab.navSuppressUntil.portrait = now + NAV_MIRROR_SUPPRESS_MS;
+                tab.navSuppressUrl.portrait = navUrl;
                 this.tabEventBus.publish({
                   tabId: tab.id,
                   viewport: 'portrait',
@@ -874,6 +902,7 @@ export class TabManager implements MirrorViewportLookup {
           ) {
             lc.converged = true;
             tab.navSuppressUntil.portrait = now + NAV_MIRROR_SUPPRESS_MS;
+            tab.navSuppressUrl.portrait = lc.landscapeFinalUrl;
             this.tabEventBus.publish({
               tabId: tab.id,
               viewport: 'portrait',
@@ -884,23 +913,171 @@ export class TabManager implements MirrorViewportLookup {
             this.loadViewportUrl(wc, lc.landscapeFinalUrl);
           }
         }
-        return;
+        const shouldSuppress =
+          !isInPage ||
+          tab.navSuppressUrl[role] === null ||
+          tab.navSuppressUrl[role] === navUrl ||
+          this.wcLoadStates.has(wc.id);
+        if (shouldSuppress) {
+          return;
+        }
       }
 
       const pairedRole: ViewportRole = role === 'portrait' ? 'landscape' : 'portrait';
       const pairedView = pairedRole === 'portrait' ? tab.portraitView : tab.landscapeView;
       if (!pairedView || pairedView.webContents.isDestroyed()) return;
-      if (pairedView.webContents.getURL() === navUrl) return;
+      if (pairedView.webContents.getURL() === navUrl) {
+        this.clearInPageSyncTimer(tab.id);
+        return;
+      }
 
       // Only mirror http/https navigations across viewports.
       if (!isHttpNav) return;
 
-      tab.navSuppressUntil[pairedRole] = now + NAV_MIRROR_SUPPRESS_MS;
-      this.loadViewportUrl(pairedView.webContents, navUrl);
+      if (!isInPage) {
+        this.clearInPageSyncTimer(tab.id);
+        tab.navSuppressUntil[pairedRole] = now + NAV_MIRROR_SUPPRESS_MS;
+        tab.navSuppressUrl[pairedRole] = navUrl;
+        this.loadViewportUrl(pairedView.webContents, navUrl);
+        return;
+      }
+
+      // In-page SPA pushState/replaceState: allow 260ms for mirrored click or chained router
+      // redirects to settle, then transition the paired SPA in-page (supporting both delegated
+      // anchor routers like SvelteKit and popstate routers like React/Next/Vue) without reload.
+      this.clearInPageSyncTimer(tab.id);
+      if (now - tab.spaSyncChain.lastTs > 1500) {
+        tab.spaSyncChain = { count: 0, lastTs: 0 };
+      }
+      if (tab.spaSyncChain.count >= 2) {
+        return;
+      }
+
+      const timer = setTimeout(() => {
+        if (this.pendingInPageSyncTimers.get(tab.id) === timer) {
+          this.pendingInPageSyncTimers.delete(tab.id);
+        }
+        if (this.disposed || wc.isDestroyed()) return;
+        const freshTab = this.getTab(tabId);
+        if (
+          !freshTab ||
+          freshTab.sleeping ||
+          freshTab.mode !== 'dual' ||
+          !freshTab.mirror ||
+          this.pendingReloads.has(tabId)
+        ) {
+          return;
+        }
+        const nowTimer = Date.now();
+        if (nowTimer - freshTab.spaSyncChain.lastTs > 1500) {
+          freshTab.spaSyncChain = { count: 0, lastTs: 0 };
+        }
+        if (freshTab.spaSyncChain.count >= 2) {
+          return;
+        }
+        const targetUrl = wc.getURL();
+        if (!targetUrl.startsWith('http://') && !targetUrl.startsWith('https://')) return;
+        const targetView =
+          pairedRole === 'portrait' ? freshTab.portraitView : freshTab.landscapeView;
+        if (!targetView || targetView.webContents.isDestroyed()) return;
+        const targetWc = targetView.webContents;
+        if (targetWc.getURL() === targetUrl) return;
+
+        freshTab.spaSyncChain = { count: freshTab.spaSyncChain.count + 1, lastTs: nowTimer };
+        freshTab.navSuppressUntil[pairedRole] = nowTimer + NAV_MIRROR_SUPPRESS_MS;
+        freshTab.navSuppressUrl[pairedRole] = targetUrl;
+        this.tabEventBus.publish({
+          tabId: freshTab.id,
+          viewport: pairedRole,
+          domain: 'navigation',
+          kind: 'spa_sync',
+          summary: targetUrl,
+        });
+
+        const targetOrigin = parseHttpOrigin(targetUrl);
+        const curOrigin = this.getOrigin(targetWc);
+        if (
+          targetOrigin &&
+          curOrigin &&
+          targetOrigin === curOrigin &&
+          typeof targetWc.executeJavaScript === 'function'
+        ) {
+          void (async () => {
+            const guard = this.mirrorRelay.getGuard(freshTab.id);
+            guard.beginReplaying(pairedRole);
+            freshTab.spaSyncInFlight[pairedRole] = true;
+            let transitioned = false;
+            try {
+              const encodedUrl = JSON.stringify(targetUrl);
+              transitioned = Boolean(
+                await targetWc.executeJavaScript(
+                  `(async () => {
+                    const u = ${encodedUrl};
+                    if (location.href === u) return true;
+                    if (!document.body) return false;
+                    const a = document.createElement('a');
+                    a.href = u;
+                    a.style.display = 'none';
+                    document.body.appendChild(a);
+                    let delegatedHandled = false;
+                    const onWinClick = (ev) => {
+                      if (ev.defaultPrevented) {
+                        delegatedHandled = true;
+                      } else {
+                        ev.preventDefault();
+                      }
+                    };
+                    window.addEventListener('click', onWinClick, { once: true });
+                    try {
+                      a.click();
+                    } finally {
+                      window.removeEventListener('click', onWinClick);
+                      a.remove();
+                    }
+                    if (!delegatedHandled && location.href !== u) {
+                      history.pushState(history.state, '', u);
+                      window.dispatchEvent(new PopStateEvent('popstate', { state: history.state }));
+                    }
+                    await new Promise((r) => setTimeout(r, 0));
+                    return true;
+                  })()`,
+                  true,
+                ),
+              );
+              await new Promise<void>((r) => setImmediate(r));
+            } catch {
+              transitioned = false;
+            } finally {
+              freshTab.spaSyncInFlight[pairedRole] = false;
+              guard.endReplaying(pairedRole);
+            }
+
+            if (
+              !transitioned &&
+              !this.disposed &&
+              !targetWc.isDestroyed() &&
+              !wc.isDestroyed() &&
+              wc.getURL() === targetUrl &&
+              !this.pendingReloads.has(tabId) &&
+              !this.pendingInPageSyncTimers.has(tabId)
+            ) {
+              this.loadViewportUrl(targetWc, targetUrl);
+            }
+          })();
+          return;
+        }
+
+        this.loadViewportUrl(targetWc, targetUrl);
+      }, 260);
+      timer.unref?.();
+      this.setInPageSyncTimer(tab.id, timer);
     };
 
     wc.on('did-navigate', (_ev, navUrl) => handleNavSync(navUrl, false));
-    wc.on('did-navigate-in-page', (_ev, navUrl) => handleNavSync(navUrl, true));
+    wc.on('did-navigate-in-page', (_ev, navUrl, isMainFrame) => {
+      if (isMainFrame === false) return;
+      handleNavSync(navUrl, true);
+    });
 
     this.telemetry.attachViewportCollectors(tabId, role, wc);
     return view;
@@ -1160,6 +1337,10 @@ export class TabManager implements MirrorViewportLookup {
   }
 
   onGesture(tabId: string, role: ViewportRole, action: string): void {
+    const tab = this.getTab(tabId);
+    if (tab) {
+      this.resetSpaSyncChain(tab);
+    }
     this.tabEventBus.beginGesture(tabId, role, action);
   }
 
@@ -1326,11 +1507,15 @@ export class TabManager implements MirrorViewportLookup {
         if (settled) return;
         settled = true;
         entry.superseded = superseded;
-        if (this.wcLoadStates.get(wc.id) === entry) {
+        const wasCurrent = this.wcLoadStates.get(wc.id) === entry;
+        if (wasCurrent) {
           this.wcLoadStates.delete(wc.id);
         }
         cleanup();
         resolveFn(ok);
+        if (wasCurrent && !superseded && !this.disposed) {
+          this.emitState(false);
+        }
       },
     };
 
@@ -1507,11 +1692,13 @@ export class TabManager implements MirrorViewportLookup {
     if (!tab.landscapeView || tab.landscapeView.webContents.isDestroyed()) {
       tab.landscapeView = this.createViewportView(tab.id, 'landscape', tab.session);
       tab.navSuppressUntil.landscape = now + NAV_MIRROR_SUPPRESS_MS;
+      tab.navSuppressUrl.landscape = targetUrl;
       this.loadViewportUrl(tab.landscapeView.webContents, targetUrl, launchEpoch);
     }
     if (tab.mode === 'dual' && (!tab.portraitView || tab.portraitView.webContents.isDestroyed())) {
       tab.portraitView = this.createViewportView(tab.id, 'portrait', tab.session);
       tab.navSuppressUntil.portrait = now + NAV_MIRROR_SUPPRESS_MS;
+      tab.navSuppressUrl.portrait = targetUrl;
       this.loadViewportUrl(tab.portraitView.webContents, targetUrl, launchEpoch);
     }
   }
@@ -1737,6 +1924,7 @@ export class TabManager implements MirrorViewportLookup {
       if (this.isTabAudible(tab)) continue;
       if (nowMs - tab.lastActiveAt >= idleMs) {
         tab.sleeping = true;
+        this.clearInPageSyncTimer(tab.id);
         this.destroyTabViews(tab);
         this.mirrorRelay.clearTab(tab.id);
         this.requestDedup.clearTabSlots(tab.id);
@@ -1835,6 +2023,12 @@ export class TabManager implements MirrorViewportLookup {
         portrait: now + NAV_MIRROR_SUPPRESS_MS,
         landscape: now + NAV_MIRROR_SUPPRESS_MS,
       },
+      navSuppressUrl: {
+        portrait: url,
+        landscape: url,
+      },
+      spaSyncChain: { count: 0, lastTs: 0 },
+      spaSyncInFlight: { portrait: false, landscape: false },
       launchConvergence: null,
       lastActiveAt: now,
       skipNextRestoreHistoryCommit: opts.recordHistory === false,
@@ -1890,6 +2084,7 @@ export class TabManager implements MirrorViewportLookup {
           this.closedTabs.length = MAX_CLOSED_TABS;
         }
       }
+      this.clearInPageSyncTimer(tab.id);
       this.destroyTabViews(tab);
       if (tab.session === 'isolated') {
         this.clearIsolatedPartition(tab.id);
@@ -1957,6 +2152,7 @@ export class TabManager implements MirrorViewportLookup {
     if (!tab) return this.getShellState();
     tab.sleeping = !tab.sleeping;
     if (tab.sleeping) {
+      this.clearInPageSyncTimer(tab.id);
       this.destroyTabViews(tab);
       this.mirrorRelay.clearTab(tab.id);
       this.requestDedup.clearTabSlots(tab.id);
@@ -1999,6 +2195,8 @@ export class TabManager implements MirrorViewportLookup {
     }
 
     const now = Date.now();
+    this.clearInPageSyncTimer(tab.id);
+    this.resetSpaSyncChain(tab);
     const isHttpTarget = url.startsWith('http://') || url.startsWith('https://');
     this.tabEventBus.publish({
       tabId: tab.id,
@@ -2010,6 +2208,8 @@ export class TabManager implements MirrorViewportLookup {
     });
     tab.navSuppressUntil.landscape = now + NAV_MIRROR_SUPPRESS_MS;
     tab.navSuppressUntil.portrait = now + NAV_MIRROR_SUPPRESS_MS;
+    tab.navSuppressUrl.landscape = url;
+    tab.navSuppressUrl.portrait = url;
 
     if (!tab.landscapeView || tab.landscapeView.webContents.isDestroyed()) {
       this.materializeTabViews(tab, url);
@@ -2041,6 +2241,8 @@ export class TabManager implements MirrorViewportLookup {
   goBack(): void {
     const tab = this.getActiveTab();
     if (!tab) return;
+    this.clearInPageSyncTimer(tab.id);
+    this.resetSpaSyncChain(tab);
     tab.skipNextRestoreHistoryCommit = false;
     tab.launchConvergence = null;
     tab.lastActiveAt = Date.now();
@@ -2049,6 +2251,7 @@ export class TabManager implements MirrorViewportLookup {
     if (tab.landscapeView.webContents.navigationHistory.canGoBack()) {
       tab.titleUrl = '';
       tab.navSuppressUntil.landscape = now + NAV_MIRROR_SUPPRESS_MS;
+      tab.navSuppressUrl.landscape = null;
       tab.landscapeView.webContents.navigationHistory.goBack();
     }
     if (
@@ -2059,6 +2262,7 @@ export class TabManager implements MirrorViewportLookup {
       tab.portraitView.webContents.navigationHistory.canGoBack()
     ) {
       tab.navSuppressUntil.portrait = now + NAV_MIRROR_SUPPRESS_MS;
+      tab.navSuppressUrl.portrait = null;
       tab.portraitView.webContents.navigationHistory.goBack();
     }
   }
@@ -2066,6 +2270,8 @@ export class TabManager implements MirrorViewportLookup {
   goForward(): void {
     const tab = this.getActiveTab();
     if (!tab) return;
+    this.clearInPageSyncTimer(tab.id);
+    this.resetSpaSyncChain(tab);
     tab.skipNextRestoreHistoryCommit = false;
     tab.launchConvergence = null;
     tab.lastActiveAt = Date.now();
@@ -2074,6 +2280,7 @@ export class TabManager implements MirrorViewportLookup {
     if (tab.landscapeView.webContents.navigationHistory.canGoForward()) {
       tab.titleUrl = '';
       tab.navSuppressUntil.landscape = now + NAV_MIRROR_SUPPRESS_MS;
+      tab.navSuppressUrl.landscape = null;
       tab.landscapeView.webContents.navigationHistory.goForward();
     }
     if (
@@ -2084,6 +2291,7 @@ export class TabManager implements MirrorViewportLookup {
       tab.portraitView.webContents.navigationHistory.canGoForward()
     ) {
       tab.navSuppressUntil.portrait = now + NAV_MIRROR_SUPPRESS_MS;
+      tab.navSuppressUrl.portrait = null;
       tab.portraitView.webContents.navigationHistory.goForward();
     }
   }
@@ -2092,6 +2300,8 @@ export class TabManager implements MirrorViewportLookup {
     if (this.disposed || this.win.isDestroyed()) return;
     const tab = this.getActiveTab();
     if (!tab) return;
+    this.clearInPageSyncTimer(tab.id);
+    this.resetSpaSyncChain(tab);
 
     const run = (async () => {
       const wasSleeping = tab.sleeping;
@@ -2137,9 +2347,12 @@ export class TabManager implements MirrorViewportLookup {
       }
 
       const now = Date.now();
+      this.clearInPageSyncTimer(tab.id);
       tab.launchConvergence = null;
       tab.navSuppressUntil.landscape = now + NAV_MIRROR_SUPPRESS_MS;
       tab.navSuppressUntil.portrait = now + NAV_MIRROR_SUPPRESS_MS;
+      tab.navSuppressUrl.landscape = null;
+      tab.navSuppressUrl.portrait = null;
 
       if (!tab.landscapeView || tab.landscapeView.webContents.isDestroyed()) {
         tab.sleeping = false;
@@ -2214,6 +2427,8 @@ export class TabManager implements MirrorViewportLookup {
   toggleDualMode(tabId?: string): ShellState {
     const tab = tabId ? this.getTab(tabId) : this.getActiveTab();
     if (!tab) return this.getShellState();
+    this.clearInPageSyncTimer(tab.id);
+    this.resetSpaSyncChain(tab);
     tab.launchConvergence = null;
 
     if (tab.mode === 'dual') {
@@ -2235,6 +2450,7 @@ export class TabManager implements MirrorViewportLookup {
       if (tab.landscapeView && !tab.landscapeView.webContents.isDestroyed() && !tab.portraitView) {
         tab.portraitView = this.createViewportView(tab.id, 'portrait', tab.session);
         tab.navSuppressUntil.portrait = Date.now() + NAV_MIRROR_SUPPRESS_MS;
+        tab.navSuppressUrl.portrait = tab.url;
         this.loadViewportUrl(tab.portraitView.webContents, tab.url);
       }
     }
@@ -2247,6 +2463,8 @@ export class TabManager implements MirrorViewportLookup {
   toggleMirror(tabId?: string): ShellState {
     const tab = tabId ? this.getTab(tabId) : this.getActiveTab();
     if (!tab) return this.getShellState();
+    this.clearInPageSyncTimer(tab.id);
+    this.resetSpaSyncChain(tab);
     tab.launchConvergence = null;
     tab.mirror = !tab.mirror;
     this.syncTabDedupAndMux(tab);
@@ -2264,6 +2482,8 @@ export class TabManager implements MirrorViewportLookup {
   setSessionMode(mode: SessionMode, tabId?: string): ShellState {
     const tab = tabId ? this.getTab(tabId) : this.getActiveTab();
     if (!tab || tab.session === mode) return this.getShellState();
+    this.clearInPageSyncTimer(tab.id);
+    this.resetSpaSyncChain(tab);
     tab.launchConvergence = null;
     const prevMode = tab.session;
     tab.session = mode;
@@ -2277,6 +2497,7 @@ export class TabManager implements MirrorViewportLookup {
       }
       tab.portraitView = this.createViewportView(tab.id, 'portrait', mode);
       tab.navSuppressUntil.portrait = Date.now() + NAV_MIRROR_SUPPRESS_MS;
+      tab.navSuppressUrl.portrait = tab.url;
       this.loadViewportUrl(tab.portraitView.webContents, tab.url);
       if (wasInspectingPortrait) {
         this.attachedDevToolsWcId = null;
@@ -3272,6 +3493,7 @@ export class TabManager implements MirrorViewportLookup {
 
     const guard = this.mirrorRelay.getGuard(tab.id);
     const outcomes: Record<string, unknown> = {};
+    this.resetSpaSyncChain(tab);
     this.tabEventBus.beginGesture(tab.id, primaryRole, params.action);
 
     await Promise.all(
@@ -4097,8 +4319,9 @@ export class TabManager implements MirrorViewportLookup {
         canGoBack: landscapeWc ? landscapeWc.navigationHistory.canGoBack() : false,
         canGoForward: landscapeWc ? landscapeWc.navigationHistory.canGoForward() : false,
         loading:
-          (landscapeWc ? landscapeWc.isLoading() : false) ||
-          (portraitWc ? portraitWc.isLoading() : false),
+          this.pendingReloads.has(tab.id) ||
+          (landscapeWc ? landscapeWc.isLoading() || this.wcLoadStates.has(landscapeWc.id) : false) ||
+          (portraitWc ? portraitWc.isLoading() || this.wcLoadStates.has(portraitWc.id) : false),
         devtoolsTarget: tab.devtoolsTarget,
         audioSource: tab.audioSource,
         dedupCount: tab.dedupCount,
@@ -4154,6 +4377,10 @@ export class TabManager implements MirrorViewportLookup {
     }
     this.wcLoadStates.clear();
     this.pendingReloads.clear();
+    for (const t of this.pendingInPageSyncTimers.values()) {
+      clearTimeout(t);
+    }
+    this.pendingInPageSyncTimers.clear();
     this.pendingEmulations.clear();
     this.observedViewports.clear();
     this.activeTracesByTab.clear();
@@ -4181,6 +4408,7 @@ export class TabManager implements MirrorViewportLookup {
     this.mirrorRelay.dispose();
     this.tabEventBus.dispose();
     for (const tab of [...this.tabs]) {
+      this.clearInPageSyncTimer(tab.id);
       this.destroyTabViews(tab);
       if (tab.session === 'isolated') {
         this.clearIsolatedPartition(tab.id);

@@ -48,6 +48,11 @@ async function runTabEventBusE2E(): Promise<void> {
       res.end(csvBody);
       return;
     }
+    if (reqUrl.pathname === '/subframe') {
+      res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8', 'Cache-Control': 'no-store' });
+      res.end('<!doctype html><html><body>subframe</body></html>');
+      return;
+    }
 
     res.writeHead(200, {
       'Content-Type': 'text/html; charset=utf-8',
@@ -55,14 +60,45 @@ async function runTabEventBusE2E(): Promise<void> {
     });
     res.end(`<!doctype html>
 <html>
-<head><meta charset="utf-8"><title>Bus E2E Fixture</title></head>
+<head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>Bus E2E Fixture</title></head>
 <body>
   <a id="dl-report" href="/report.csv" download="report.csv" style="display:inline-block;padding:18px 28px;background:#10b981;color:#fff;">Download CSV</a>
+  <iframe id="sub-frame" src="/subframe" style="width:40px;height:20px;border:0;"></iframe>
   <script>
+    window.__bootId = Math.random().toString(36).slice(2);
     window.__ssEvents = [];
     window.addEventListener('storage', (ev) => {
       if (ev.storageArea === window.sessionStorage) {
         window.__ssEvents.push({ key: ev.key, newValue: ev.newValue });
+      }
+    });
+    // Delegated SPA anchor router (like SvelteKit / Next.js on stake.com)
+    document.addEventListener('click', (ev) => {
+      const a = ev.target && ev.target.closest ? ev.target.closest('a') : null;
+      if (!a || a.hasAttribute('download')) return;
+      const u = new URL(a.href, location.href);
+      if (u.origin === location.origin && u.pathname === '/spa-async') {
+        ev.preventDefault();
+        setTimeout(() => {
+          history.pushState({ spa: true }, '', '/spa-async-done');
+        }, 240);
+        return;
+      }
+      if (u.origin === location.origin && u.pathname.startsWith('/spa-')) {
+        ev.preventDefault();
+        history.pushState({ spa: true }, '', u.pathname + u.search + u.hash);
+      }
+    });
+    // Responsive canonicalizing popstate router (adversarial ping-pong fixture for F-21)
+    window.addEventListener('popstate', () => {
+      if (window.innerWidth < 600 && location.pathname === '/responsive-lobby') {
+        history.replaceState({}, '', '/mobile-lobby');
+      } else if (window.innerWidth >= 600 && location.pathname === '/mobile-lobby') {
+        history.replaceState({}, '', '/responsive-lobby');
+      } else if (window.innerWidth < 600 && location.pathname === '/delayed-desktop') {
+        setTimeout(() => history.replaceState({}, '', '/delayed-mobile'), 50);
+      } else if (window.innerWidth >= 600 && location.pathname === '/delayed-mobile') {
+        setTimeout(() => history.replaceState({}, '', '/delayed-desktop'), 50);
       }
     });
   </script>
@@ -199,7 +235,173 @@ async function runTabEventBusE2E(): Promise<void> {
       `expected dedupCount >= 1 after suppressed duplicate download, got ${sharedSnap.dedupCount}`,
     );
 
-    // 4. Isolated session tab MUST NOT inherit or replicate sessionStorage across panes
+    // 4. SPA in-page pushState syncs paired viewport WITHOUT hard reload, and ignores subframe pushState
+    const bootBeforeL = (
+      await session.ctl.evalJs(`window.__bootId`, 'landscape', sharedTabId)
+    ).value;
+    const bootBeforeP = (
+      await session.ctl.evalJs(`window.__bootId`, 'portrait', sharedTabId)
+    ).value;
+
+    // Subframe pushState must NOT alter tab URL or trigger spa_sync
+    await session.ctl.evalJs(
+      `document.getElementById('sub-frame').contentWindow.history.pushState({}, '', '/subframe-pushed'); 'ok'`,
+      'landscape',
+      sharedTabId,
+    );
+    await sleep(350);
+    const pUrlAfterSubframe = (
+      await session.ctl.evalJs(`location.pathname`, 'portrait', sharedTabId)
+    ).value;
+    assert.equal(pUrlAfterSubframe, '/page2', 'subframe pushState must never sync main-frame URL');
+
+    // Chained main-frame SPA pushState + replaceState on landscape converges portrait in-page with ZERO reload
+    await session.ctl.evalJs(
+      `history.pushState({}, '', '/spa-casino'); setTimeout(() => history.replaceState({}, '', '/spa-modal?modal=restricted'), 60); 'ok'`,
+      'landscape',
+      sharedTabId,
+    );
+    const spaConverged = await pollUntil('in-page SPA sync without reload', 4_000, async () => {
+      const p = await session.ctl.evalJs(
+        `JSON.stringify({ href: location.pathname + location.search, boot: window.__bootId })`,
+        'portrait',
+        sharedTabId,
+      );
+      const parsed = JSON.parse(p.value) as { href: string; boot: string };
+      return parsed.href === '/spa-modal?modal=restricted' ? parsed : null;
+    });
+    assert.equal(
+      spaConverged.boot,
+      bootBeforeP,
+      'Portrait SPA sync must transition in-page without reloading document',
+    );
+    const bootAfterL = (
+      await session.ctl.evalJs(`window.__bootId`, 'landscape', sharedTabId)
+    ).value;
+    assert.equal(bootAfterL, bootBeforeL);
+
+    // F-18 regression: popstate-only SPA route (not matching /spa-* delegated click handler) ALSO syncs in-page with ZERO reload!
+    await session.ctl.evalJs(
+      `history.pushState({}, '', '/react-router-view?tab=bets'); 'ok'`,
+      'portrait',
+      sharedTabId,
+    );
+    const popstateConverged = await pollUntil(
+      'popstate-only SPA sync without reload',
+      4_000,
+      async () => {
+        const l = await session.ctl.evalJs(
+          `JSON.stringify({ href: location.pathname + location.search, boot: window.__bootId })`,
+          'landscape',
+          sharedTabId,
+        );
+        const parsed = JSON.parse(l.value) as { href: string; boot: string };
+        return parsed.href === '/react-router-view?tab=bets' ? parsed : null;
+      },
+    );
+    assert.equal(
+      popstateConverged.boot,
+      bootBeforeL,
+      'F-18: popstate-only SPA sync must NOT trigger a cold reload',
+    );
+
+    // F-21a regression: async delegated router (>180ms) completes in-page without premature cold reload
+    await session.ctl.interact({
+      tabId: sharedTabId,
+      action: 'hover',
+      x: 12,
+      y: 12,
+      mirror: false,
+    });
+    await session.ctl.evalJs(
+      `history.pushState({}, '', '/spa-async'); 'ok'`,
+      'landscape',
+      sharedTabId,
+    );
+    const asyncSpaConverged = await pollUntil(
+      'async delegated SPA sync (>180ms) without reload',
+      4_000,
+      async () => {
+        const p = await session.ctl.evalJs(
+          `JSON.stringify({ href: location.pathname, boot: window.__bootId })`,
+          'portrait',
+          sharedTabId,
+        );
+        const parsed = JSON.parse(p.value) as { href: string; boot: string };
+        return parsed.href === '/spa-async-done' ? parsed : null;
+      },
+    );
+    assert.equal(
+      asyncSpaConverged.boot,
+      bootBeforeP,
+      'F-21a: async delegated router must NOT be interrupted by a cold reload',
+    );
+
+    // F-21b regression: responsive canonicalizing router (sync + delayed) never ping-pongs or cold-reloads
+    await session.ctl.interact({
+      tabId: sharedTabId,
+      action: 'hover',
+      x: 14,
+      y: 14,
+      mirror: false,
+    });
+    const spaEventsBeforeSyncCanon = (
+      await session.ctl.events({ tabId: sharedTabId, domain: 'navigation' })
+    ).events.filter((e) => e.kind === 'spa_sync').length;
+    await session.ctl.evalJs(
+      `history.pushState({}, '', '/responsive-lobby'); 'ok'`,
+      'landscape',
+      sharedTabId,
+    );
+    await pollUntil('sync canonicalizing router settles on /mobile-lobby', 4_000, async () => {
+      const p = (await session.ctl.evalJs(`location.pathname`, 'portrait', sharedTabId)).value;
+      return p === '/mobile-lobby' ? p : null;
+    });
+    await sleep(400);
+    const spaEventsAfterSyncCanon = (
+      await session.ctl.events({ tabId: sharedTabId, domain: 'navigation' })
+    ).events.filter((e) => e.kind === 'spa_sync').length;
+    assert.equal(
+      spaEventsAfterSyncCanon - spaEventsBeforeSyncCanon,
+      1,
+      'F-21b: sync canonicalizing replaceState during spa_sync must be suppressed as echo (1 hop)',
+    );
+
+    await session.ctl.interact({
+      tabId: sharedTabId,
+      action: 'hover',
+      x: 16,
+      y: 16,
+      mirror: false,
+    });
+    const spaEventsBeforeDelayedCanon = (
+      await session.ctl.events({ tabId: sharedTabId, domain: 'navigation' })
+    ).events.filter((e) => e.kind === 'spa_sync').length;
+    await session.ctl.evalJs(
+      `history.pushState({}, '', '/delayed-desktop'); 'ok'`,
+      'landscape',
+      sharedTabId,
+    );
+    await sleep(950);
+    const spaEventsAfterDelayedCanon = (
+      await session.ctl.events({ tabId: sharedTabId, domain: 'navigation' })
+    ).events.filter((e) => e.kind === 'spa_sync').length;
+    assert.ok(
+      spaEventsAfterDelayedCanon - spaEventsBeforeDelayedCanon <= 2,
+      `F-21b: delayed responsive canonicalizer must terminate within <=2 hops, got ${spaEventsAfterDelayedCanon - spaEventsBeforeDelayedCanon}`,
+    );
+    assert.equal(
+      (await session.ctl.evalJs(`window.__bootId`, 'portrait', sharedTabId)).value,
+      bootBeforeP,
+      'F-21b: responsive canonicalizer must never cold-reload portrait',
+    );
+    assert.equal(
+      (await session.ctl.evalJs(`window.__bootId`, 'landscape', sharedTabId)).value,
+      bootBeforeL,
+      'F-21b: responsive canonicalizer must never cold-reload landscape',
+    );
+
+    // 5. Isolated session tab MUST NOT inherit or replicate sessionStorage across panes
     const isoOpened = await session.ctl.open(`${baseUrl}/isolated`, {
       mode: 'dual',
       session: 'isolated',

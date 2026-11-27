@@ -315,7 +315,7 @@ export class ControlSocketServer {
   private async dispatch(method: string, params: Record<string, unknown>): Promise<unknown> {
     switch (method) {
       case 'ping':
-        return { pong: true, version: '0.1.0', socketPath: this.socketPath };
+        return { pong: true, version: '0.1.1', socketPath: this.socketPath };
 
       case 'browser_tabs': {
         const activeId = this.tabManager.getActiveTab()?.id;
@@ -488,11 +488,20 @@ export class ControlSocketServer {
           params.filter === 'all'
             ? params.filter
             : 'all';
+        const urlContains =
+          typeof params.url_contains === 'string'
+            ? params.url_contains
+            : typeof params.url === 'string'
+              ? params.url
+              : typeof params.query === 'string'
+                ? params.query
+                : undefined;
         const limit = typeof params.limit === 'number' ? params.limit : 50;
         const entries = this.tabManager.telemetry.getNetworkEntries({
           tabId,
           viewport,
           filter,
+          urlContains,
           limit,
         });
         const includeIncidents = params.include_incidents === true;
@@ -799,6 +808,64 @@ export class ControlSocketServer {
           action,
           top,
           intervalUs,
+        });
+      }
+
+      case 'browser_heap': {
+        const action = params.action;
+        if (
+          action !== 'snapshot' &&
+          action !== 'sampling_start' &&
+          action !== 'sampling_stop' &&
+          action !== 'diff'
+        ) {
+          throw new Error(
+            "browser_heap action must be 'snapshot', 'sampling_start', 'sampling_stop', or 'diff'",
+          );
+        }
+        const rawTab =
+          typeof params.tab_id === 'string' && params.tab_id.trim().length > 0
+            ? params.tab_id.trim()
+            : typeof params.tab === 'string' && params.tab.trim().length > 0
+              ? params.tab.trim()
+              : undefined;
+        let viewport: ViewportRole | undefined;
+        if (params.viewport !== undefined) {
+          if (params.viewport !== 'portrait' && params.viewport !== 'landscape') {
+            throw new Error("viewport must be 'portrait' or 'landscape'");
+          }
+          viewport = params.viewport;
+        }
+        const top =
+          typeof params.top === 'number' && Number.isFinite(params.top)
+            ? Math.min(Math.max(Math.floor(params.top), 1), 200)
+            : undefined;
+        const topLargest =
+          typeof params.top_largest === 'number' && Number.isFinite(params.top_largest)
+            ? Math.min(Math.max(Math.floor(params.top_largest), 1), 20)
+            : undefined;
+        const samplingIntervalBytes =
+          typeof params.sampling_interval_bytes === 'number' &&
+          Number.isFinite(params.sampling_interval_bytes)
+            ? Math.min(Math.max(Math.round(params.sampling_interval_bytes), 512), 1024 * 1024)
+            : undefined;
+        const beforePath =
+          typeof params.before_path === 'string' && params.before_path.trim().length > 0
+            ? params.before_path.trim()
+            : undefined;
+        const afterPath =
+          typeof params.after_path === 'string' && params.after_path.trim().length > 0
+            ? params.after_path.trim()
+            : undefined;
+        return await this.tabManager.profileHeap({
+          tabId: rawTab,
+          viewport,
+          action,
+          top,
+          topLargest,
+          samplingIntervalBytes,
+          beforePath,
+          afterPath,
         });
       }
 

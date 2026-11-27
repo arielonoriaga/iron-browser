@@ -51,6 +51,21 @@ export interface ScriptSelfEntry {
   samples: number;
 }
 
+export interface CallTreeInclusiveEntry {
+  nodeId: number;
+  functionName: string;
+  url: string;
+  line: number;
+  column: number;
+  location: string;
+  inclusiveMs: number;
+  inclusivePercent: number;
+  selfMs: number;
+  samples: number;
+  depth: number;
+  parentChain: string[];
+}
+
 export interface CpuProfileSummary {
   totalDurationMs: number;
   sampledDurationMs: number;
@@ -61,6 +76,7 @@ export interface CpuProfileSummary {
   sampleCount: number;
   nodeCount: number;
   functions: BottomUpFunctionEntry[];
+  callTree: CallTreeInclusiveEntry[];
   scripts: ScriptSelfEntry[];
 }
 
@@ -97,9 +113,9 @@ function sanitizeScriptUrl(rawUrl: string | undefined): string {
  */
 export function summarizeCpuProfile(
   profile: CdpCpuProfile,
-  top = 25,
+  top = 30,
 ): CpuProfileSummary {
-  const safeTop = Math.min(Math.max(Math.floor(top || 25), 1), 200);
+  const safeTop = Math.min(Math.max(Math.floor(top || 30), 1), 200);
   const nodes = Array.isArray(profile.nodes) ? profile.nodes : [];
   const nodeById = new Map<number, CdpProfileNode>();
   const parentById = new Map<number, number>();
@@ -133,6 +149,9 @@ export function summarizeCpuProfile(
 
   const funcMap = new Map<string, FuncAcc>();
   const scriptMap = new Map<string, { url: string; selfUs: number; samples: number }>();
+  const nodeSelfUs = new Map<number, number>();
+  const nodeTotalUs = new Map<number, number>();
+  const nodeSamples = new Map<number, number>();
 
   let sampledUs = 0;
   let idleUs = 0;
@@ -257,6 +276,18 @@ export function summarizeCpuProfile(
         acc.totalUs += dtUs;
       }
     }
+
+    nodeSelfUs.set(leafNodeId, (nodeSelfUs.get(leafNodeId) ?? 0) + dtUs);
+    const seenTreeNodes = new Set<number>();
+    let walkId: number | undefined = leafNodeId;
+    while (walkId !== undefined && !seenTreeNodes.has(walkId)) {
+      seenTreeNodes.add(walkId);
+      const wn = nodeById.get(walkId);
+      if (!wn) break;
+      nodeTotalUs.set(walkId, (nodeTotalUs.get(walkId) ?? 0) + dtUs);
+      nodeSamples.set(walkId, (nodeSamples.get(walkId) ?? 0) + hitWeight);
+      walkId = parentById.get(walkId);
+    }
   };
 
   const samples = Array.isArray(profile.samples) ? profile.samples : [];
@@ -317,6 +348,64 @@ export function summarizeCpuProfile(
       samples: s.samples,
     }));
 
+  const buildParentChain = (nodeId: number): { depth: number; parentChain: string[] } => {
+    const chain: string[] = [];
+    const visited = new Set<number>([nodeId]);
+    let pId = parentById.get(nodeId);
+    let depth = 0;
+    while (pId !== undefined && !visited.has(pId)) {
+      visited.add(pId);
+      const pn = nodeById.get(pId);
+      if (!pn) break;
+      const pm = getNodeMeta(pn);
+      if (pm.functionName !== '(root)') {
+        depth += 1;
+        if (chain.length < 24) {
+          const loc = pm.line > 0 ? `${pm.url}:${pm.line}:${pm.column}` : pm.url;
+          chain.push(`${pm.functionName}@${loc}`);
+        }
+      }
+      pId = parentById.get(pId);
+    }
+    return { depth, parentChain: chain };
+  };
+
+  const callTreeTop = safeTop;
+  const callTree: CallTreeInclusiveEntry[] = Array.from(nodeTotalUs.entries())
+    .filter(([nid, totUs]) => {
+      if (totUs <= 0) return false;
+      const n = nodeById.get(nid);
+      if (!n) return false;
+      const m = getNodeMeta(n);
+      if (META_ROOT_OR_IDLE.has(m.functionName)) return false;
+      if (m.functionName === '(program)' && (nodeSelfUs.get(nid) ?? 0) <= 0) return false;
+      return true;
+    })
+    .map(([nid, totUs]) => {
+      const n = nodeById.get(nid)!;
+      const m = getNodeMeta(n);
+      const selfU = nodeSelfUs.get(nid) ?? 0;
+      const { depth, parentChain } = buildParentChain(nid);
+      return {
+        nodeId: nid,
+        functionName: m.functionName,
+        url: m.url,
+        line: m.line,
+        column: m.column,
+        location: m.line > 0 ? `${m.url}:${m.line}:${m.column}` : m.url,
+        inclusiveMs: roundMs(totUs),
+        inclusivePercent: roundPct(totUs, activeUs),
+        selfMs: roundMs(selfU),
+        samples: nodeSamples.get(nid) ?? 0,
+        depth,
+        parentChain,
+        _totUs: totUs,
+      };
+    })
+    .sort((a, b) => (b._totUs !== a._totUs ? b._totUs - a._totUs : a.depth - b.depth))
+    .slice(0, callTreeTop)
+    .map(({ _totUs: _ignored, ...rest }) => rest);
+
   return {
     totalDurationMs: roundMs(wallUs > 0 ? wallUs : sampledUs),
     sampledDurationMs: roundMs(sampledUs),
@@ -327,6 +416,7 @@ export function summarizeCpuProfile(
     sampleCount,
     nodeCount: nodes.length,
     functions,
+    callTree,
     scripts,
   };
 }
@@ -547,7 +637,7 @@ function roundPct(part, whole) {
 }
 
 function summarize(profile, top) {
-  const safeTop = Math.min(Math.max(Math.floor(top || 25), 1), 200);
+  const safeTop = Math.min(Math.max(Math.floor(top || 30), 1), 200);
   const nodes = Array.isArray(profile.nodes) ? profile.nodes : [];
   const nodeById = new Map();
   const parentById = new Map();
@@ -565,6 +655,9 @@ function summarize(profile, top) {
   const wallUs = Math.max(0, endUs - startUs);
   const funcMap = new Map();
   const scriptMap = new Map();
+  const nodeSelfUs = new Map();
+  const nodeTotalUs = new Map();
+  const nodeSamples = new Map();
   const metaCache = new Map();
   const ancestorCache = new Map();
   let sampledUs = 0, idleUs = 0, programUs = 0, gcUs = 0, sampleCount = 0;
@@ -641,6 +734,17 @@ function summarize(profile, top) {
       const a = funcMap.get(anc[i]);
       if (a) a.totalUs += dtUs;
     }
+    nodeSelfUs.set(leafId, (nodeSelfUs.get(leafId) || 0) + dtUs);
+    const seenTree = new Set();
+    let cur = leafId;
+    while (cur !== undefined && !seenTree.has(cur)) {
+      seenTree.add(cur);
+      const wn = nodeById.get(cur);
+      if (!wn) break;
+      nodeTotalUs.set(cur, (nodeTotalUs.get(cur) || 0) + dtUs);
+      nodeSamples.set(cur, (nodeSamples.get(cur) || 0) + weight);
+      cur = parentById.get(cur);
+    }
   }
 
   const samples = Array.isArray(profile.samples) ? profile.samples : [];
@@ -678,6 +782,62 @@ function summarize(profile, top) {
     .map((s) => ({
       url: s.url, selfMs: roundMs(s.selfUs), selfPercent: roundPct(s.selfUs, activeUs), samples: s.samples
     }));
+  function buildParents(nid) {
+    const chain = [];
+    const vis = new Set([nid]);
+    let pid = parentById.get(nid);
+    let depth = 0;
+    while (pid !== undefined && !vis.has(pid)) {
+      vis.add(pid);
+      const pn = nodeById.get(pid);
+      if (!pn) break;
+      const pm = getMeta(pn);
+      if (pm.functionName !== '(root)') {
+        depth += 1;
+        if (chain.length < 24) {
+          const loc = pm.line > 0 ? pm.url + ':' + pm.line + ':' + pm.column : pm.url;
+          chain.push(pm.functionName + '@' + loc);
+        }
+      }
+      pid = parentById.get(pid);
+    }
+    return { depth, parentChain: chain };
+  }
+  const callTreeTop = safeTop;
+  const callTree = Array.from(nodeTotalUs.entries())
+    .filter(([nid, totUs]) => {
+      if (totUs <= 0) return false;
+      const n = nodeById.get(nid);
+      if (!n) return false;
+      const m = getMeta(n);
+      if (m.functionName === '(root)' || m.functionName === '(idle)') return false;
+      if (m.functionName === '(program)' && (nodeSelfUs.get(nid) || 0) <= 0) return false;
+      return true;
+    })
+    .map(([nid, totUs]) => {
+      const n = nodeById.get(nid);
+      const m = getMeta(n);
+      const su = nodeSelfUs.get(nid) || 0;
+      const { depth, parentChain } = buildParents(nid);
+      return {
+        nodeId: nid,
+        functionName: m.functionName,
+        url: m.url,
+        line: m.line,
+        column: m.column,
+        location: m.line > 0 ? m.url + ':' + m.line + ':' + m.column : m.url,
+        inclusiveMs: roundMs(totUs),
+        inclusivePercent: roundPct(totUs, activeUs),
+        selfMs: roundMs(su),
+        samples: nodeSamples.get(nid) || 0,
+        depth,
+        parentChain,
+        _totUs: totUs
+      };
+    })
+    .sort((a, b) => (b._totUs !== a._totUs ? b._totUs - a._totUs : a.depth - b.depth))
+    .slice(0, callTreeTop)
+    .map(({ _totUs: _ig, ...rest }) => rest);
   return {
     totalDurationMs: roundMs(wallUs > 0 ? wallUs : sampledUs),
     sampledDurationMs: roundMs(sampledUs),
@@ -688,6 +848,7 @@ function summarize(profile, top) {
     sampleCount,
     nodeCount: nodes.length,
     functions,
+    callTree,
     scripts
   };
 }
@@ -1097,7 +1258,7 @@ export class CpuProfilerManager {
     const combinedProfile = mergeCpuProfiles(segments);
     const nowMs = this.now();
     const profilesDir = this.getProfilesDir();
-    const top = opts.top ?? 25;
+    const top = opts.top ?? 30;
 
     const finalized = this.useWorker
       ? await offloadProfileFinalize({

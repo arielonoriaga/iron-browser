@@ -1,5 +1,6 @@
 import fs from 'node:fs';
 import { createRequire } from 'node:module';
+import os from 'node:os';
 import path from 'node:path';
 import type { ViewportRole } from '../shared/types';
 import { isValidHttpOrigin } from '../shared/ws-sse-mux-core';
@@ -186,7 +187,64 @@ function loadNativeBusBinding(): NativeBusBinding | null {
   for (const candidate of candidateNativeAddonPaths()) {
     try {
       if (!fs.existsSync(candidate)) continue;
-      const loaded = req(candidate) as Partial<NativeBusBinding>;
+      const candStat = fs.lstatSync(candidate);
+      if (!candStat.isFile() || candStat.isSymbolicLink()) continue;
+
+      // Copy to an exclusive mkdtempSync 0700 directory and unlink immediately after dlopen() so an
+      // external in-place overwrite (`cp -f`) of `iron_browser_bus.node` can NEVER SIGSEGV our mapped pages,
+      // while avoiding predictable /tmp directory names (F-32).
+      let loadTarget = candidate;
+      let tempDir: string | null = null;
+      let tempCopy: string | null = null;
+      try {
+        const baseTmp = process.env.XDG_RUNTIME_DIR?.trim() || os.tmpdir();
+        const createdDir = fs.mkdtempSync(path.join(baseTmp, 'iron-browser-nat-'));
+        fs.chmodSync(createdDir, 0o700);
+        const dirSt = fs.lstatSync(createdDir);
+        const uidOk = typeof process.getuid !== 'function' || dirSt.uid === process.getuid();
+        const modeOk = (dirSt.mode & 0o077) === 0;
+        if (dirSt.isDirectory() && !dirSt.isSymbolicLink() && uidOk && modeOk) {
+          tempDir = createdDir;
+          const uniquePath = path.join(createdDir, `iron_browser_bus-${process.pid}.node`);
+          const bytes = fs.readFileSync(candidate);
+          const fd = fs.openSync(uniquePath, 'wx', 0o700);
+          try {
+            fs.writeSync(fd, bytes, 0, bytes.length);
+          } finally {
+            fs.closeSync(fd);
+          }
+          loadTarget = uniquePath;
+          tempCopy = uniquePath;
+        } else {
+          try {
+            fs.rmdirSync(createdDir);
+          } catch {
+            // Ignore cleanup failure.
+          }
+        }
+      } catch {
+        loadTarget = candidate;
+        tempCopy = null;
+      }
+      let loaded: Partial<NativeBusBinding>;
+      try {
+        loaded = req(loadTarget) as Partial<NativeBusBinding>;
+      } finally {
+        if (tempCopy) {
+          try {
+            fs.unlinkSync(tempCopy);
+          } catch {
+            // Ignore unlink races.
+          }
+        }
+        if (tempDir) {
+          try {
+            fs.rmdirSync(tempDir);
+          } catch {
+            // Ignore rmdir races.
+          }
+        }
+      }
       if (
         loaded &&
         typeof loaded.busCreate === 'function' &&
@@ -492,23 +550,31 @@ export class TabEventBus {
     tsMs = this.now(),
   ): SessionStorageMutationResult {
     if (this.disposed || !tabId) return { ok: false, changed: false, error: 'disposed' };
-    if (this.native && this.handle !== null) {
-      const res = JSON.parse(
-        this.native.busSessionStorageOp(
-          this.handle,
-          JSON.stringify({ op: 'set', tabId, origin, viewport, key, value, tsMs }),
-        ),
-      ) as SessionStorageMutationResult;
-      if (res.ok && res.changed) {
-        this.lastSessionStorageWriteByTab.set(tabId, tsMs);
-      }
-      return res;
-    }
     if (!isValidHttpOrigin(origin)) {
       return { ok: false, changed: false, error: 'invalid http/https origin' };
     }
     if (key.length + value.length > 512 * 1024) {
       return { ok: false, changed: false, error: 'sessionStorage quota exceeded' };
+    }
+    if (this.native && this.handle !== null) {
+      try {
+        const res = JSON.parse(
+          this.native.busSessionStorageOp(
+            this.handle,
+            JSON.stringify({ op: 'set', tabId, origin, viewport, key, value, tsMs }),
+          ),
+        ) as SessionStorageMutationResult;
+        if (res.ok && res.changed) {
+          this.lastSessionStorageWriteByTab.set(tabId, tsMs);
+        }
+        return res;
+      } catch (err) {
+        return {
+          ok: false,
+          changed: false,
+          error: err instanceof Error ? err.message : String(err),
+        };
+      }
     }
     let origins = this.fbSessionStorage.get(tabId);
     if (!origins) {

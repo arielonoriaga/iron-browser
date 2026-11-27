@@ -29,7 +29,12 @@ function loadElectronRuntime(): {
   }
   return {};
 }
-import { DEFAULT_AGENT_DOCK_WIDTH } from '../shared/layout';
+import {
+  clampAnchoredFloatBoundsUpdate,
+  DEFAULT_AGENT_DOCK_WIDTH,
+  MIN_AGENT_FLOAT_HEIGHT,
+  MIN_AGENT_FLOAT_WIDTH,
+} from '../shared/layout';
 import type {
   AgentCliPreset,
   AgentDockMode,
@@ -198,9 +203,26 @@ export class AgentDockManager {
     private readonly agentPreloadPath: string,
     private readonly agentHtmlPath: string,
     private readonly callbacks: AgentDockCallbacks,
-    options: { initialMode?: AgentDockMode; ptyBinding?: NativePtyBinding | null } = {},
+    options: {
+      initialMode?: AgentDockMode;
+      initialFloatBounds?: Rect;
+      ptyBinding?: NativePtyBinding | null;
+    } = {},
   ) {
     this.mode = options.initialMode ?? 'minimized';
+    if (options.initialFloatBounds) {
+      const fb = options.initialFloatBounds;
+      this.floatBounds = {
+        x: Number.isFinite(fb.x) ? Math.round(fb.x) : this.floatBounds.x,
+        y: Number.isFinite(fb.y) ? Math.round(fb.y) : this.floatBounds.y,
+        width: Number.isFinite(fb.width)
+          ? Math.max(MIN_AGENT_FLOAT_WIDTH, Math.round(fb.width))
+          : this.floatBounds.width,
+        height: Number.isFinite(fb.height)
+          ? Math.max(MIN_AGENT_FLOAT_HEIGHT, Math.round(fb.height))
+          : this.floatBounds.height,
+      };
+    }
     this.expectedAgentUrl = this.agentHtmlPath
       ? pathToFileURL(path.resolve(this.agentHtmlPath)).toString()
       : '';
@@ -299,6 +321,17 @@ export class AgentDockManager {
     }
     const view = this.ensureViewCreated();
     if (!view || view.webContents.isDestroyed()) return;
+    if (this.mode === 'floating') {
+      const changed =
+        this.floatBounds.x !== rect.x ||
+        this.floatBounds.y !== rect.y ||
+        this.floatBounds.width !== rect.width ||
+        this.floatBounds.height !== rect.height;
+      this.floatBounds = { ...rect };
+      if (changed) {
+        this.pushStateToView();
+      }
+    }
     this.ensureTopMost();
     view.setBounds(rect);
     view.setVisible(true);
@@ -324,14 +357,23 @@ export class AgentDockManager {
   }
 
   setFloatBounds(partial: Partial<Rect>): AgentDockState {
-    this.floatBounds = {
-      x: Number.isFinite(partial.x) ? Math.round(partial.x!) : this.floatBounds.x,
-      y: Number.isFinite(partial.y) ? Math.round(partial.y!) : this.floatBounds.y,
-      width: Number.isFinite(partial.width) ? Math.round(partial.width!) : this.floatBounds.width,
-      height: Number.isFinite(partial.height)
-        ? Math.round(partial.height!)
-        : this.floatBounds.height,
-    };
+    const canReadContentSize =
+      !this.win.isDestroyed() && typeof this.win.getContentSize === 'function';
+    if (canReadContentSize) {
+      const [winW = 1480, winH = 920] = this.win.getContentSize();
+      this.floatBounds = clampAnchoredFloatBoundsUpdate(this.floatBounds, partial, winW, winH);
+    } else {
+      this.floatBounds = {
+        x: Number.isFinite(partial.x) ? Math.round(partial.x!) : this.floatBounds.x,
+        y: Number.isFinite(partial.y) ? Math.round(partial.y!) : this.floatBounds.y,
+        width: Number.isFinite(partial.width)
+          ? Math.max(MIN_AGENT_FLOAT_WIDTH, Math.round(partial.width!))
+          : this.floatBounds.width,
+        height: Number.isFinite(partial.height)
+          ? Math.max(MIN_AGENT_FLOAT_HEIGHT, Math.round(partial.height!))
+          : this.floatBounds.height,
+      };
+    }
     if (this.mode === 'floating') {
       this.callbacks.onLayoutChanged();
     }

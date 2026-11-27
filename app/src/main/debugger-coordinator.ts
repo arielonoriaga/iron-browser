@@ -90,8 +90,8 @@ export class DebuggerCoordinator {
   }
 
   private removeDebuggerListeners(entry: WcEntry): void {
-    const dbg = entry.wc.debugger;
     try {
+      const dbg = entry.wc.debugger;
       if (typeof dbg.off === 'function') {
         dbg.off('detach', entry.onDetachListener);
         dbg.off('message', entry.onMessageListener);

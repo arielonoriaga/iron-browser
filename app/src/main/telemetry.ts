@@ -10,6 +10,7 @@ import type {
   WebGlViewportSummary,
 } from '../shared/types';
 import { truncateUtf8 } from '../shared/frame';
+import { extractNetworkInitiator, MAX_ASYNC_STACK_DEPTH } from '../shared/network-initiator';
 import {
   groupDiagnosticIncidents,
   type DiagnosticIncident,
@@ -42,7 +43,9 @@ export interface TelemetryServiceOptions {
 }
 
 const MAX_CONSOLE_ENTRIES = 400;
-const MAX_NETWORK_ENTRIES = 400;
+const MAX_NETWORK_ENTRIES = 1000;
+
+export { extractNetworkInitiator };
 const CDP_PERF_TIMEOUT_MS = 800;
 const MAX_RAF_RECENT_SAMPLES = 30;
 export const ACTIVE_POLL_INTERVAL_MS = 2000;
@@ -97,6 +100,10 @@ export class TelemetryService {
   private readonly consoleEntries: ConsoleEntry[] = [];
   private readonly networkEntries: NetworkEntry[] = [];
   private readonly networkByReqId = new Map<string, NetworkEntry>();
+  private readonly reqTimingByReqId = new Map<
+    string,
+    { startMonoSec: number | null; decodedBytes: number }
+  >();
   private readonly collectorUnsubs = new Map<number, () => void>();
   private readonly now: () => number;
   private readonly rafTtlMs: number;
@@ -199,6 +206,7 @@ export class TelemetryService {
     }
     this.collectorUnsubs.clear();
     this.webglByWcId.clear();
+    this.reqTimingByReqId.clear();
   }
 
   setThrottled(throttled: boolean): void {
@@ -259,7 +267,23 @@ export class TelemetryService {
     if (wc.isDestroyed() || !this.debuggerCoordinator.isAttached(wc)) return;
     await Promise.all([
       this.debuggerCoordinator.sendCommand(wc, 'Performance.enable').catch(() => {}),
-      this.debuggerCoordinator.sendCommand(wc, 'Runtime.enable').catch(() => {}),
+      this.debuggerCoordinator
+        .sendCommand(wc, 'Runtime.enable')
+        .then(() =>
+          this.debuggerCoordinator
+            .sendCommand(wc, 'Runtime.setAsyncCallStackDepth', { maxDepth: MAX_ASYNC_STACK_DEPTH })
+            .catch(() =>
+              this.debuggerCoordinator
+                .sendCommand(wc, 'Debugger.enable', { maxScriptsCacheSize: 2_000_000 })
+                .then(() =>
+                  this.debuggerCoordinator.sendCommand(wc, 'Debugger.setAsyncCallStackDepth', {
+                    maxDepth: MAX_ASYNC_STACK_DEPTH,
+                  }),
+                )
+                .catch(() => {}),
+            ),
+        )
+        .catch(() => {}),
       this.debuggerCoordinator
         .sendCommand(wc, 'Network.enable', {
           maxTotalBufferSize: 1,
@@ -347,19 +371,36 @@ export class TelemetryService {
     } else if (method === 'Network.requestWillBeSent') {
       const requestId = `${wcId}:${String(params.requestId ?? '')}`;
       const req = (params.request ?? {}) as Record<string, unknown>;
-      const entry: NetworkEntry = {
-        id: requestId,
-        timestampMs: this.now(),
-        tabId,
-        viewport: role,
-        method: String(req.method ?? 'GET'),
-        url: String(req.url ?? ''),
-        status: null,
-        failed: false,
-        resourceType: typeof params.type === 'string' ? params.type : undefined,
-      };
-      this.networkByReqId.set(requestId, entry);
-      this.pushNetwork(entry);
+      const monoTs =
+        typeof params.timestamp === 'number' && Number.isFinite(params.timestamp)
+          ? params.timestamp
+          : null;
+      const initiator = extractNetworkInitiator(params.initiator);
+      const existing = this.networkByReqId.get(requestId);
+      if (existing) {
+        // Redirect chain on same requestId: update target URL/method while preserving initial start time & root initiator.
+        existing.method = String(req.method ?? existing.method);
+        existing.url = this.sanitizeTelemetryUrl(String(req.url ?? existing.url)) ?? existing.url;
+        if (!existing.initiator && initiator) {
+          existing.initiator = initiator;
+        }
+      } else {
+        const entry: NetworkEntry = {
+          id: requestId,
+          timestampMs: this.now(),
+          tabId,
+          viewport: role,
+          method: String(req.method ?? 'GET'),
+          url: String(req.url ?? ''),
+          status: null,
+          failed: false,
+          resourceType: typeof params.type === 'string' ? params.type : undefined,
+          ...(initiator ? { initiator } : {}),
+        };
+        this.reqTimingByReqId.set(requestId, { startMonoSec: monoTs, decodedBytes: 0 });
+        this.networkByReqId.set(requestId, entry);
+        this.pushNetwork(entry);
+      }
     } else if (method === 'Network.responseReceived') {
       const requestId = `${wcId}:${String(params.requestId ?? '')}`;
       const resp = (params.response ?? {}) as Record<string, unknown>;
@@ -368,7 +409,29 @@ export class TelemetryService {
         const status = typeof resp.status === 'number' ? resp.status : null;
         existing.status = status;
         existing.failed = status !== null && status >= 400;
-        existing.durationMs = Math.max(0, this.now() - existing.timestampMs);
+        if (typeof resp.mimeType === 'string' && resp.mimeType) {
+          existing.mimeType = resp.mimeType;
+        }
+        if (typeof resp.protocol === 'string' && resp.protocol) {
+          existing.protocol = resp.protocol;
+        }
+        if (resp.fromDiskCache === true || resp.fromPrefetchCache === true) {
+          existing.fromCache = true;
+        }
+        if (typeof resp.encodedDataLength === 'number' && resp.encodedDataLength >= 0) {
+          existing.encodedBytes = resp.encodedDataLength;
+        }
+        const timing = this.reqTimingByReqId.get(requestId);
+        const respMono =
+          typeof params.timestamp === 'number' && Number.isFinite(params.timestamp)
+            ? params.timestamp
+            : null;
+        const ttfbMs =
+          timing?.startMonoSec !== null && timing?.startMonoSec !== undefined && respMono !== null
+            ? Math.max(0, Math.round((respMono - timing.startMonoSec) * 1000 * 100) / 100)
+            : Math.max(0, this.now() - existing.timestampMs);
+        existing.ttfbMs = ttfbMs;
+        existing.durationMs = ttfbMs;
         if (existing.failed) {
           this.onBusEvent?.({
             tabId,
@@ -380,21 +443,53 @@ export class TelemetryService {
           });
         }
       }
+    } else if (method === 'Network.dataReceived') {
+      const requestId = `${wcId}:${String(params.requestId ?? '')}`;
+      const existing = this.networkByReqId.get(requestId);
+      const timing = this.reqTimingByReqId.get(requestId);
+      const chunkLen = typeof params.dataLength === 'number' && params.dataLength > 0 ? params.dataLength : 0;
+      if (timing && chunkLen > 0) {
+        timing.decodedBytes += chunkLen;
+        if (existing) {
+          existing.decodedBytes = timing.decodedBytes;
+        }
+      }
     } else if (method === 'Network.loadingFinished') {
       const requestId = `${wcId}:${String(params.requestId ?? '')}`;
       const existing = this.networkByReqId.get(requestId);
+      const timing = this.reqTimingByReqId.get(requestId);
       if (existing) {
-        existing.encodedBytes =
-          typeof params.encodedDataLength === 'number' ? params.encodedDataLength : undefined;
-        existing.durationMs = Math.max(0, this.now() - existing.timestampMs);
+        if (typeof params.encodedDataLength === 'number' && params.encodedDataLength >= 0) {
+          existing.encodedBytes = params.encodedDataLength;
+        }
+        const endMono =
+          typeof params.timestamp === 'number' && Number.isFinite(params.timestamp)
+            ? params.timestamp
+            : null;
+        existing.durationMs =
+          timing?.startMonoSec !== null && timing?.startMonoSec !== undefined && endMono !== null
+            ? Math.max(0, Math.round((endMono - timing.startMonoSec) * 1000 * 100) / 100)
+            : Math.max(0, this.now() - existing.timestampMs);
+        if (timing && timing.decodedBytes > 0) {
+          existing.decodedBytes = timing.decodedBytes;
+        }
       }
+      this.reqTimingByReqId.delete(requestId);
     } else if (method === 'Network.loadingFailed') {
       const requestId = `${wcId}:${String(params.requestId ?? '')}`;
       const existing = this.networkByReqId.get(requestId);
+      const timing = this.reqTimingByReqId.get(requestId);
       if (existing) {
         existing.failed = true;
         existing.errorText = typeof params.errorText === 'string' ? params.errorText : 'failed';
-        existing.durationMs = Math.max(0, this.now() - existing.timestampMs);
+        const endMono =
+          typeof params.timestamp === 'number' && Number.isFinite(params.timestamp)
+            ? params.timestamp
+            : null;
+        existing.durationMs =
+          timing?.startMonoSec !== null && timing?.startMonoSec !== undefined && endMono !== null
+            ? Math.max(0, Math.round((endMono - timing.startMonoSec) * 1000 * 100) / 100)
+            : Math.max(0, this.now() - existing.timestampMs);
         this.onBusEvent?.({
           tabId,
           viewport: role,
@@ -404,6 +499,7 @@ export class TelemetryService {
           tsMs: this.now(),
         });
       }
+      this.reqTimingByReqId.delete(requestId);
     }
   }
 
@@ -469,6 +565,7 @@ export class TelemetryService {
       const removed = this.networkEntries.splice(0, this.networkEntries.length - MAX_NETWORK_ENTRIES);
       for (const item of removed) {
         this.networkByReqId.delete(item.id);
+        this.reqTimingByReqId.delete(item.id);
       }
     }
   }
@@ -494,17 +591,20 @@ export class TelemetryService {
     tabId?: string;
     viewport?: ViewportRole | 'both';
     filter?: 'all' | 'failed' | '4xx' | '5xx';
+    urlContains?: string;
     limit?: number;
   }): NetworkEntry[] {
     const limit = Math.min(Math.max(opts.limit ?? 50, 1), 200);
     const filter = opts.filter ?? 'all';
+    const needle = typeof opts.urlContains === 'string' ? opts.urlContains.trim().toLowerCase() : '';
     return this.networkEntries
       .filter((e) => {
         if (opts.tabId && e.tabId !== opts.tabId) return false;
         if (opts.viewport && opts.viewport !== 'both' && e.viewport !== opts.viewport) return false;
-        if (filter === 'failed') return e.failed;
-        if (filter === '4xx') return e.status !== null && e.status >= 400 && e.status < 500;
-        if (filter === '5xx') return e.status !== null && e.status >= 500;
+        if (filter === 'failed' && !e.failed) return false;
+        if (filter === '4xx' && !(e.status !== null && e.status >= 400 && e.status < 500)) return false;
+        if (filter === '5xx' && !(e.status !== null && e.status >= 500)) return false;
+        if (needle && !e.url.toLowerCase().includes(needle)) return false;
         return true;
       })
       .slice(-limit);
@@ -542,6 +642,7 @@ export class TelemetryService {
       if (entry.tabId === tabId) {
         this.networkEntries.splice(i, 1);
         this.networkByReqId.delete(entry.id);
+        this.reqTimingByReqId.delete(entry.id);
       }
     }
   }
@@ -558,6 +659,7 @@ export class TelemetryService {
       if (entry.tabId === tabId && entry.viewport === viewport) {
         this.networkEntries.splice(i, 1);
         this.networkByReqId.delete(entry.id);
+        this.reqTimingByReqId.delete(entry.id);
       }
     }
   }

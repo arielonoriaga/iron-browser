@@ -159,7 +159,7 @@ pub fn definitions(hard_max_bytes: usize) -> Value {
     });
     let profile_tool = json!({
         "name": "browser_profile",
-        "description": "Start or stop an off-thread V8 CDP CPU profile (Profiler.start / Profiler.stop) on portrait or landscape (compatible with active slow-device CPU throttling and page navigations), writing a size-capped 0600 .cpuprofile file to disk and returning a bottom-up hotspot summary (selfMs + totalMs per function + script URL:line, plus selfMs per script URL).",
+        "description": "Start or stop an off-thread V8 CDP CPU profile (Profiler.start / Profiler.stop) on portrait or landscape (compatible with active slow-device CPU throttling and page navigations), writing a size-capped 0600 .cpuprofile file to disk and returning a bottom-up hotspot summary (selfMs + totalMs per function + script URL:line), top-30 inclusive call-tree frames with their caller parentChain, and selfMs per script URL.",
         "annotations": {"readOnlyHint": false, "destructiveHint": false, "idempotentHint": false, "openWorldHint": false},
         "inputSchema": {
             "type": "object",
@@ -170,8 +170,29 @@ pub fn definitions(hard_max_bytes: usize) -> Value {
                 "tab_id": tab_id,
                 "viewport": viewport,
                 "action": {"type": "string", "enum": ["start", "stop"]},
-                "top": {"type": "integer", "minimum": 1, "maximum": 200, "default": 25},
+                "top": {"type": "integer", "minimum": 1, "maximum": 200, "default": 30},
                 "interval_us": {"type": "integer", "minimum": 200, "maximum": 10000, "default": 1000}
+            }
+        }
+    });
+    let heap_tool = json!({
+        "name": "browser_heap",
+        "description": "Capture and analyze V8 heap snapshots, allocation sampling profiles, and snapshot diffs off the Electron main thread (compatible with slow-device CPU throttling): snapshot streams HeapProfiler.takeHeapSnapshot to a 0600 .heapsnapshot file and computes total/used heap, top 30 constructors by retained & self bytes + count, detached DOM node count, and top retainers/dominator chains of the 5 largest objects; sampling_start/sampling_stop records allocating call stacks + .heapprofile; diff compares two snapshots for constructor count/byte leaks.",
+        "annotations": {"readOnlyHint": false, "destructiveHint": false, "idempotentHint": false, "openWorldHint": false},
+        "inputSchema": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["action"],
+            "properties": {
+                "tab": tab_id,
+                "tab_id": tab_id,
+                "viewport": viewport,
+                "action": {"type": "string", "enum": ["snapshot", "sampling_start", "sampling_stop", "diff"]},
+                "top": {"type": "integer", "minimum": 1, "maximum": 200, "default": 30},
+                "top_largest": {"type": "integer", "minimum": 1, "maximum": 20, "default": 5},
+                "sampling_interval_bytes": {"type": "integer", "minimum": 512, "maximum": 1048576, "default": 32768},
+                "before_path": {"type": "string", "minLength": 1, "maxLength": 4096},
+                "after_path": {"type": "string", "minLength": 1, "maxLength": 4096}
             }
         }
     });
@@ -313,7 +334,7 @@ pub fn definitions(hard_max_bytes: usize) -> Value {
         }),
         json!({
             "name": "browser_network",
-            "description": "Inspect recent HTTP/WebSocket requests filtered by status (all, failed, 4xx, 5xx) with timing, encoded byte size, and optional diagnostic incident grouping.",
+            "description": "Inspect recent HTTP/WebSocket requests filtered by status (all, failed, 4xx, 5xx) and optional URL substring (url_contains), including CDP initiator JS + async parent call stacks (url:line:col + functionName), TTFB/total durationMs (requestWillBeSent -> responseEnd), encoded/decoded byte sizes, and optional diagnostic incident grouping.",
             "annotations": {"readOnlyHint": true, "destructiveHint": false, "idempotentHint": true, "openWorldHint": false},
             "inputSchema": {
                 "type": "object",
@@ -322,6 +343,7 @@ pub fn definitions(hard_max_bytes: usize) -> Value {
                     "tab_id": tab_id,
                     "viewport": viewport_or_both,
                     "filter": {"type": "string", "enum": ["all", "failed", "4xx", "5xx"], "default": "all"},
+                    "url_contains": {"type": "string", "maxLength": 1024},
                     "limit": limit,
                     "include_incidents": {"type": "boolean", "default": false}
                 }
@@ -464,13 +486,14 @@ pub fn definitions(hard_max_bytes: usize) -> Value {
         }),
         emulate_tool,
         profile_tool,
+        heap_tool,
         health_tool,
         webgl_tool,
     ];
     json!({"tools": tools})
 }
 
-const TOOL_NAMES: [&str; 19] = [
+const TOOL_NAMES: [&str; 20] = [
     "browser_tabs",
     "browser_open",
     "browser_navigate",
@@ -488,6 +511,7 @@ const TOOL_NAMES: [&str; 19] = [
     "browser_events",
     "browser_emulate",
     "browser_profile",
+    "browser_heap",
     "browser_health",
     "browser_webgl",
 ];
@@ -807,7 +831,7 @@ mod tests {
     fn all_tools_declare_four_boolean_annotations() {
         let defs = definitions(DEFAULT_MAX_BYTES);
         let tools = defs["tools"].as_array().expect("tools array");
-        assert_eq!(tools.len(), 19);
+        assert_eq!(tools.len(), 20);
         assert_eq!(tools.len(), TOOL_NAMES.len());
         for tool in tools {
             let ann = tool["annotations"].as_object().expect("annotations object");

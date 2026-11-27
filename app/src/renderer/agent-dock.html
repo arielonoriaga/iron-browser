@@ -8,7 +8,17 @@
   <link rel="stylesheet" href="./agent-dock.css" />
 </head>
 <body>
-  <div class="dock-root">
+  <div id="dock-root" class="dock-root">
+    <!-- Custom resize handles (active only when floating) -->
+    <div class="float-resize-handle handle-n" data-resize-edge="n" aria-label="Resize top edge"></div>
+    <div class="float-resize-handle handle-s" data-resize-edge="s" aria-label="Resize bottom edge"></div>
+    <div class="float-resize-handle handle-e" data-resize-edge="e" aria-label="Resize right edge"></div>
+    <div class="float-resize-handle handle-w" data-resize-edge="w" aria-label="Resize left edge"></div>
+    <div class="float-resize-handle handle-ne" data-resize-edge="ne" aria-label="Resize top-right corner"></div>
+    <div class="float-resize-handle handle-nw" data-resize-edge="nw" aria-label="Resize top-left corner"></div>
+    <div class="float-resize-handle handle-se" data-resize-edge="se" aria-label="Resize bottom-right corner" title="Drag any edge or corner to resize"></div>
+    <div class="float-resize-handle handle-sw" data-resize-edge="sw" aria-label="Resize bottom-left corner"></div>
+
     <header id="dock-drag-bar" class="dock-header">
       <div class="dock-brand">
         <span id="status-dot" class="status-dot"></span>
@@ -16,6 +26,7 @@
         <span id="session-badge" class="session-badge">Idle</span>
       </div>
       <div class="dock-actions">
+        <button id="btn-format-md" class="hdr-btn active" type="button" title="Toggle Markdown & Code formatting vs Raw ANSI terminal">MD</button>
         <button id="btn-mode-docked" class="hdr-btn" title="Dock to side">Dock</button>
         <button id="btn-mode-floating" class="hdr-btn" title="Float over viewports">Float</button>
         <button id="btn-mode-min" class="hdr-btn" title="Minimize (Ctrl+`)">_</button>
@@ -53,7 +64,7 @@
     </section>
 
     <main id="terminal-wrap" class="terminal-wrap" tabindex="0" aria-label="Agent terminal output (click to send direct keys)">
-      <pre id="terminal-screen" class="terminal-screen"></pre>
+      <div id="terminal-screen" class="terminal-screen md-mode"></div>
     </main>
 
     <div class="quick-keys-bar">

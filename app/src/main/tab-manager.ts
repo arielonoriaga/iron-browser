@@ -100,6 +100,7 @@ import {
 } from '../shared/session-store';
 import { CpuProfilerManager } from './cpu-profiler';
 import { DebuggerCoordinator } from './debugger-coordinator';
+import { HeapProfilerManager, type HeapAction } from './heap-profiler';
 import { MirrorRelay, type MirrorViewportLookup } from './mirror-relay';
 import { RequestDedupMiddleware, type DedupViewportContext } from './request-dedup';
 import { TelemetryService } from './telemetry';
@@ -311,6 +312,7 @@ export class TabManager implements MirrorViewportLookup {
   public readonly debuggerCoordinator: DebuggerCoordinator;
   public readonly slowDeviceEmulation: SlowDeviceEmulationManager;
   public readonly cpuProfiler: CpuProfilerManager;
+  public readonly heapProfiler: HeapProfilerManager;
   public readonly webGlInspector: WebGlInspectorManager;
   public readonly mirrorRelay: MirrorRelay;
   public readonly requestDedup: RequestDedupMiddleware<WebContents>;
@@ -334,6 +336,9 @@ export class TabManager implements MirrorViewportLookup {
     this.debuggerCoordinator = new DebuggerCoordinator();
     this.slowDeviceEmulation = new SlowDeviceEmulationManager(this.debuggerCoordinator);
     this.cpuProfiler = new CpuProfilerManager(this.debuggerCoordinator, () =>
+      this.getProfilesDir(),
+    );
+    this.heapProfiler = new HeapProfilerManager(this.debuggerCoordinator, () =>
       this.getProfilesDir(),
     );
     this.webGlInspector = new WebGlInspectorManager(this.debuggerCoordinator);
@@ -565,10 +570,21 @@ export class TabManager implements MirrorViewportLookup {
     return DEVICE_PRESETS;
   }
 
+  private getViewportPartition(
+    tabId: string,
+    role: ViewportRole,
+    sessionMode: SessionMode,
+  ): string | undefined {
+    if (sessionMode !== 'isolated') return undefined;
+    return role === 'portrait' ? `iron-iso-${tabId}` : `iron-iso-${tabId}-landscape`;
+  }
+
   private clearIsolatedPartition(tabId: string): void {
     try {
-      const part = session.fromPartition(`iron-iso-${tabId}`);
-      void part.clearStorageData().catch(() => {});
+      const partPortrait = session.fromPartition(`iron-iso-${tabId}`);
+      void partPortrait?.clearStorageData?.()?.catch?.(() => {});
+      const partLandscape = session.fromPartition(`iron-iso-${tabId}-landscape`);
+      void partLandscape?.clearStorageData?.()?.catch?.(() => {});
     } catch {
       // Ignore partition cleanup errors on shutdown.
     }
@@ -686,10 +702,7 @@ export class TabManager implements MirrorViewportLookup {
     role: ViewportRole,
     sessionMode: SessionMode,
   ): WebContentsView {
-    const partition =
-      role === 'portrait' && sessionMode === 'isolated'
-        ? `iron-iso-${tabId}`
-        : undefined;
+    const partition = this.getViewportPartition(tabId, role, sessionMode);
 
     const view = new WebContentsView({
       webPreferences: {
@@ -737,7 +750,8 @@ export class TabManager implements MirrorViewportLookup {
               summary: safeUrl,
             });
           }
-          this.createTab({ url: safeUrl, mode: 'dual' });
+          const parentSession = this.getTab(tabId)?.session ?? 'shared';
+          this.createTab({ url: safeUrl, mode: 'dual', session: parentSession });
         }
       } catch {
         // Deny unsafe schemes silently.
@@ -2458,6 +2472,7 @@ export class TabManager implements MirrorViewportLookup {
       }
       this.slowDeviceEmulation.clearTab(tab.id);
       this.cpuProfiler.clearTab(tab.id);
+      this.heapProfiler.clearTab(tab.id);
       this.requestDedup.clearTab(tab.id);
       this.wsSseMux.clearTab(tab.id);
       this.activeTracesByTab.delete(tab.id);
@@ -2526,6 +2541,7 @@ export class TabManager implements MirrorViewportLookup {
       this.destroyTabViews(tab);
       this.mirrorRelay.clearTab(tab.id);
       this.cpuProfiler.clearTab(tab.id);
+      this.heapProfiler.clearTab(tab.id);
       this.requestDedup.clearTabSlots(tab.id);
       this.wsSseMux.clearTab(tab.id);
       this.tabEventBus.sessionStorageClearTab(tab.id);
@@ -2691,18 +2707,27 @@ export class TabManager implements MirrorViewportLookup {
       }
 
       const sessions = new Set<Session>();
+      try {
+        if (session.defaultSession) sessions.add(session.defaultSession);
+      } catch {
+        // Ignore defaultSession lookup errors in stubbed test VMs.
+      }
       if (tab.landscapeView && !tab.landscapeView.webContents.isDestroyed()) {
-        sessions.add(tab.landscapeView.webContents.session);
+        if (tab.landscapeView.webContents.session) {
+          sessions.add(tab.landscapeView.webContents.session);
+        }
       }
       if (tab.portraitView && !tab.portraitView.webContents.isDestroyed()) {
-        sessions.add(tab.portraitView.webContents.session);
+        if (tab.portraitView.webContents.session) {
+          sessions.add(tab.portraitView.webContents.session);
+        }
       }
-      if (sessions.size === 0) {
+      if (tab.session === 'isolated') {
         try {
-          if (session.defaultSession) sessions.add(session.defaultSession);
-          if (tab.session === 'isolated') {
-            sessions.add(session.fromPartition(`iron-iso-${tab.id}`));
-          }
+          const pSess = session.fromPartition(`iron-iso-${tab.id}`);
+          if (pSess) sessions.add(pSess);
+          const lSess = session.fromPartition(`iron-iso-${tab.id}-landscape`);
+          if (lSess) sessions.add(lSess);
         } catch {
           // Ignore session lookup fallback failures.
         }
@@ -2909,6 +2934,19 @@ export class TabManager implements MirrorViewportLookup {
     tab.session = mode;
     this.tabEventBus.sessionStorageClearTab(tab.id);
 
+    const now = Date.now();
+    if (tab.landscapeView) {
+      const wasInspectingLandscape = tab.devtoolsTarget === 'landscape';
+      this.destroyView(tab.landscapeView);
+      tab.landscapeView = this.createViewportView(tab.id, 'landscape', mode);
+      tab.navSuppressUntil.landscape = now + NAV_MIRROR_SUPPRESS_MS;
+      tab.navSuppressUrl.landscape = tab.url;
+      this.loadViewportUrl(tab.landscapeView.webContents, tab.url);
+      if (wasInspectingLandscape) {
+        this.attachedDevToolsWcId = null;
+      }
+    }
+
     if (tab.portraitView) {
       const wasInspectingPortrait = tab.devtoolsTarget === 'portrait';
       this.destroyView(tab.portraitView);
@@ -2916,7 +2954,7 @@ export class TabManager implements MirrorViewportLookup {
         this.clearIsolatedPartition(tab.id);
       }
       tab.portraitView = this.createViewportView(tab.id, 'portrait', mode);
-      tab.navSuppressUntil.portrait = Date.now() + NAV_MIRROR_SUPPRESS_MS;
+      tab.navSuppressUntil.portrait = now + NAV_MIRROR_SUPPRESS_MS;
       tab.navSuppressUrl.portrait = tab.url;
       this.loadViewportUrl(tab.portraitView.webContents, tab.url);
       if (wasInspectingPortrait) {
@@ -3025,6 +3063,7 @@ export class TabManager implements MirrorViewportLookup {
     }
     this.slowDeviceEmulation.disposeWebContents(wc.id);
     this.cpuProfiler.disposeWebContents(wc.id);
+    this.heapProfiler.disposeWebContents(wc.id);
     this.webGlInspector.disposeWebContents(wc.id);
     this.wsSseMux.disposeWebContents(wc.id);
     this.requestDedup.disposeWebContents(wc.id);
@@ -4266,6 +4305,7 @@ export class TabManager implements MirrorViewportLookup {
       theme: this.theme,
       ecoMode: this.ecoMode,
       autoSleep: this.autoSleep,
+      ...(this.agentDock ? { agentFloatBounds: this.agentDock.getState().floatBounds } : {}),
       activeTabIndex,
       tabs,
       history: [...this.history],
@@ -4345,6 +4385,121 @@ export class TabManager implements MirrorViewportLookup {
     }
 
     throw new Error("browser_profile action must be 'start' or 'stop'");
+  }
+
+  async profileHeap(params: {
+    tabId?: string;
+    viewport?: ViewportRole;
+    action: HeapAction;
+    top?: number;
+    topLargest?: number;
+    samplingIntervalBytes?: number;
+    beforePath?: string;
+    afterPath?: string;
+  }): Promise<Record<string, unknown>> {
+    const tab = params.tabId ? this.getTab(params.tabId) : this.getActiveTab();
+    if (!tab) throw new Error('no active tab');
+
+    const role: ViewportRole =
+      params.viewport ?? (tab.mode === 'dual' ? 'portrait' : 'landscape');
+
+    if (params.action === 'diff') {
+      const diffed = await this.heapProfiler.diffSnapshots({
+        tabId: tab.id,
+        viewport: role,
+        beforePath: params.beforePath,
+        afterPath: params.afterPath,
+        top: params.top,
+      });
+      return {
+        ...diffed,
+        emulation: this.slowDeviceEmulation.getTabSummary(tab.id),
+      };
+    }
+
+    if (tab.sleeping) throw new Error(`tab '${tab.id}' is sleeping`);
+
+    if (params.viewport === 'portrait' && tab.mode !== 'dual') {
+      throw new Error(`viewport 'portrait' is not active in single-mode tab '${tab.id}'`);
+    }
+
+    if (params.action === 'sampling_stop') {
+      const stopped = await this.heapProfiler.stopSampling({
+        tabId: tab.id,
+        viewport: role,
+        top: params.top,
+      });
+      this.tabEventBus.publish({
+        tabId: tab.id,
+        viewport: role,
+        domain: 'trace',
+        kind: 'heap_sampling_stop',
+        summary: `heap sampling stopped (${role})`,
+      });
+      return {
+        ...stopped,
+        emulation: this.slowDeviceEmulation.getTabSummary(tab.id),
+      };
+    }
+
+    const ready = await this.ensureTabMaterializedAndLoaded(tab);
+    if (!ready) {
+      throw new Error(
+        !this.tabs.includes(tab)
+          ? `tab '${tab.id}' was closed`
+          : `tab '${tab.id}' failed to finish loading`,
+      );
+    }
+    const wc =
+      role === 'portrait' ? tab.portraitView?.webContents : tab.landscapeView?.webContents;
+    if (!wc || wc.isDestroyed()) {
+      throw new Error(`viewport '${role}' is not active in tab '${tab.id}'`);
+    }
+
+    if (params.action === 'snapshot') {
+      const snap = await this.heapProfiler.takeSnapshot({
+        tabId: tab.id,
+        viewport: role,
+        wc,
+        top: params.top,
+        topLargest: params.topLargest,
+      });
+      this.tabEventBus.publish({
+        tabId: tab.id,
+        viewport: role,
+        domain: 'trace',
+        kind: 'heap_snapshot',
+        summary: `heap snapshot captured (${role}, ${snap.snapshotBytes}B)`,
+      });
+      return {
+        ...snap,
+        emulation: this.slowDeviceEmulation.getTabSummary(tab.id),
+      };
+    }
+
+    if (params.action === 'sampling_start') {
+      const started = await this.heapProfiler.startSampling({
+        tabId: tab.id,
+        viewport: role,
+        wc,
+        samplingIntervalBytes: params.samplingIntervalBytes,
+      });
+      this.tabEventBus.publish({
+        tabId: tab.id,
+        viewport: role,
+        domain: 'trace',
+        kind: 'heap_sampling_start',
+        summary: `heap sampling started (${role})`,
+      });
+      return {
+        ...started,
+        emulation: this.slowDeviceEmulation.getTabSummary(tab.id),
+      };
+    }
+
+    throw new Error(
+      "browser_heap action must be 'snapshot', 'sampling_start', 'sampling_stop', or 'diff'",
+    );
   }
 
   getViewportHealthSnapshot(): ViewportRendererHealth[] {
@@ -5057,11 +5212,11 @@ export class TabManager implements MirrorViewportLookup {
   getShellState(): ShellState {
     const tabs: TabSnapshot[] = this.tabs.map((tab) => {
       const landscapeWc =
-        tab.landscapeView && !tab.landscapeView.webContents.isDestroyed()
+        tab.landscapeView?.webContents && !tab.landscapeView.webContents.isDestroyed()
           ? tab.landscapeView.webContents
           : null;
       const portraitWc =
-        tab.portraitView && !tab.portraitView.webContents.isDestroyed()
+        tab.portraitView?.webContents && !tab.portraitView.webContents.isDestroyed()
           ? tab.portraitView.webContents
           : null;
       return {
@@ -5278,6 +5433,7 @@ export class TabManager implements MirrorViewportLookup {
     this.telemetry.dispose();
     this.slowDeviceEmulation.dispose();
     this.cpuProfiler.dispose();
+    this.heapProfiler.dispose();
     this.webGlInspector.dispose();
     this.requestDedup.dispose();
     this.wsSseMux.dispose();

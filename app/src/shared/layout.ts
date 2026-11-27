@@ -1,4 +1,4 @@
-import type { LayoutInput, LayoutResult } from './types';
+import type { LayoutInput, LayoutResult, Rect } from './types';
 
 export const TOP_BAR_HEIGHT = 40;
 export const RAIL_WIDTH = 216;
@@ -15,10 +15,181 @@ export const MIN_VIEWPORT_WIDTH = 180;
 export const DEFAULT_AGENT_DOCK_WIDTH = 360;
 export const MIN_AGENT_DOCK_WIDTH = 280;
 export const MAX_AGENT_DOCK_RATIO = 0.46;
+export const MIN_AGENT_FLOAT_WIDTH = 260;
+export const MIN_AGENT_FLOAT_HEIGHT = 180;
+export const FLOAT_MARGIN_X = 8;
+export const FLOAT_MARGIN_TOP = 4;
+export const FLOAT_MARGIN_BOTTOM = 4;
+
+export type FloatResizeEdge = 'n' | 's' | 'e' | 'w' | 'ne' | 'nw' | 'se' | 'sw';
 
 export function clamp(value: number, min: number, max: number): number {
   if (max < min) return min;
   return Math.min(Math.max(value, min), max);
+}
+
+export function clampFloatBounds(
+  bounds: Partial<Rect> | undefined,
+  windowWidth: number,
+  windowHeight: number,
+): Rect {
+  const winW = Math.max(320, Math.floor(windowWidth));
+  const winH = Math.max(320, Math.floor(windowHeight));
+  const minX = FLOAT_MARGIN_X;
+  const minY = TOP_BAR_HEIGHT + FLOAT_MARGIN_TOP;
+  const maxW = Math.max(MIN_AGENT_FLOAT_WIDTH, winW - FLOAT_MARGIN_X * 2);
+  const maxH = Math.max(MIN_AGENT_FLOAT_HEIGHT, winH - minY - FLOAT_MARGIN_BOTTOM);
+
+  const rawW =
+    typeof bounds?.width === 'number' && Number.isFinite(bounds.width)
+      ? Math.floor(bounds.width)
+      : 400;
+  const rawH =
+    typeof bounds?.height === 'number' && Number.isFinite(bounds.height)
+      ? Math.floor(bounds.height)
+      : Math.min(540, winH - TOP_BAR_HEIGHT - 24);
+
+  const width = clamp(rawW, MIN_AGENT_FLOAT_WIDTH, maxW);
+  const height = clamp(rawH, MIN_AGENT_FLOAT_HEIGHT, maxH);
+
+  const rawX =
+    typeof bounds?.x === 'number' && Number.isFinite(bounds.x)
+      ? Math.floor(bounds.x)
+      : winW - width - 14;
+  const rawY =
+    typeof bounds?.y === 'number' && Number.isFinite(bounds.y)
+      ? Math.floor(bounds.y)
+      : TOP_BAR_HEIGHT + 12;
+
+  const x = clamp(rawX, minX, Math.max(minX, winW - width - FLOAT_MARGIN_X));
+  const y = clamp(rawY, minY, Math.max(minY, winH - height - FLOAT_MARGIN_BOTTOM));
+  return { x, y, width, height };
+}
+
+export function computeResizedFloatBounds(
+  origin: Rect,
+  edge: FloatResizeEdge,
+  dx: number,
+  dy: number,
+  windowWidth?: number,
+  windowHeight?: number,
+): Rect {
+  const safeDx = Number.isFinite(dx) ? Math.round(dx) : 0;
+  const safeDy = Number.isFinite(dy) ? Math.round(dy) : 0;
+  const minX = FLOAT_MARGIN_X;
+  const minY = TOP_BAR_HEIGHT + FLOAT_MARGIN_TOP;
+  const hasWin =
+    typeof windowWidth === 'number' &&
+    Number.isFinite(windowWidth) &&
+    typeof windowHeight === 'number' &&
+    Number.isFinite(windowHeight);
+  const winW = hasWin ? Math.max(320, Math.floor(windowWidth!)) : 0;
+  const winH = hasWin ? Math.max(320, Math.floor(windowHeight!)) : 0;
+
+  const right = origin.x + origin.width;
+  const bottom = origin.y + origin.height;
+
+  let x = origin.x;
+  let y = origin.y;
+  let width = origin.width;
+  let height = origin.height;
+
+  if (edge.includes('w')) {
+    const maxW = hasWin
+      ? Math.max(MIN_AGENT_FLOAT_WIDTH, right - minX)
+      : Number.POSITIVE_INFINITY;
+    width = clamp(origin.width - safeDx, MIN_AGENT_FLOAT_WIDTH, maxW);
+    x = right - width;
+  } else if (edge.includes('e')) {
+    const maxW = hasWin
+      ? Math.max(MIN_AGENT_FLOAT_WIDTH, winW - FLOAT_MARGIN_X - origin.x)
+      : Number.POSITIVE_INFINITY;
+    width = clamp(origin.width + safeDx, MIN_AGENT_FLOAT_WIDTH, maxW);
+  }
+
+  if (edge.includes('n')) {
+    const maxH = hasWin
+      ? Math.max(MIN_AGENT_FLOAT_HEIGHT, bottom - minY)
+      : Number.POSITIVE_INFINITY;
+    height = clamp(origin.height - safeDy, MIN_AGENT_FLOAT_HEIGHT, maxH);
+    y = bottom - height;
+  } else if (edge.includes('s')) {
+    const maxH = hasWin
+      ? Math.max(MIN_AGENT_FLOAT_HEIGHT, winH - FLOAT_MARGIN_BOTTOM - origin.y)
+      : Number.POSITIVE_INFINITY;
+    height = clamp(origin.height + safeDy, MIN_AGENT_FLOAT_HEIGHT, maxH);
+  }
+
+  if (hasWin) {
+    return clampFloatBounds({ x, y, width, height }, winW, winH);
+  }
+  return {
+    x: Math.round(x),
+    y: Math.round(y),
+    width: Math.round(width),
+    height: Math.round(height),
+  };
+}
+
+export function clampAnchoredFloatBoundsUpdate(
+  current: Rect,
+  partial: Partial<Rect>,
+  windowWidth: number,
+  windowHeight: number,
+): Rect {
+  const winW = Math.max(320, Math.floor(windowWidth));
+  const winH = Math.max(320, Math.floor(windowHeight));
+  const minX = FLOAT_MARGIN_X;
+  const maxRight = Math.max(minX + MIN_AGENT_FLOAT_WIDTH, winW - FLOAT_MARGIN_X);
+  const minY = TOP_BAR_HEIGHT + FLOAT_MARGIN_TOP;
+  const maxBottom = Math.max(minY + MIN_AGENT_FLOAT_HEIGHT, winH - FLOAT_MARGIN_BOTTOM);
+
+  const hasX = typeof partial.x === 'number' && Number.isFinite(partial.x);
+  const hasY = typeof partial.y === 'number' && Number.isFinite(partial.y);
+  const hasW = typeof partial.width === 'number' && Number.isFinite(partial.width);
+  const hasH = typeof partial.height === 'number' && Number.isFinite(partial.height);
+
+  const rawX = hasX ? Math.round(partial.x!) : current.x;
+  const rawW = hasW ? Math.round(partial.width!) : current.width;
+  let x: number;
+  let width: number;
+  if (hasW) {
+    if (hasX && rawX < minX) {
+      const anchoredRight = clamp(rawX + rawW, minX + MIN_AGENT_FLOAT_WIDTH, maxRight);
+      x = minX;
+      width = Math.max(MIN_AGENT_FLOAT_WIDTH, anchoredRight - minX);
+    } else {
+      x = clamp(rawX, minX, Math.max(minX, maxRight - MIN_AGENT_FLOAT_WIDTH));
+      width = clamp(rawW, MIN_AGENT_FLOAT_WIDTH, Math.max(MIN_AGENT_FLOAT_WIDTH, maxRight - x));
+    }
+  } else {
+    width = clamp(rawW, MIN_AGENT_FLOAT_WIDTH, Math.max(MIN_AGENT_FLOAT_WIDTH, maxRight - minX));
+    x = clamp(rawX, minX, Math.max(minX, maxRight - width));
+  }
+
+  const rawY = hasY ? Math.round(partial.y!) : current.y;
+  const rawH = hasH ? Math.round(partial.height!) : current.height;
+  let y: number;
+  let height: number;
+  if (hasH) {
+    if (hasY && rawY < minY) {
+      const anchoredBottom = clamp(rawY + rawH, minY + MIN_AGENT_FLOAT_HEIGHT, maxBottom);
+      y = minY;
+      height = Math.max(MIN_AGENT_FLOAT_HEIGHT, anchoredBottom - minY);
+    } else {
+      y = clamp(rawY, minY, Math.max(minY, maxBottom - MIN_AGENT_FLOAT_HEIGHT));
+      height = clamp(rawH, MIN_AGENT_FLOAT_HEIGHT, Math.max(MIN_AGENT_FLOAT_HEIGHT, maxBottom - y));
+    }
+  } else {
+    height = clamp(
+      rawH,
+      MIN_AGENT_FLOAT_HEIGHT,
+      Math.max(MIN_AGENT_FLOAT_HEIGHT, maxBottom - minY),
+    );
+    y = clamp(rawY, minY, Math.max(minY, maxBottom - height));
+  }
+
+  return clampFloatBounds({ x, y, width, height }, winW, winH);
 }
 
 export function computeFitScale(
@@ -64,24 +235,7 @@ export function computeLayout(input: LayoutInput): LayoutResult {
       height: winH - TOP_BAR_HEIGHT,
     };
   } else if (agentMode === 'floating' || (agentMode === 'docked' && availableAfterRail < MIN_VIEWPORT_WIDTH + MIN_AGENT_DOCK_WIDTH)) {
-    const fb = input.agentFloatBounds;
-    const fw = clamp(Math.floor(fb?.width ?? 400), 260, Math.max(260, winW - 16));
-    const fh = clamp(
-      Math.floor(fb?.height ?? Math.min(540, winH - TOP_BAR_HEIGHT - 24)),
-      180,
-      Math.max(180, winH - TOP_BAR_HEIGHT - 8),
-    );
-    const fx = clamp(
-      Math.floor(fb?.x ?? winW - fw - 14),
-      8,
-      Math.max(8, winW - fw - 8),
-    );
-    const fy = clamp(
-      Math.floor(fb?.y ?? TOP_BAR_HEIGHT + 12),
-      TOP_BAR_HEIGHT + 4,
-      Math.max(TOP_BAR_HEIGHT + 4, winH - fh - 4),
-    );
-    agentDock = { x: fx, y: fy, width: fw, height: fh };
+    agentDock = clampFloatBounds(input.agentFloatBounds, winW, winH);
   }
 
   const contentW = Math.max(MIN_VIEWPORT_WIDTH, availableAfterRail - rightReservedW);

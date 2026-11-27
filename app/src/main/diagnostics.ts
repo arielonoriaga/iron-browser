@@ -1,3 +1,4 @@
+import { spawn, type ChildProcess } from 'node:child_process';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
@@ -83,8 +84,17 @@ export function resolveStateLogDir(opts?: {
   if (explicit) {
     return path.resolve(explicit);
   }
-  if (opts?.isSmoke && opts.userDataDir) {
-    return path.join(path.resolve(opts.userDataDir), 'logs');
+  const envUserData = process.env.IRON_BROWSER_USER_DATA?.trim();
+  const candidateUserData = opts?.userDataDir?.trim() || envUserData;
+  if (candidateUserData) {
+    const resolvedUd = path.resolve(candidateUserData);
+    const isCustomUserData =
+      Boolean(opts?.isSmoke) ||
+      Boolean(envUserData) ||
+      path.basename(resolvedUd) !== 'iron-browser-app';
+    if (isCustomUserData) {
+      return path.join(resolvedUd, 'logs');
+    }
   }
   const xdgState = process.env.XDG_STATE_HOME?.trim();
   if (xdgState) {
@@ -680,6 +690,94 @@ export class MainThreadWatchdog {
       const w = this.worker;
       this.worker = null;
       void w.terminate().catch(() => {});
+    }
+  }
+}
+
+/**
+ * Out-of-process zero-CPU pipe-EOF monitor that records fatal native crashes (`SIGSEGV`, `SIGABRT`,
+ * `SIGBUS`, `SIGILL`) or external `SIGKILL`s into `main.log` even when V8/Node exit hooks cannot run.
+ */
+export class AbnormalExitMonitor {
+  private child: ChildProcess | null = null;
+  private notifiedClean = false;
+
+  constructor(
+    private readonly opts: {
+      pid?: number;
+      logPath: string;
+      crashDumpsDir: string;
+    },
+  ) {}
+
+  start(): void {
+    if (process.platform === 'win32' || this.child) return;
+    if (!this.opts.logPath || !fs.existsSync('/bin/sh')) return;
+    const pidStr = String(this.opts.pid ?? process.pid);
+    const script = [
+      'IFS= read -r status_line || true',
+      '[ "$status_line" = "clean" ] && exit 0',
+      'sleep 0.05 2>/dev/null || sleep 1',
+      'pid="$1"; log_path="$2"; crash_dir="$3"',
+      '[ -z "$log_path" ] && exit 0',
+      '[ -L "$log_path" ] && exit 0',
+      'log_dir=$(dirname "$log_path")',
+      '[ -L "$log_dir" ] && exit 0',
+      'latest_dmp=""',
+      'if [ -d "$crash_dir" ] && [ ! -L "$crash_dir" ]; then',
+      '  for d in "$crash_dir/pending" "$crash_dir/completed" "$crash_dir"; do',
+      '    [ -d "$d" ] && [ ! -L "$d" ] || continue',
+      '    cand=$(ls -1t "$d"/*.dmp 2>/dev/null | head -n 1)',
+      '    if [ -n "$cand" ]; then latest_dmp="$cand"; break; fi',
+      '  done',
+      'fi',
+      'ts=$(date -u +"%Y-%m-%dT%H:%M:%S.000Z" 2>/dev/null || echo "")',
+      'esc_dmp=$(printf "%s" "$latest_dmp" | tr -d \'\\n\\r"\\\\\')',
+      'if [ -n "$esc_dmp" ]; then',
+      '  printf \'{"ts":"%s","pid":%s,"level":"fatal","event":"process.abnormal_exit","reason":"native_signal_or_sigkill","latestCrashDump":"%s"}\\n\' "$ts" "$pid" "$esc_dmp" >> "$log_path" 2>/dev/null || true',
+      'else',
+      '  printf \'{"ts":"%s","pid":%s,"level":"fatal","event":"process.abnormal_exit","reason":"native_signal_or_sigkill"}\\n\' "$ts" "$pid" >> "$log_path" 2>/dev/null || true',
+      'fi',
+    ].join('\n');
+
+    try {
+      const child = spawn(
+        '/bin/sh',
+        ['-c', script, '_', pidStr, this.opts.logPath, this.opts.crashDumpsDir],
+        {
+          detached: true,
+          stdio: ['pipe', 'ignore', 'ignore'],
+        },
+      );
+      child.unref();
+      child.stdin?.on('error', () => {});
+      (child.stdin as unknown as { unref?: () => void })?.unref?.();
+      this.child = child;
+    } catch {
+      this.child = null;
+    }
+  }
+
+  notifyCleanExit(): void {
+    if (this.notifiedClean) return;
+    this.notifiedClean = true;
+    const child = this.child;
+    this.child = null;
+    if (!child) return;
+    try {
+      const rawFd = (child.stdin as unknown as { _handle?: { fd?: number } })?._handle?.fd;
+      if (typeof rawFd === 'number' && rawFd >= 0) {
+        fs.writeSync(rawFd, 'clean\n');
+      } else {
+        child.stdin?.write('clean\n');
+      }
+    } catch {
+      // Ignore broken pipe if helper already exited.
+    }
+    try {
+      child.stdin?.destroy();
+    } catch {
+      // Ignore stream close errors.
     }
   }
 }

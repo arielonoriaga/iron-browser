@@ -11,7 +11,19 @@ import {
   writePerWindowMcpConfig,
 } from '../src/main/agent-dock';
 import { MirrorRelay, type IpcMainLike } from '../src/main/mirror-relay';
-import { computeLayout } from '../src/shared/layout';
+import {
+  clampAnchoredFloatBoundsUpdate,
+  clampFloatBounds,
+  computeLayout,
+  computeResizedFloatBounds,
+  FLOAT_MARGIN_BOTTOM,
+  FLOAT_MARGIN_TOP,
+  FLOAT_MARGIN_X,
+  MIN_AGENT_FLOAT_HEIGHT,
+  MIN_AGENT_FLOAT_WIDTH,
+  TOP_BAR_HEIGHT,
+} from '../src/shared/layout';
+import { sanitizePersistedSession } from '../src/shared/session-store';
 import { buildWebGlInspectorInitScript } from '../src/shared/webgl-inspector-core';
 import type { ElementFingerprint, ViewportRole } from '../src/shared/types';
 
@@ -518,5 +530,192 @@ describe('Embedded Multi-CLI & Running-Instance Agent Chat Dock', () => {
       mgr.dispose();
       fs.rmSync(tmpDir, { recursive: true, force: true });
     }
+  });
+
+  test('floating Agent Dock supports custom 8-edge/corner resizing with anchored opposite edges, window clamping, and session persistence', () => {
+    const winW = 1480;
+    const winH = 920;
+    const origin = { x: 500, y: 200, width: 400, height: 350 };
+
+    // 1. East & South expand cleanly while anchoring x/y
+    expect(computeResizedFloatBounds(origin, 'e', 120, 40, winW, winH)).toEqual({
+      x: 500,
+      y: 200,
+      width: 520,
+      height: 350,
+    });
+    expect(computeResizedFloatBounds(origin, 's', 40, 110, winW, winH)).toEqual({
+      x: 500,
+      y: 200,
+      width: 400,
+      height: 460,
+    });
+    expect(computeResizedFloatBounds(origin, 'se', 150, 90, winW, winH)).toEqual({
+      x: 500,
+      y: 200,
+      width: 550,
+      height: 440,
+    });
+
+    // 2. West & North anchor right/bottom even when shrunk past minimum dimensions
+    const westMin = computeResizedFloatBounds(origin, 'w', 500, 0, winW, winH);
+    expect(westMin.width).toBe(MIN_AGENT_FLOAT_WIDTH);
+    expect(westMin.x + westMin.width).toBe(origin.x + origin.width);
+
+    const northMin = computeResizedFloatBounds(origin, 'n', 0, 500, winW, winH);
+    expect(northMin.height).toBe(MIN_AGENT_FLOAT_HEIGHT);
+    expect(northMin.y + northMin.height).toBe(origin.y + origin.height);
+
+    // 3. NW corner expanding past left/top window margins anchors right/bottom without sliding
+    const nwPastMargin = computeResizedFloatBounds(origin, 'nw', -900, -500, winW, winH);
+    expect(nwPastMargin.x).toBe(FLOAT_MARGIN_X);
+    expect(nwPastMargin.y).toBe(TOP_BAR_HEIGHT + FLOAT_MARGIN_TOP);
+    expect(nwPastMargin.x + nwPastMargin.width).toBe(origin.x + origin.width);
+    expect(nwPastMargin.y + nwPastMargin.height).toBe(origin.y + origin.height);
+
+    // 4. NE and SW corners resize diagonally with exact opposite-corner anchoring
+    const neRes = computeResizedFloatBounds(origin, 'ne', 80, -60, winW, winH);
+    expect(neRes).toEqual({ x: 500, y: 140, width: 480, height: 410 });
+    const swRes = computeResizedFloatBounds(origin, 'sw', -75, 55, winW, winH);
+    expect(swRes).toEqual({ x: 425, y: 200, width: 475, height: 405 });
+
+    // 5. SE expanding past right/bottom clamps cleanly to window margins without shifting x/y
+    const sePastMargin = computeResizedFloatBounds(origin, 'se', 2000, 2000, winW, winH);
+    expect(sePastMargin.x).toBe(500);
+    expect(sePastMargin.y).toBe(200);
+    expect(sePastMargin.x + sePastMargin.width).toBe(winW - FLOAT_MARGIN_X);
+    expect(sePastMargin.y + sePastMargin.height).toBe(winH - FLOAT_MARGIN_BOTTOM);
+
+    // 6. Non-finite deltas are ignored cleanly
+    expect(computeResizedFloatBounds(origin, 'se', Number.NaN, Number.POSITIVE_INFINITY)).toEqual(origin);
+
+    // 7. Main-process anchored clamping preserves right/bottom on west/north overflow and preserves size on move-only
+    const anchoredWest = clampAnchoredFloatBoundsUpdate(
+      origin,
+      { x: -100, width: 1000 },
+      winW,
+      winH,
+    );
+    expect(anchoredWest.x).toBe(FLOAT_MARGIN_X);
+    expect(anchoredWest.x + anchoredWest.width).toBe(900);
+
+    const moveOnly = clampAnchoredFloatBoundsUpdate(origin, { x: -50, y: 0 }, winW, winH);
+    expect(moveOnly).toEqual({
+      x: FLOAT_MARGIN_X,
+      y: TOP_BAR_HEIGHT + FLOAT_MARGIN_TOP,
+      width: 400,
+      height: 350,
+    });
+
+    // 8. AgentDockManager clamps setFloatBounds against window size and syncs applyBounds on window shrink
+    const pushedStates: Array<{ floatBounds: { x: number; y: number; width: number; height: number } }> = [];
+    const fakeWc = Object.assign(new EventEmitter(), {
+      id: 888,
+      mainFrame: { id: 1 },
+      isDestroyed: () => false,
+      send: (ch: string, payload: any) => {
+        if (ch === 'agent:state') pushedStates.push(payload);
+      },
+      close: () => {},
+    });
+    let currentWinSize: [number, number] = [1480, 920];
+    const appliedRects: Array<{ x: number; y: number; width: number; height: number }> = [];
+    const fakeWin: any = {
+      isDestroyed: () => false,
+      getContentSize: () => currentWinSize,
+      contentView: { addChildView: () => {}, removeChildView: () => {} },
+    };
+
+    const mgr = new AgentDockManager(
+      fakeWin,
+      '/nonexistent/preload.js',
+      '/nonexistent/dock.html',
+      {
+        getSocketPath: () => '/tmp/fake.sock',
+        getActiveTabId: () => 'tab-1',
+        getBrowserContextSnippet: () => '',
+        onLayoutChanged: () => {
+          const rect = clampFloatBounds(mgr.getState().floatBounds, currentWinSize[0], currentWinSize[1]);
+          mgr.applyBounds(rect);
+        },
+      },
+      {
+        initialMode: 'floating',
+        initialFloatBounds: { x: 600, y: 120, width: 520, height: 480 },
+        ptyBinding: null,
+      },
+    );
+    (mgr as any).view = {
+      webContents: fakeWc,
+      setVisible: () => {},
+      setBounds: (r: any) => appliedRects.push(r),
+    };
+
+    try {
+      expect(mgr.getState().floatBounds).toEqual({ x: 600, y: 120, width: 520, height: 480 });
+      const resized = mgr.setFloatBounds({ x: 300, y: 90, width: 700, height: 610 });
+      expect(resized.floatBounds).toEqual({ x: 300, y: 90, width: 700, height: 610 });
+      expect(appliedRects[appliedRects.length - 1]).toEqual({ x: 300, y: 90, width: 700, height: 610 });
+
+      // Shrinking main window clamps floatBounds and pushes updated state to renderer
+      pushedStates.length = 0;
+      currentWinSize = [800, 500];
+      mgr.applyBounds(clampFloatBounds(mgr.getState().floatBounds, 800, 500));
+      expect(mgr.getState().floatBounds).toEqual({
+        x: 92,
+        y: 44,
+        width: 700,
+        height: 452,
+      });
+      expect(pushedStates.length).toBe(1);
+      expect(pushedStates[0]!.floatBounds).toEqual(mgr.getState().floatBounds);
+    } finally {
+      mgr.dispose();
+    }
+
+    // 9. Persisted session sanitizes custom agentFloatBounds cleanly
+    const persisted = sanitizePersistedSession({
+      version: 1,
+      savedAt: 1000,
+      railCollapsed: false,
+      dockOpen: false,
+      dockHeight: 280,
+      splitRatio: 0.35,
+      theme: 'dark',
+      agentFloatBounds: { x: 320.4, y: 95.6, width: 640, height: 520 },
+      activeTabIndex: 0,
+      tabs: [],
+      history: [],
+    });
+    expect(persisted?.agentFloatBounds).toEqual({ x: 320, y: 96, width: 640, height: 520 });
+
+    const clampedPersisted = sanitizePersistedSession({
+      version: 1,
+      savedAt: 1000,
+      railCollapsed: false,
+      dockOpen: false,
+      dockHeight: 280,
+      splitRatio: 0.35,
+      theme: 'dark',
+      agentFloatBounds: { x: -50, y: -10, width: 50, height: 40 },
+      activeTabIndex: 0,
+      tabs: [],
+      history: [],
+    });
+    expect(clampedPersisted?.agentFloatBounds).toEqual({
+      x: 0,
+      y: 0,
+      width: MIN_AGENT_FLOAT_WIDTH,
+      height: MIN_AGENT_FLOAT_HEIGHT,
+    });
+
+    // 10. Renderer HTML/CSS expose all 8 floating resize handles gated on .dock-root.floating
+    const html = fs.readFileSync(path.resolve(import.meta.dir, '../src/renderer/agent-dock.html'), 'utf8');
+    const css = fs.readFileSync(path.resolve(import.meta.dir, '../src/renderer/agent-dock.css'), 'utf8');
+    for (const edge of ['n', 's', 'e', 'w', 'ne', 'nw', 'se', 'sw']) {
+      expect(html).toContain(`data-resize-edge="${edge}"`);
+      expect(css).toContain(`.handle-${edge}`);
+    }
+    expect(css).toContain('.dock-root.floating .float-resize-handle');
   });
 });

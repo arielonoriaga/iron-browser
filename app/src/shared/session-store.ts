@@ -1,5 +1,6 @@
 import type {
   HistoryEntry,
+  Rect,
   SessionMode,
   ThemeMode,
   ViewMode,
@@ -11,7 +12,14 @@ import {
   DEFAULT_PORTRAIT_PRESET_ID,
   DEVICE_PRESETS,
 } from './presets';
-import { clamp, MAX_SPLIT_RATIO, MIN_DOCK_HEIGHT, MIN_SPLIT_RATIO } from './layout';
+import {
+  clamp,
+  MAX_SPLIT_RATIO,
+  MIN_AGENT_FLOAT_HEIGHT,
+  MIN_AGENT_FLOAT_WIDTH,
+  MIN_DOCK_HEIGHT,
+  MIN_SPLIT_RATIO,
+} from './layout';
 
 export const MAX_PERSISTED_TABS = 24;
 export const MAX_HISTORY_ENTRIES = 30;
@@ -53,6 +61,7 @@ export interface PersistedSession {
   theme: ThemeMode;
   ecoMode?: boolean;
   autoSleep?: boolean;
+  agentFloatBounds?: Rect;
   activeTabIndex: number;
   tabs: PersistedTab[];
   history: HistoryEntry[];
@@ -390,6 +399,29 @@ export function sanitizePersistedSession(raw: unknown): PersistedSession | null 
       : 0;
   const activeTabIndex = tabs.length > 0 ? clamp(rawActiveIdx, 0, tabs.length - 1) : 0;
 
+  const rawFloat = obj.agentFloatBounds;
+  let agentFloatBounds: Rect | undefined;
+  if (rawFloat && typeof rawFloat === 'object' && !Array.isArray(rawFloat)) {
+    const f = rawFloat as Record<string, unknown>;
+    if (
+      typeof f.x === 'number' &&
+      Number.isFinite(f.x) &&
+      typeof f.y === 'number' &&
+      Number.isFinite(f.y) &&
+      typeof f.width === 'number' &&
+      Number.isFinite(f.width) &&
+      typeof f.height === 'number' &&
+      Number.isFinite(f.height)
+    ) {
+      agentFloatBounds = {
+        x: Math.round(clamp(f.x, 0, 8192)),
+        y: Math.round(clamp(f.y, 0, 8192)),
+        width: Math.round(clamp(f.width, MIN_AGENT_FLOAT_WIDTH, 4096)),
+        height: Math.round(clamp(f.height, MIN_AGENT_FLOAT_HEIGHT, 4096)),
+      };
+    }
+  }
+
   return {
     version: 1,
     savedAt:
@@ -404,6 +436,7 @@ export function sanitizePersistedSession(raw: unknown): PersistedSession | null 
     theme: asEnumOrDefault<ThemeMode>(obj.theme, ['dark', 'light'], 'dark'),
     ecoMode: typeof obj.ecoMode === 'boolean' ? obj.ecoMode : true,
     autoSleep: typeof obj.autoSleep === 'boolean' ? obj.autoSleep : false,
+    ...(agentFloatBounds ? { agentFloatBounds } : {}),
     activeTabIndex,
     tabs,
     history,

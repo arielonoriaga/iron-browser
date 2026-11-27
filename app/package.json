@@ -1,7 +1,7 @@
 {
   "name": "iron-browser-app",
   "desktopName": "iron-browser.desktop",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "private": true,
   "description": "IronBrowser — Ultra-lean multi-viewport Zen Chromium developer browser",
   "main": "dist/main/index.js",

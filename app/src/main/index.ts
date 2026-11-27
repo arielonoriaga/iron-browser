@@ -2,6 +2,7 @@ import * as electron from 'electron';
 import type { BrowserWindow as BrowserWindowType, IpcMainInvokeEvent } from 'electron';
 
 const { app, BrowserWindow, crashReporter, ipcMain, screen } = electron;
+import fs from 'node:fs';
 import path from 'node:path';
 import { pathToFileURL } from 'node:url';
 import type { AgentDockMode, SessionMode, ThemeMode, ViewMode, ViewportRole } from '../shared/types';
@@ -10,9 +11,11 @@ import { normalizeUrl } from '../shared/url';
 import { AgentDockManager } from './agent-dock';
 import { ControlSocketServer, resolveControlSocketPath } from './ctl-socket';
 import {
+  AbnormalExitMonitor,
   MainThreadWatchdog,
   resolveCrashDumpsDir,
   resolveStateLogDir,
+  scanLatestCrashDump,
   StructuredLogger,
 } from './diagnostics';
 import { loadPersistedSession, savePersistedSession } from './session-file';
@@ -75,6 +78,7 @@ let agentDock: AgentDockManager | null = null;
 let ctlServer: ControlSocketServer | null = null;
 let diagLogger: StructuredLogger | null = null;
 let watchdog: MainThreadWatchdog | null = null;
+let exitMonitor: AbnormalExitMonitor | null = null;
 let sessionFilePath: string | null = null;
 let persistTimer: ReturnType<typeof setTimeout> | null = null;
 let lastNormalBounds: PersistedWindowBounds | undefined;
@@ -490,7 +494,7 @@ async function createMainWindow(): Promise<void> {
   }
 
   diagLogger?.info('lifecycle.startup', {
-    version: '0.1.0',
+    version: '0.1.1',
     electronVersion: process.versions.electron ?? 'unknown',
     nodeVersion: process.versions.node ?? 'unknown',
     smoke: isSmoke,
@@ -498,9 +502,49 @@ async function createMainWindow(): Promise<void> {
     logPath: diagLogger?.logPath ?? null,
     crashDumpsDir,
   });
+  try {
+    const latestDump = scanLatestCrashDump(crashDumpsDir);
+    if (latestDump) {
+      const markerPath = path.join(userDataDir, '.last-reported-crashdump');
+      let prevSeen = '';
+      try {
+        if (fs.existsSync(markerPath) && !fs.lstatSync(markerPath).isSymbolicLink()) {
+          prevSeen = fs.readFileSync(markerPath, 'utf8').trim();
+        }
+      } catch {
+        // Ignore read error.
+      }
+      const dumpKey = `${latestDump.path}|${latestDump.mtimeMs}`;
+      if (prevSeen !== dumpKey) {
+        diagLogger?.error('lifecycle.previous_native_crash_dump', {
+          dumpPath: latestDump.path,
+          dumpMtimeIso: latestDump.mtimeIso,
+          sizeBytes: latestDump.sizeBytes,
+          totalDumps: latestDump.totalDumps,
+        });
+        try {
+          if (!fs.existsSync(markerPath) || !fs.lstatSync(markerPath).isSymbolicLink()) {
+            fs.writeFileSync(markerPath, dumpKey, { mode: 0o600 });
+          }
+        } catch {
+          // Ignore marker write error.
+        }
+      }
+    }
+  } catch {
+    // Ignore post-mortem dump check failure.
+  }
   process.stderr.write(
     `IronBrowser diagnostics: log=${diagLogger?.logPath ?? 'disabled'} crashDumps=${crashDumpsDir}\n`,
   );
+  if (diagLogger?.logPath) {
+    exitMonitor = new AbnormalExitMonitor({
+      pid: process.pid,
+      logPath: diagLogger.logPath,
+      crashDumpsDir,
+    });
+    exitMonitor.start();
+  }
 
   const explicitStateFile = process.env.IRON_BROWSER_STATE_FILE?.trim();
   sessionFilePath = explicitStateFile
@@ -613,12 +657,16 @@ async function createMainWindow(): Promise<void> {
       getBrowserContextSnippet: () => mgr.buildBrowserContextSnippet(),
       onLayoutChanged: () => {
         mgr.applyLayout();
+        scheduleSessionSave();
         if (!win.isDestroyed()) {
           win.webContents.send('shell:state', mgr.getShellState());
         }
       },
     },
-    { initialMode: isSmoke ? 'minimized' : 'docked' },
+    {
+      initialMode: isSmoke ? 'minimized' : 'docked',
+      initialFloatBounds: savedSession?.agentFloatBounds,
+    },
   );
   agentDock = dock;
   dock.registerIpcHandlers();
@@ -677,6 +725,31 @@ if (typeof app?.whenReady === 'function') {
     );
   });
 
+  app.on('render-process-gone', (_ev, wc, details) => {
+    const hit = tabManager?.findByWebContentsId(wc.id);
+    let safeUrl = '';
+    try {
+      if (!wc.isDestroyed()) safeUrl = wc.getURL();
+    } catch {
+      // Ignore URL lookup on destroyed WebContents.
+    }
+    diagLogger?.error('app.render_process_gone', {
+      wcId: wc.id,
+      osProcessId: (() => {
+        try {
+          return !wc.isDestroyed() ? wc.getOSProcessId() : null;
+        } catch {
+          return null;
+        }
+      })(),
+      tabId: hit?.tabId ?? null,
+      viewport: hit?.role ?? null,
+      reason: details?.reason ?? 'unknown',
+      exitCode: details?.exitCode ?? null,
+      url: safeUrl,
+    });
+  });
+
   app.on('child-process-gone', (_ev, details) => {
     diagLogger?.error('app.child_process_gone', {
       type: details?.type ?? 'unknown',
@@ -685,6 +758,14 @@ if (typeof app?.whenReady === 'function') {
       serviceName: details?.serviceName ?? null,
       name: details?.name ?? null,
     });
+  });
+
+  let exitLogged = false;
+  process.on('exit', (code) => {
+    exitMonitor?.notifyCleanExit();
+    if (exitLogged) return;
+    exitLogged = true;
+    diagLogger?.log('info', 'process.exit', { exitCode: code, reason: quitReason }, true);
   });
 
   app.whenReady().then(() => {

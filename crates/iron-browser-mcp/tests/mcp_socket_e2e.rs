@@ -200,6 +200,20 @@ fn spawn_mock_browser_socket(
                         Value::Null
                     }
                 }),
+                "browser_heap" => json!({
+                    "ok": true,
+                    "action": req.params["action"],
+                    "tabId": req.params.get("tab").or_else(|| req.params.get("tab_id")).cloned().unwrap_or_else(|| json!("tab-1")),
+                    "viewport": req.params.get("viewport").cloned().unwrap_or_else(|| json!("portrait")),
+                    "snapshotPath": "/tmp/heap-tab-1-portrait.heapsnapshot",
+                    "summary": {
+                        "totalHeapBytes": 12582912,
+                        "usedHeapBytes": 8388608,
+                        "detachedDomNodeCount": 2,
+                        "constructors": [{"name": "Array", "count": 412, "selfBytes": 65536, "retainedBytes": 262144}],
+                        "largestObjects": [{"objectId": 101, "name": "CartStore", "retainedBytes": 524288}]
+                    }
+                }),
                 "browser_health" => json!({
                     "ok": true,
                     "socketReachable": true,
@@ -259,8 +273,8 @@ fn spawn_mock_browser_socket(
 }
 
 #[test]
-fn mcp_end_to_end_exercises_all_nineteen_tools_over_framed_unix_socket() {
-    let (_dir, sock_path, server) = spawn_mock_browser_socket(19);
+fn mcp_end_to_end_exercises_all_twenty_tools_over_framed_unix_socket() {
+    let (_dir, sock_path, server) = spawn_mock_browser_socket(20);
     let client = SocketClient::new(sock_path);
 
     let requests = vec![
@@ -274,7 +288,7 @@ fn mcp_end_to_end_exercises_all_nineteen_tools_over_framed_unix_socket() {
         json!({"jsonrpc":"2.0","id":7,"method":"tools/call","params":{"name":"browser_metrics","arguments":{}}}),
         json!({"jsonrpc":"2.0","id":8,"method":"tools/call","params":{"name":"browser_interact","arguments":{"action":"click","selector":"[data-testid=\"play\"]","mirror":true}}}),
         json!({"jsonrpc":"2.0","id":9,"method":"tools/call","params":{"name":"browser_console","arguments":{"viewport":"both","level":"error","include_incidents":true}}}),
-        json!({"jsonrpc":"2.0","id":10,"method":"tools/call","params":{"name":"browser_network","arguments":{"filter":"5xx","include_incidents":true}}}),
+        json!({"jsonrpc":"2.0","id":10,"method":"tools/call","params":{"name":"browser_network","arguments":{"filter":"5xx","url_contains":"/api/v1","include_incidents":true}}}),
         json!({"jsonrpc":"2.0","id":11,"method":"tools/call","params":{"name":"browser_eval","arguments":{"expression":"document.title","max_bytes":999999}}}),
         json!({"jsonrpc":"2.0","id":12,"method":"tools/call","params":{"name":"browser_incidents","arguments":{"viewport":"both"}}}),
         json!({"jsonrpc":"2.0","id":13,"method":"tools/call","params":{"name":"browser_repro","arguments":{"action":"step","frame":120,"seed":"s1","multiplier":1.94}}}),
@@ -284,8 +298,9 @@ fn mcp_end_to_end_exercises_all_nineteen_tools_over_framed_unix_socket() {
         json!({"jsonrpc":"2.0","id":17,"method":"tools/call","params":{"name":"browser_events","arguments":{"domain":"download","gesture_seq":1}}}),
         json!({"jsonrpc":"2.0","id":18,"method":"tools/call","params":{"name":"browser_emulate","arguments":{"tab":"tab-1","profile":"sunmi-v2-pro","calibrate":true}}}),
         json!({"jsonrpc":"2.0","id":19,"method":"tools/call","params":{"name":"browser_profile","arguments":{"tab":"tab-1","viewport":"portrait","action":"stop","top":10}}}),
-        json!({"jsonrpc":"2.0","id":20,"method":"tools/call","params":{"name":"browser_health","arguments":{"lines":25}}}),
-        json!({"jsonrpc":"2.0","id":21,"method":"tools/call","params":{"name":"browser_webgl","arguments":{"viewport":"portrait","action":"capture_frame","max_calls":64}}}),
+        json!({"jsonrpc":"2.0","id":20,"method":"tools/call","params":{"name":"browser_heap","arguments":{"tab":"tab-1","viewport":"portrait","action":"snapshot","top":30}}}),
+        json!({"jsonrpc":"2.0","id":21,"method":"tools/call","params":{"name":"browser_health","arguments":{"lines":25}}}),
+        json!({"jsonrpc":"2.0","id":22,"method":"tools/call","params":{"name":"browser_webgl","arguments":{"viewport":"portrait","action":"capture_frame","max_calls":64}}}),
     ];
 
     let mut wire_in = String::new();
@@ -300,10 +315,12 @@ fn mcp_end_to_end_exercises_all_nineteen_tools_over_framed_unix_socket() {
         .expect("serve_io succeeds");
 
     let received = server.join().expect("mock socket thread joined");
-    assert_eq!(received.len(), 19);
+    assert_eq!(received.len(), 20);
     // Verify browser_eval received clamped max_bytes = 512
     assert_eq!(received[8].method, "browser_eval");
     assert_eq!(received[8].params["max_bytes"], json!(512));
+    assert_eq!(received[7].method, "browser_network");
+    assert_eq!(received[7].params["url_contains"], json!("/api/v1"));
     assert_eq!(received[3].params["exact_size"], json!(true));
     assert_eq!(received[3].params["highlight_clipped"], json!(true));
     assert_eq!(received[14].method, "browser_events");
@@ -314,11 +331,13 @@ fn mcp_end_to_end_exercises_all_nineteen_tools_over_framed_unix_socket() {
     assert_eq!(received[16].method, "browser_profile");
     assert_eq!(received[16].params["action"], json!("stop"));
     assert_eq!(received[16].params["top"], json!(10));
-    assert_eq!(received[17].method, "browser_health");
-    assert_eq!(received[17].params["lines"], json!(25));
-    assert_eq!(received[18].method, "browser_webgl");
-    assert_eq!(received[18].params["action"], json!("capture_frame"));
-    assert_eq!(received[18].params["max_calls"], json!(64));
+    assert_eq!(received[17].method, "browser_heap");
+    assert_eq!(received[17].params["action"], json!("snapshot"));
+    assert_eq!(received[18].method, "browser_health");
+    assert_eq!(received[18].params["lines"], json!(25));
+    assert_eq!(received[19].method, "browser_webgl");
+    assert_eq!(received[19].params["action"], json!("capture_frame"));
+    assert_eq!(received[19].params["max_calls"], json!(64));
 
     let lines: Vec<Value> = String::from_utf8(wire_out)
         .expect("utf8 output")
@@ -326,14 +345,14 @@ fn mcp_end_to_end_exercises_all_nineteen_tools_over_framed_unix_socket() {
         .map(|l| serde_json::from_str::<Value>(l).expect("valid json line"))
         .collect();
 
-    // 22 input lines minus 1 notification = 21 responses
-    assert_eq!(lines.len(), 21);
+    // 23 input lines minus 1 notification = 22 responses
+    assert_eq!(lines.len(), 22);
 
     // Initialize negotiated 2025-06-18
     assert_eq!(lines[0]["result"]["protocolVersion"], "2025-06-18");
 
-    // tools/list returns all 19 tools
-    assert_eq!(lines[1]["result"]["tools"].as_array().unwrap().len(), 19);
+    // tools/list returns all 20 tools
+    assert_eq!(lines[1]["result"]["tools"].as_array().unwrap().len(), 20);
 
     // browser_emulate response includes active profile & calibration result
     let emu_text = lines[17]["result"]["content"][0]["text"].as_str().unwrap();

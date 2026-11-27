@@ -454,6 +454,24 @@ export interface ConsoleEntry {
   source?: 'console-api' | 'exception' | 'log';
 }
 
+export interface NetworkInitiatorFrame {
+  functionName: string;
+  url: string;
+  line: number;
+  column: number;
+  location: string;
+  async?: boolean;
+  asyncDescription?: string;
+}
+
+export interface NetworkInitiatorInfo {
+  type: string;
+  url?: string;
+  line?: number;
+  column?: number;
+  frames: NetworkInitiatorFrame[];
+}
+
 export interface NetworkEntry {
   id: string;
   timestampMs: number;
@@ -465,8 +483,14 @@ export interface NetworkEntry {
   failed: boolean;
   errorText?: string;
   resourceType?: string;
+  mimeType?: string;
+  protocol?: string;
+  fromCache?: boolean;
+  ttfbMs?: number;
   durationMs?: number;
   encodedBytes?: number;
+  decodedBytes?: number;
+  initiator?: NetworkInitiatorInfo;
 }
 
 export interface CtlRpcRequest {

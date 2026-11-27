@@ -70,6 +70,13 @@ pub fn default_log_path() -> PathBuf {
     {
         return PathBuf::from(explicit.trim()).join("main.log");
     }
+    if let Ok(user_data) = env::var("IRON_BROWSER_USER_DATA")
+        && !user_data.trim().is_empty()
+    {
+        return PathBuf::from(user_data.trim())
+            .join("logs")
+            .join("main.log");
+    }
     if let Ok(xdg_state) = env::var("XDG_STATE_HOME")
         && !xdg_state.trim().is_empty()
     {

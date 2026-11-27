@@ -1,0 +1,330 @@
+export type ViewportRole = 'portrait' | 'landscape';
+export type ViewMode = 'single' | 'dual';
+export type SessionMode = 'shared' | 'isolated';
+export type ThemeMode = 'dark' | 'light';
+
+export interface DevicePreset {
+  id: string;
+  label: string;
+  width: number;
+  height: number;
+  dpr: number;
+  touch: boolean;
+  category: ViewportRole;
+}
+
+export interface ViewportDimensions {
+  width: number;
+  height: number;
+  dpr: number;
+}
+
+export interface Rect {
+  x: number;
+  y: number;
+  width: number;
+  height: number;
+}
+
+export interface LayoutInput {
+  windowWidth: number;
+  windowHeight: number;
+  mode: ViewMode;
+  railCollapsed: boolean;
+  dockOpen: boolean;
+  dockHeight: number;
+  splitRatio: number;
+}
+
+export interface LayoutResult {
+  topBar: Rect;
+  rail: Rect | null;
+  portraitHeader: Rect | null;
+  portraitView: Rect | null;
+  divider: Rect | null;
+  landscapeHeader: Rect;
+  landscapeView: Rect;
+  telemetryBar: Rect;
+  devtoolsHeader: Rect | null;
+  devtoolsView: Rect | null;
+  clampedSplitRatio: number;
+  clampedDockHeight: number;
+}
+
+export interface ClippedElementDetail {
+  selector: string;
+  tag: string;
+  text: string;
+  bounds: {
+    x: number;
+    y: number;
+    width: number;
+    height: number;
+  };
+  overflowPx: {
+    left: number;
+    right: number;
+  };
+}
+
+export interface ScreenshotStageError {
+  stage: string;
+  viewport: ViewportRole;
+  error: string;
+}
+
+export interface ViewportSizingSummary {
+  role: ViewportRole;
+  requestedSize: ViewportDimensions;
+  effectiveCssSize: { width: number; height: number } | null;
+  dpr: number | null;
+  capturedPixels: { width: number; height: number } | null;
+  exactSizeApplied?: boolean;
+  sizeMismatch: boolean;
+  mismatchReason?: string;
+}
+
+export interface TabSnapshot {
+  id: string;
+  title: string;
+  url: string;
+  mode: ViewMode;
+  mirror: boolean;
+  dedup: boolean;
+  session: SessionMode;
+  sleeping: boolean;
+  portraitPresetId: string;
+  landscapePresetId: string;
+  portraitSize: ViewportDimensions;
+  landscapeSize: ViewportDimensions;
+  canGoBack: boolean;
+  canGoForward: boolean;
+  loading: boolean;
+  devtoolsTarget: ViewportRole;
+  audioSource: ViewportRole | 'muted';
+  dedupCount: number;
+  viewportReport?: Partial<Record<ViewportRole, ViewportSizingSummary>>;
+}
+
+export interface HistoryEntry {
+  url: string;
+  title: string;
+  visitedAt: number;
+  visitCount: number;
+}
+
+export interface MirrorMissInfo {
+  reason: string;
+  targetLabel: string;
+  timestamp: number;
+  url?: string;
+}
+
+export interface ShellState {
+  tabs: TabSnapshot[];
+  activeTabId: string | null;
+  railCollapsed: boolean;
+  dockOpen: boolean;
+  dockHeight: number;
+  splitRatio: number;
+  theme: ThemeMode;
+  ecoMode: boolean;
+  autoSleep: boolean;
+  mirrorMiss?: MirrorMissInfo | null;
+  history: HistoryEntry[];
+  closedTabCount: number;
+}
+
+export interface ElementFingerprint {
+  testId?: string;
+  id?: string;
+  ariaLabel?: string;
+  title?: string;
+  name?: string;
+  role?: string;
+  text?: string;
+  tag: string;
+  classTokens?: string[];
+  occurrenceIndex?: number;
+  clickedSelfDirect?: boolean;
+  elemRelX?: number;
+  elemRelY?: number;
+  dismissedOverlay?: boolean;
+  iframePath?: number[];
+  toggleState?: Record<string, string | null>;
+  cssPath: string;
+  isCanvas: boolean;
+  canvasIndex?: number;
+  normalizedX?: number;
+  normalizedY?: number;
+  relViewportX: number;
+  relViewportY: number;
+}
+
+export interface MirrorCaptureMeta {
+  pointerType?: string;
+  toggleState?: Record<string, string | null>;
+  iframePath?: number[];
+  topNormX?: number;
+  topNormY?: number;
+}
+
+export type MirrorCaptureEvent = (
+  | {
+      kind: 'click' | 'pointerdown' | 'pointerup' | 'hover';
+      fingerprint: ElementFingerprint;
+      button: 'left' | 'middle' | 'right';
+      clickCount: number;
+      modifiers: string[];
+    }
+  | {
+      kind: 'input' | 'change';
+      fingerprint: ElementFingerprint;
+      value: string;
+      checked?: boolean;
+      inputType?: string;
+      inputOp?: string;
+      insertedText?: string;
+    }
+  | {
+      kind: 'keydown' | 'keyup';
+      fingerprint: ElementFingerprint;
+      key: string;
+      code: string;
+      modifiers: string[];
+    }
+  | {
+      kind: 'wheel';
+      fingerprint: ElementFingerprint;
+      deltaX: number;
+      deltaY: number;
+    }
+  | {
+      kind: 'scroll';
+      ratioX: number;
+      ratioY: number;
+      scrollX: number;
+      scrollY: number;
+    }
+) &
+  MirrorCaptureMeta;
+
+export interface FrameStats {
+  fps: number;
+  p95FrameMs: number;
+  jankCount: number;
+  recentFrameMs: number[];
+}
+
+export interface ViewportMetrics {
+  role: ViewportRole;
+  pid: number | null;
+  cpuPercent: number;
+  memoryMb: number;
+  jsHeapUsedMb: number;
+  domNodes: number;
+  layoutCount: number;
+  recalcStyleCount: number;
+  fps: number;
+  p95FrameMs: number;
+  jankCount: number;
+  recentFrameMs: number[];
+}
+
+export interface TelemetrySnapshot {
+  timestampMs: number;
+  gpuCpuPercent: number;
+  gpuProcessCpuPercent?: number;
+  gpuExecutionTimeMs?: number | null;
+  gpuMetricLabels?: {
+    gpuProcessCpuPercent: string;
+    gpuExecutionTimeMs: string;
+  };
+  gpuMemoryMb: number;
+  totalMemoryMb: number;
+  portrait: ViewportMetrics | null;
+  landscape: ViewportMetrics | null;
+  consoleErrorCount: number;
+  failedNetworkCount: number;
+  paused: boolean;
+  mirrorMiss?: MirrorMissInfo | null;
+}
+
+export interface IronShellApi {
+  getInitialState(): Promise<{ state: ShellState; presets: readonly DevicePreset[] }>;
+  newTab(url?: string, mode?: ViewMode): Promise<ShellState>;
+  closeTab(tabId: string): Promise<ShellState>;
+  selectTab(tabId: string): Promise<ShellState>;
+  sleepTab(tabId: string): Promise<ShellState>;
+  navigate(url: string): Promise<ShellState>;
+  goBack(): Promise<void>;
+  goForward(): Promise<void>;
+  reload(): Promise<void>;
+  toggleDualMode(): Promise<ShellState>;
+  toggleMirror(): Promise<ShellState>;
+  toggleDedup(tabId?: string): Promise<ShellState>;
+  toggleSessionMode(): Promise<ShellState>;
+  setSessionMode(mode: SessionMode): Promise<ShellState>;
+  setPreset(role: ViewportRole, presetId: string): Promise<ShellState>;
+  setRailCollapsed(collapsed: boolean): Promise<ShellState>;
+  setDockOpen(open: boolean): Promise<ShellState>;
+  setDockHeight(height: number): Promise<ShellState>;
+  setSplitRatio(ratio: number): Promise<ShellState>;
+  setDevToolsTarget(role: ViewportRole): Promise<ShellState>;
+  toggleAudio(role: ViewportRole): Promise<ShellState>;
+  setTheme(theme: ThemeMode): Promise<ShellState>;
+  toggleEcoMode(): Promise<ShellState>;
+  setAutoSleep(enabled: boolean): Promise<ShellState>;
+  copyMirrorMissDebug(): Promise<boolean>;
+  focusAnomaly(kind: 'console' | 'network'): Promise<ShellState>;
+  openHistoryMenu(x?: number, y?: number): Promise<void>;
+  removeHistoryItem(url: string): Promise<ShellState>;
+  clearHistory(): Promise<ShellState>;
+  reopenClosedTab(): Promise<ShellState>;
+  onStateUpdate(cb: (state: ShellState) => void): () => void;
+  onTelemetry(cb: (snapshot: TelemetrySnapshot) => void): () => void;
+  onFocusUrlBar(cb: () => void): () => void;
+}
+
+export interface ConsoleEntry {
+  id: number;
+  timestampMs: number;
+  tabId: string;
+  viewport: ViewportRole;
+  level: 'log' | 'info' | 'warn' | 'error' | 'debug';
+  text: string;
+  url?: string;
+  line?: number;
+  source?: 'console-api' | 'exception' | 'log';
+}
+
+export interface NetworkEntry {
+  id: string;
+  timestampMs: number;
+  tabId: string;
+  viewport: ViewportRole;
+  method: string;
+  url: string;
+  status: number | null;
+  failed: boolean;
+  errorText?: string;
+  resourceType?: string;
+  durationMs?: number;
+  encodedBytes?: number;
+}
+
+export interface CtlRpcRequest {
+  id: number | string;
+  method: string;
+  params?: Record<string, unknown>;
+}
+
+export interface CtlRpcResponse {
+  id: number | string;
+  ok: boolean;
+  result?: unknown;
+  error?: {
+    code: number;
+    message: string;
+  };
+}

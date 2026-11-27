@@ -4,10 +4,11 @@ import type { BrowserWindow as BrowserWindowType, IpcMainInvokeEvent } from 'ele
 const { app, BrowserWindow, crashReporter, ipcMain, screen } = electron;
 import path from 'node:path';
 import { pathToFileURL } from 'node:url';
-import type { SessionMode, ThemeMode, ViewMode, ViewportRole } from '../shared/types';
+import type { AgentDockMode, SessionMode, ThemeMode, ViewMode, ViewportRole } from '../shared/types';
 import { type PersistedWindowBounds } from '../shared/session-store';
 import { normalizeUrl } from '../shared/url';
-import { ControlSocketServer } from './ctl-socket';
+import { AgentDockManager } from './agent-dock';
+import { ControlSocketServer, resolveControlSocketPath } from './ctl-socket';
 import {
   MainThreadWatchdog,
   resolveCrashDumpsDir,
@@ -61,10 +62,16 @@ if (crashReporter && typeof crashReporter.start === 'function') {
 if (app?.commandLine && typeof app.commandLine.appendSwitch === 'function') {
   app.commandLine.appendSwitch('ozone-platform-hint', 'auto');
   app.commandLine.appendSwitch('enable-features', 'UseOzonePlatform,WaylandWindowDecorations');
+  if (isSmokeBoot) {
+    app.commandLine.appendSwitch('disable-renderer-backgrounding');
+    app.commandLine.appendSwitch('disable-backgrounding-occluded-windows');
+    app.commandLine.appendSwitch('disable-background-timer-throttling');
+  }
 }
 
 let mainWindow: BrowserWindowType | null = null;
 let tabManager: TabManager | null = null;
+let agentDock: AgentDockManager | null = null;
 let ctlServer: ControlSocketServer | null = null;
 let diagLogger: StructuredLogger | null = null;
 let watchdog: MainThreadWatchdog | null = null;
@@ -213,7 +220,9 @@ export interface ShortcutTarget {
     | 'closeTab'
     | 'setDockOpen'
     | 'reload'
-  > | null;
+  > & {
+    toggleAgentDock?: () => unknown;
+  } | null;
   mainWindow: Pick<BrowserWindowType, 'webContents'> | null;
 }
 
@@ -225,6 +234,13 @@ export function dispatchGlobalShortcut(
   if (!mgr || !win) return false;
   const ctrl = input.control || input.meta;
   const key = input.key.toLowerCase();
+
+  if (ctrl && !input.shift && (key === '`' || input.code === 'Backquote')) {
+    if (typeof mgr.toggleAgentDock === 'function') {
+      mgr.toggleAgentDock();
+      return true;
+    }
+  }
 
   if (ctrl && !input.shift && key === '\\') {
     const state = mgr.getShellState();
@@ -439,6 +455,18 @@ export function registerIpcHandlers(
     return mgr.setAutoSleep(asBoolean(obj.enabled, 'enabled'));
   });
   handleShell('shell:copy-mirror-miss-debug', () => mgr.copyMirrorMissDebug());
+  handleShell('shell:toggle-agent-dock', () => mgr.toggleAgentDock());
+  handleShell('shell:set-agent-dock-mode', (raw) => {
+    const obj = asObject(raw);
+    return mgr.setAgentDockMode(
+      asEnum<AgentDockMode>(obj.mode, ['docked', 'floating', 'minimized'], 'mode'),
+    );
+  });
+  handleShell('shell:set-agent-dock-width', (raw) => {
+    const obj = asObject(raw);
+    return mgr.setAgentDockWidth(asFiniteNumber(obj.width, 'width'));
+  });
+  handleShell('shell:send-context-to-agent', () => mgr.sendContextToAgent());
 }
 
 function getPendingShutdownSummary(): Record<string, unknown> {
@@ -488,7 +516,9 @@ async function createMainWindow(): Promise<void> {
   const distRoot = path.join(app.getAppPath(), 'dist');
   const shellPreloadPath = path.join(distRoot, 'preload', 'shell-preload.js');
   const mirrorPreloadPath = path.join(distRoot, 'preload', 'mirror-preload.js');
+  const agentPreloadPath = path.join(distRoot, 'preload', 'agent-preload.js');
   const rendererHtmlPath = path.join(distRoot, 'renderer', 'index.html');
+  const agentHtmlPath = path.join(distRoot, 'renderer', 'agent-dock.html');
   const expectedRendererUrl = pathToFileURL(rendererHtmlPath).toString();
 
   const iconPath = path.join(app.getAppPath(), '..', 'packaging', 'iron-browser.png');
@@ -572,6 +602,27 @@ async function createMainWindow(): Promise<void> {
     logger: diagLogger,
   });
   tabManager = mgr;
+  const plannedSocketPath = resolveControlSocketPath();
+  const dock = new AgentDockManager(
+    win,
+    agentPreloadPath,
+    agentHtmlPath,
+    {
+      getSocketPath: () => ctlServer?.socketPath ?? plannedSocketPath,
+      getActiveTabId: () => mgr.getActiveTab()?.id ?? null,
+      getBrowserContextSnippet: () => mgr.buildBrowserContextSnippet(),
+      onLayoutChanged: () => {
+        mgr.applyLayout();
+        if (!win.isDestroyed()) {
+          win.webContents.send('shell:state', mgr.getShellState());
+        }
+      },
+    },
+    { initialMode: isSmoke ? 'minimized' : 'docked' },
+  );
+  agentDock = dock;
+  dock.registerIpcHandlers();
+  mgr.attachAgentDock(dock);
   registerIpcHandlers(win, mgr);
 
   await win.loadFile(rendererHtmlPath);
@@ -663,6 +714,7 @@ if (typeof app?.whenReady === 'function') {
     flushSessionNow();
     sessionFlushed = true;
     ctlServer?.close();
+    agentDock?.dispose();
     tabManager?.dispose();
   });
 
@@ -685,6 +737,7 @@ if (typeof app?.whenReady === 'function') {
     flushSessionNow();
     sessionFlushed = true;
     ctlServer?.close();
+    agentDock?.dispose();
     tabManager?.dispose();
     if (mainWindow && !mainWindow.isDestroyed()) {
       mainWindow.destroy();

@@ -884,12 +884,25 @@ function setupCaptureListeners(): void {
         'testId' | 'id' | 'ariaLabel' | 'title' | 'name' | 'role'
       >;
       inEditable: boolean;
+      sensitive: boolean;
+      repeat: boolean;
       key: string;
       code: string;
       modifiers: string[];
     }
   >();
   const handledKeyEvents = new WeakSet<Event>();
+  const pendingKeyEventsByCode = new Map<string, KeyboardEvent>();
+  const relayedHeldKeys = new Map<
+    string,
+    {
+      fp: ElementFingerprint;
+      meta: ReturnType<typeof buildCaptureMeta>;
+      key: string;
+      code: string;
+      sensitive: boolean;
+    }
+  >();
 
   let recentActivationKey: {
     el: Element;
@@ -1281,22 +1294,80 @@ function setupCaptureListeners(): void {
       { capture: true, passive: true },
     );
 
+    const rememberHeldKey = (
+      codeKey: string,
+      fp: ElementFingerprint,
+      meta: ReturnType<typeof buildCaptureMeta>,
+      key: string,
+      code: string,
+      sensitive: boolean,
+    ) => {
+      if (!codeKey) return;
+      if (relayedHeldKeys.size >= 32 && !relayedHeldKeys.has(codeKey)) {
+        const oldest = relayedHeldKeys.keys().next().value;
+        if (oldest !== undefined) relayedHeldKeys.delete(oldest);
+      }
+      relayedHeldKeys.set(codeKey, { fp, meta, key, code, sensitive });
+    };
+
+    const releaseAllHeldKeys = () => {
+      pendingKeyEventsByCode.clear();
+      if (relayedHeldKeys.size === 0) return;
+      const entries = Array.from(relayedHeldKeys.values());
+      relayedHeldKeys.clear();
+      for (const held of entries) {
+        sendCapture({
+          kind: 'keyup',
+          fingerprint: held.fp,
+          key: held.key,
+          code: held.code,
+          modifiers: [],
+          sensitive: held.sensitive,
+          ...held.meta,
+        });
+      }
+    };
+
     const finalizePreventDefaultKey = (ev: KeyboardEvent) => {
+      const normKey = ev.key === ' ' ? 'Space' : ev.key;
+      const codeKey = ev.code || normKey;
+      if (pendingKeyEventsByCode.get(codeKey) === ev) {
+        pendingKeyEventsByCode.delete(codeKey);
+      }
+      if (pendingKeyEventsByCode.get(normKey) === ev) {
+        pendingKeyEventsByCode.delete(normKey);
+      }
       if (handledKeyEvents.has(ev)) return;
       const entry = pendingPreventDefaultKey.get(ev);
       if (!entry) return;
       handledKeyEvents.add(ev);
       pendingPreventDefaultKey.delete(ev);
-      if (!ev.defaultPrevented && entry.inEditable) return;
+      if (!ev.defaultPrevented && entry.inEditable) {
+        // Observe on TabEventBus (redacted) via dedicated channel without emitting a mirror-capture!
+        ipcRenderer.send('iron:key-observe', {
+          kind: 'keydown',
+          key: entry.key,
+          code: entry.code,
+          modifiers: entry.modifiers,
+          repeat: entry.repeat,
+          tag: getTagName(entry.el),
+          sensitive: true,
+        });
+        return;
+      }
       const fp: ElementFingerprint =
         entry.fp ?? { ...buildFingerprint(entry.el), ...entry.preIdent };
       const meta = entry.meta ?? buildCaptureMeta(entry.el);
+      rememberHeldKey(entry.code || entry.key, fp, meta, entry.key, entry.code, entry.sensitive);
       sendCapture({
         kind: 'keydown',
         fingerprint: fp,
         key: entry.key,
         code: entry.code,
         modifiers: entry.modifiers,
+        repeat: entry.repeat,
+        holdUntilKeyup: true,
+        sensitive: entry.sensitive,
         ...meta,
       });
     };
@@ -1313,6 +1384,23 @@ function setupCaptureListeners(): void {
           'ArrowDown',
           'ArrowLeft',
           'ArrowRight',
+          'Home',
+          'End',
+          'PageUp',
+          'PageDown',
+          'Insert',
+          'ContextMenu',
+          'F1',
+          'F2',
+          'F3',
+          'F4',
+          'F5',
+          'F6',
+          'F7',
+          'F8',
+          'F9',
+          'F10',
+          'F11',
           'Space',
           ' ',
         ]);
@@ -1333,11 +1421,23 @@ function setupCaptureListeners(): void {
         const targetNode = rawTarget ?? activeDoc.activeElement ?? document.activeElement;
         const isTextEditable = isEditableElement(targetNode);
         if (isTextEditable && (ev.key === ' ' || ev.key === 'Space')) {
+          const spaceTag = isElementNode(targetNode) ? getTagName(targetNode) : 'input';
+          ipcRenderer.send('iron:key-observe', {
+            kind: 'keydown',
+            key: 'Space',
+            code: ev.code || 'Space',
+            modifiers: getModifiers(ev),
+            repeat: Boolean(ev.repeat),
+            tag: spaceTag,
+            sensitive: true,
+          });
           return;
         }
         const inEditable = isTextEditable || isSelectElement(targetNode);
         const el = interactiveElement(targetNode);
         if (!el) return;
+        const isPasswordField = isInputElement(el) && el.type.toLowerCase() === 'password';
+        const sensitive = inEditable || isPasswordField;
 
         const isAlwaysRelayed = relayKeys.has(ev.key) || ev.ctrlKey || ev.metaKey || ev.altKey;
         if (!isAlwaysRelayed) {
@@ -1364,10 +1464,14 @@ function setupCaptureListeners(): void {
               role: implicitRole(el) || undefined,
             },
             inEditable,
+            sensitive,
+            repeat: Boolean(ev.repeat),
             key: ev.key,
             code: ev.code,
             modifiers: getModifiers(ev),
           });
+          const pendingCodeKey = ev.code || (ev.key === ' ' ? 'Space' : ev.key);
+          pendingKeyEventsByCode.set(pendingCodeKey, ev);
           setTimeout(() => finalizePreventDefaultKey(ev), 0);
           return;
         }
@@ -1380,13 +1484,20 @@ function setupCaptureListeners(): void {
             expiresAt: performance.now() + 800,
           };
         }
+        const normalizedKey = ev.key === ' ' ? 'Space' : ev.key;
+        const fp = buildFingerprint(el);
+        const meta = buildCaptureMeta(el);
+        rememberHeldKey(ev.code || normalizedKey, fp, meta, normalizedKey, ev.code, sensitive);
         sendCapture({
           kind: 'keydown',
-          fingerprint: buildFingerprint(el),
-          key: ev.key === ' ' ? 'Space' : ev.key,
+          fingerprint: fp,
+          key: normalizedKey,
           code: ev.code,
           modifiers: getModifiers(ev),
-          ...buildCaptureMeta(el),
+          repeat: Boolean(ev.repeat),
+          holdUntilKeyup: true,
+          sensitive,
+          ...meta,
         });
       },
       { capture: true, passive: true },
@@ -1408,8 +1519,37 @@ function setupCaptureListeners(): void {
         if ((ev.key === ' ' || ev.key === 'Space') && recentActivationKey) {
           recentActivationKey.expiresAt = performance.now() + 250;
         }
+        const normalizedKey = ev.key === ' ' ? 'Space' : ev.key;
+        const codeKey = ev.code || normalizedKey;
+        const pendingDown =
+          pendingKeyEventsByCode.get(codeKey) ?? pendingKeyEventsByCode.get(normalizedKey);
+        if (pendingDown) {
+          finalizePreventDefaultKey(pendingDown);
+        }
+        const held = relayedHeldKeys.get(codeKey) ?? relayedHeldKeys.get(normalizedKey);
+        if (!held) return;
+        relayedHeldKeys.delete(codeKey);
+        relayedHeldKeys.delete(normalizedKey);
+        sendCapture({
+          kind: 'keyup',
+          fingerprint: held.fp,
+          key: normalizedKey,
+          code: ev.code || held.code,
+          modifiers: getModifiers(ev),
+          sensitive: held.sensitive,
+          ...held.meta,
+        });
       },
       { capture: true, passive: true },
+    );
+
+    win.addEventListener('blur', releaseAllHeldKeys, { passive: true });
+    doc.addEventListener(
+      'visibilitychange',
+      () => {
+        if (doc.visibilityState === 'hidden') releaseAllHeldKeys();
+      },
+      { passive: true },
     );
 
     let wheelRafId: number | null = null;

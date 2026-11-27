@@ -12,6 +12,9 @@ export const MIN_SPLIT_RATIO = 0.22;
 export const MAX_SPLIT_RATIO = 0.68;
 export const MIN_VIEWPORT_HEIGHT = 120;
 export const MIN_VIEWPORT_WIDTH = 180;
+export const DEFAULT_AGENT_DOCK_WIDTH = 360;
+export const MIN_AGENT_DOCK_WIDTH = 280;
+export const MAX_AGENT_DOCK_RATIO = 0.46;
 
 export function clamp(value: number, min: number, max: number): number {
   if (max < min) return min;
@@ -41,7 +44,47 @@ export function computeLayout(input: LayoutInput): LayoutResult {
   const rail = railWidth > 0 ? { x: 0, y: TOP_BAR_HEIGHT, width: railWidth, height: winH - TOP_BAR_HEIGHT } : null;
 
   const contentX = railWidth;
-  const contentW = Math.max(MIN_VIEWPORT_WIDTH, winW - railWidth);
+  const availableAfterRail = Math.max(MIN_VIEWPORT_WIDTH, winW - railWidth);
+  const agentMode = input.agentDockMode ?? 'minimized';
+
+  let agentDock: LayoutResult['agentDock'] = null;
+  let clampedAgentWidth = clamp(
+    Math.floor(input.agentDockWidth ?? DEFAULT_AGENT_DOCK_WIDTH),
+    MIN_AGENT_DOCK_WIDTH,
+    Math.max(MIN_AGENT_DOCK_WIDTH, Math.floor(availableAfterRail * MAX_AGENT_DOCK_RATIO)),
+  );
+
+  let rightReservedW = 0;
+  if (agentMode === 'docked' && availableAfterRail >= MIN_VIEWPORT_WIDTH + MIN_AGENT_DOCK_WIDTH) {
+    rightReservedW = clampedAgentWidth;
+    agentDock = {
+      x: winW - rightReservedW,
+      y: TOP_BAR_HEIGHT,
+      width: rightReservedW,
+      height: winH - TOP_BAR_HEIGHT,
+    };
+  } else if (agentMode === 'floating' || (agentMode === 'docked' && availableAfterRail < MIN_VIEWPORT_WIDTH + MIN_AGENT_DOCK_WIDTH)) {
+    const fb = input.agentFloatBounds;
+    const fw = clamp(Math.floor(fb?.width ?? 400), 260, Math.max(260, winW - 16));
+    const fh = clamp(
+      Math.floor(fb?.height ?? Math.min(540, winH - TOP_BAR_HEIGHT - 24)),
+      180,
+      Math.max(180, winH - TOP_BAR_HEIGHT - 8),
+    );
+    const fx = clamp(
+      Math.floor(fb?.x ?? winW - fw - 14),
+      8,
+      Math.max(8, winW - fw - 8),
+    );
+    const fy = clamp(
+      Math.floor(fb?.y ?? TOP_BAR_HEIGHT + 12),
+      TOP_BAR_HEIGHT + 4,
+      Math.max(TOP_BAR_HEIGHT + 4, winH - fh - 4),
+    );
+    agentDock = { x: fx, y: fy, width: fw, height: fh };
+  }
+
+  const contentW = Math.max(MIN_VIEWPORT_WIDTH, availableAfterRail - rightReservedW);
   const availableH = Math.max(MIN_VIEWPORT_HEIGHT + TELEMETRY_BAR_HEIGHT, winH - TOP_BAR_HEIGHT);
 
   const maxDockH = Math.max(
@@ -113,8 +156,10 @@ export function computeLayout(input: LayoutInput): LayoutResult {
       telemetryBar,
       devtoolsHeader,
       devtoolsView,
+      agentDock,
       clampedSplitRatio,
       clampedDockHeight,
+      clampedAgentWidth,
     };
   }
 
@@ -165,7 +210,9 @@ export function computeLayout(input: LayoutInput): LayoutResult {
     telemetryBar,
     devtoolsHeader,
     devtoolsView,
+    agentDock,
     clampedSplitRatio,
     clampedDockHeight,
+    clampedAgentWidth,
   };
 }

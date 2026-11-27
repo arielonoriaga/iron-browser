@@ -4,9 +4,9 @@
 
 # IronBrowser
 
-**Dual-viewport (`390×844` Portrait + `1280×720` Landscape) Chromium developer browser, causal Rust `TabEventBus`, and 18-tool `stdio` MCP server for Claude Code, Codex, OpenCode, Cursor, and Antigravity.**
+**Dual-viewport (`390×844` Portrait + `1280×720` Landscape) Chromium developer browser, embedded multi-CLI & running-instance Agent Chat Dock, WebGL draw-call/render-order inspector, causal Rust `TabEventBus`, and 19-tool `stdio` MCP server for Claude Code, Codex, OpenCode, Cursor, and Antigravity.**
 
-[![Status: Public Beta](https://img.shields.io/badge/status-public%20beta-E8622C.svg)](#status-public-beta) [![MCP Tools: 18](https://img.shields.io/badge/MCP%20tools-18-14B8A6.svg)](#18-tool-mcp-server-iron-browser-mcp) [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE) [![The Iron Stack](https://img.shields.io/badge/The%20Iron%20Stack-iron--suite%20%C2%B7%20iron--term-0B1220.svg)](#the-iron-stack)
+[![Status: Public Beta](https://img.shields.io/badge/status-public%20beta-E8622C.svg)](#status-public-beta) [![MCP Tools: 19](https://img.shields.io/badge/MCP%20tools-19-14B8A6.svg)](#19-tool-mcp-server-iron-browser-mcp) [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE) [![The Iron Stack](https://img.shields.io/badge/The%20Iron%20Stack-iron--suite%20%C2%B7%20iron--term-0B1220.svg)](#the-iron-stack)
 
 > [!IMPORTANT]
 > **Status: Public Beta (`v0.1.0-beta`).** IronBrowser is actively dogfooded daily on Linux (Wayland/X11) across responsive SPAs, POS hardware profiles, and real-time WebGL/WebSocket multiplayer apps. Expect rapid iteration on platform packaging (macOS/Windows) and embedded agent UX as **The Iron Stack** evolves. Bug reports and repro recipes are welcome.
@@ -16,7 +16,7 @@ IronBrowser solves two structural blind spots in modern AI-assisted frontend and
 1. **Single-viewport blindness & responsive drift:** Agents and developers verify a fix at desktop width while mobile (`390×844`) silently clips CTAs, breaks modal backdrops, or stalls under constrained POS/mobile CPUs — or they open two separate browser tabs that double-submit `POST` mutations, open duplicate WebSockets, kick each other off single-session game servers, and drift out of auth sync.
 2. **Unbounded, non-causal browser MCP logs:** Dumping raw Playwright/DevTools network and console streams blows up agent context windows without linking *which* user click or keystroke caused *which* HTTP replay, WebSocket frame, `sessionStorage` write, route transition, or layout overflow.
 
-IronBrowser runs **Portrait and Landscape live side-by-side inside one native multi-`WebContentsView` Chromium window**, mirrors interaction across both viewports with **single-flight HTTP / WebSocket / SSE / SFS2X binary deduplication**, links every side effect to a **causal `gestureSeq` (`~878 ns/op` in Rust)**, and exposes **18 bounded-byte MCP tools** over a `0600` Unix domain socket.
+IronBrowser runs **Portrait and Landscape live side-by-side inside one native multi-`WebContentsView` Chromium window**, mirrors pointer, keyboard (`keydown`/`keyup`), modal, and canvas interaction across both viewports with **single-flight HTTP / WebSocket / SSE / SFS2X binary deduplication**, embeds a **live Agent Chat & CLI Dock** (`agy`, `claude`, `codex`, `opencode`, custom CLI, or live `tmux` attach), inspects **WebGL draw calls & CSS/Canvas rendering order**, links every side effect to a **causal `gestureSeq` (`~878 ns/op` in Rust)**, and exposes **19 bounded-byte MCP tools** over a `0600` Unix domain socket.
 
 ---
 
@@ -32,11 +32,17 @@ IronBrowser runs **Portrait and Landscape live side-by-side inside one native mu
 | **Causal Gesture Forensics (`gestureSeq` Event Bus)** | No | No | **Yes (Rust N-API `TabEventBus`, `~878 ns/op`)** |
 | **POS / Slow-Device Lab + Off-Thread `.cpuprofile`** | Manual DevTools clicks | Basic UA / viewport | **Yes (`sunmi-v2-pro`, CPU calibration, Worker profiler)** |
 | **Silent Focus-Safe Headless Verification (`--smoke`)** | Separate headless browser | Steals desktop focus | **Yes (invisible offscreen compositor capture)** |
-| **Zero-Cloud Bounded-Byte Native Rust MCP (`--max-bytes`)** | Unbounded JSON / Node wrappers | Proprietary / none | **Yes (single Rust binary · 18 tools · `0600` socket)** |
+| **WebGL Draw-Call & Render-Order Inspector (`browser_webgl`)** | External extensions only | No | **Yes (per-frame drawCalls/tris/passes + z-index layer order)** |
+| **Embedded Agent Chat Dock (Running `tmux` + Multi-CLI PTY)** | Separate terminal window | No | **Yes (`agy` · `claude` · `codex` · `opencode` · live `tmux`)** |
+| **Zero-Cloud Bounded-Byte Native Rust MCP (`--max-bytes`)** | Unbounded JSON / Node wrappers | Proprietary / none | **Yes (single Rust binary · 19 tools · `0600` socket)** |
 
 ---
 
 ## How IronBrowser Works
+
+<p align="center">
+  <img src="assets/iron-browser-architecture.png" alt="IronBrowser Architecture — Agent Runtimes & Embedded Dock, Single-Flight Sync Core, Dual Chromium Compositor, and WebGL & Hardware Lab" width="100%" />
+</p>
 
 ```mermaid
 flowchart LR
@@ -77,6 +83,14 @@ flowchart LR
 - **POS & Slow-Device Hardware Emulation + Off-Thread V8 CPU Profiler:**
   - Named hardware profiles (`sunmi-v2-pro` at `360×720` DPR `2`, `6×` CPU, `slow-4g`, `deviceMemory: 2`, `hardwareConcurrency: 4`, Android 7.1 UA; `low-end-android`; and `none` host reset), custom `cpu_rate` (`1..20`), network shaping, `prefers-reduced-motion` / `Save-Data`, and empirical host-to-target CPU benchmark `calibrate`.
   - Non-blocking `browser_profile` (`Profiler.start`/`stop`) harvesting segments across reload/navigation, summarizing bottom-up `selfMs`/`totalMs` hotspots inside a `worker_threads.Worker`, and streaming a `50 MB`-capped `0600` `.cpuprofile` to disk without stalling the Electron main thread.
+- **Embedded Multi-CLI & Running-Instance Agent Chat Dock (`Ctrl+\``):**
+  - Hosted inside a dedicated top-most `agentView: WebContentsView` (`Docked` right `360px` with drag-resize, `Floating` draggable overlay composited above native viewports, or `Minimized` `0px` returning `100%` canvas width).
+  - **Attach to Running Instances:** Auto-discovers live `tmux` sessions (`claude`, `agy`, `codex`, `opencode`, shells) and lets you view live conversation output and send prompts or approval hotkeys (`[1]`/`[2]`/`[3]`/`Enter`/`Esc`/`^C`) without resizing or detaching your terminal window.
+  - **Spawn Any CLI Agent via Native Rust POSIX PTY:** 1-click launcher for `agy`, `claude` (with auto-generated `0600` `--mcp-config`), `codex`, `opencode`, `shell`, or any custom CLI command — pre-wired with `IRON_BROWSER_SOCKET` and `+ Tab Context` 1-click redacted browser context injection.
+- **Full Keyboard Event Listening & Hold-State Mirroring:**
+  - Captures and mirrors `keydown` + `keyup` + `repeat` across Dual viewports (including `Home`/`End`/`PageUp`/`PageDown`/`Insert`/`F1`–`F11`, `<canvas>`/`<body>` held game keys with automatic blur/visibility release, and `preventDefault` PIN keypads) while publishing every keyboard gesture to `TabEventBus` with automatic `[REDACTED]` masking on editable/password fields.
+- **WebGL, Draw-Call, Performance & Rendering-Order Inspector (`WebGlInspectorManager` / `browser_webgl`):**
+  - Zero-stall prototype instrumentation across WebGL1 & WebGL2 (`<5 ns` steady-state counter increments; zero `gl.getError()`/`gl.finish()` pipeline stalls) tracking `drawCallsPerFrame`, `trianglesPerFrame`, `instancedDrawCallsPerFrame`, `shaderSwitchesPerFrame`, `textureBindsPerFrame`, `renderPassesPerFrame` (`FBO` switches), live GPU resource counts (`programs`, `textures`, `buffers`, `framebuffers`, `vaos`), and `webglcontextlost` events, plus 1-frame chronological draw-call capture (`capture_frame`) and CSS/Canvas stacking-context & compositor paint-order auditing (`renderingOrder`).
 - **Crash, Hang & Post-Mortem Forensics (`diagnostics.ts` / `browser_health` / `iron-browser doctor`):**
   - Rotated `0600` JSONL log (`~/.local/state/iron-browser/main.log`) with token redaction, local Crashpad `.dmp` minidumps (`RLIMIT_CORE=0` so `systemd-coredump` never wedges `ctl.sock`), `SharedArrayBuffer` + `inspector.Session.connectToMainThread()` stall watchdog + `5s` shutdown watchdog, and offline-capable `iron-browser doctor`.
 
@@ -132,7 +146,7 @@ Multiple isolated IronBrowser instances can run side-by-side by setting `IRON_BR
 
 ---
 
-## 18-Tool MCP Server (`iron-browser-mcp`)
+## 19-Tool MCP Server (`iron-browser-mcp`)
 
 Speaks newline-delimited `stdio` MCP (`2025-06-18` / `2025-03-26` / `2024-11-05`) with strict UTF-8 byte ceilings (`--max-bytes`, default `32768`, max `262144`) and explicit tool safety annotations:
 
@@ -156,6 +170,7 @@ Speaks newline-delimited `stdio` MCP (`2025-06-18` / `2025-03-26` / `2024-11-05`
 | **`browser_emulate`** | Apply/reset `sunmi-v2-pro`, `low-end-android`, or custom CPU (`1..20×`), network (`slow-4g`, `3g`, `offline`, custom), UA, cores, RAM, and `calibrate`. |
 | **`browser_profile`** | Non-blocking V8 CPU profiler (`start`/`stop`) returning bottom-up `selfMs`/`totalMs` hotspots, per-script breakdown, and a `0600` `.cpuprofile` path. |
 | **`browser_health`** | Live main-thread event-loop lag, renderer crash/unresponsive state, watchdog stalls, recent `main.log` tail, and Crashpad `.dmp` fallback when offline. |
+| **`browser_webgl`** | WebGL/WebGL2 draw calls, triangles/vertices, instanced draws, shader switches, texture binds, FBO render passes, GPU resource counts, 1-frame ordered draw-call log (`capture_frame`), and CSS/Canvas paint & stacking-context rendering order. |
 
 ---
 
@@ -177,6 +192,10 @@ IronBrowser is part of **The Iron Stack** — zero-cloud, local-first Rust & Typ
    Dual-viewport Chromium verification browser, causal Rust `TabEventBus`, single-flight HTTP/WS/SSE/SFS2X deduplication, POS/slow-device lab, and 18-tool Rust MCP server.
 3. **`iron-term` (`Coming Soon`):**
    Native **Rust + GPUI** multi-agent terminal and fleet orchestrator (*Alacritty Blade*):
+
+<p align="center">
+  <img src="assets/iron-term-preview.png" alt="IronTerm — Coming Soon Native Rust + GPUI Multi-Agent Fleet Terminal (Alacritty Blade)" width="100%" />
+</p>
    - **Headless `iron-agentd` Daemon (`portable-pty` + `alacritty_terminal` + SQLite):** Decouples PTY execution from GPU rendering so 20+ concurrent agents (`claude`, `agy`, `codex`, `opencode`, shells) run with **0 off-screen GPU frames**, while idle multi-day sessions hibernate to **`0 MB` live RAM** with 1-line *"where I left off"* checkpoints, `--resume` tokens, and git worktree freshness checks (`dirty` / `behind origin/main`).
    - **90–98% Raw Terminal Pixels (`iron-gpui`):** Zero dashboard card bloat — native `⌘D` split panes, collapsible `236px` monospace **Urgency Whisper Rail** (`NEEDS YOU` · `ACTIVE` · `DORMANT`), and a 1-keystroke **Ghost Action Bar** with *Fix-Before-Destroy* prompt actions (`[1] Run via runq instead`, `[2] Allow`, `[3] Deny`).
    - **Multi-Host SSH + `runq` Thermal & Build-Queue Control + `390px` Tailscale Companion:** Coordinates CPU/RAM slots across workstation and laptop over plain SSH (zero extra open ports), integrates natively with `iron` memory (`iron-suite`) and `iron-browser` (`IRON_BROWSER_SOCKET` + live `browser_events` causal stream), and embeds a zero-dependency `390px` mobile companion for remote approvals on Tailscale.

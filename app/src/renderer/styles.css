@@ -721,3 +721,28 @@ svg {
   border-color: var(--teal);
   background: rgba(20, 184, 166, 0.14);
 }
+
+.agent-chat-btn {
+  border-color: rgba(232, 98, 44, 0.45);
+  background: rgba(232, 98, 44, 0.12);
+}
+
+.agent-chat-btn.active {
+  border-color: #e8622c;
+  background: rgba(232, 98, 44, 0.22);
+  color: #fff;
+}
+
+.agent-chat-dot {
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  background: var(--muted);
+  display: inline-block;
+  flex-shrink: 0;
+}
+
+.agent-chat-dot.live {
+  background: var(--emerald);
+  box-shadow: 0 0 6px rgba(52, 211, 153, 0.7);
+}

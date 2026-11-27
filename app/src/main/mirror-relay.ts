@@ -1,6 +1,21 @@
 import crypto from 'node:crypto';
-import * as electronMod from 'electron';
+import { createRequire } from 'node:module';
+import path from 'node:path';
 import type { IpcMainEvent, WebContents } from 'electron';
+
+function resolveDefaultIpcMain(): IpcMainLike {
+  let mod: { ipcMain?: IpcMainLike } | undefined;
+  if (typeof require === 'function') {
+    mod = require('electron') as { ipcMain?: IpcMainLike };
+  } else {
+    const req = createRequire(path.join(__dirname, 'index.js'));
+    mod = req('electron') as { ipcMain?: IpcMainLike };
+  }
+  if (!mod?.ipcMain) {
+    throw new Error('Electron ipcMain unavailable; pass an explicit IpcMainLike in tests');
+  }
+  return mod.ipcMain;
+}
 import {
   buildMirrorMissLabel,
   EchoLoopGuard,
@@ -80,6 +95,19 @@ export interface MirrorViewportLookup {
   } | null;
   onMirrorMiss?: (tabId: string, info: MirrorMissInfo, sourceWcId?: number) => void;
   onGesture?: (tabId: string, role: ViewportRole, action: string) => void;
+  onKeyboardEvent?: (
+    tabId: string,
+    role: ViewportRole,
+    ev: {
+      kind: 'keydown' | 'keyup';
+      key: string;
+      code: string;
+      modifiers: string[];
+      repeat: boolean;
+      tag: string;
+      sensitive: boolean;
+    },
+  ) => void;
   getOrigin?: (wc: WebContents) => string | null;
   isMainFrame?: (wc: WebContents, frame: unknown) => boolean;
   beforeMouseDispatch?: (wc: WebContents) => Promise<void>;
@@ -123,14 +151,32 @@ const SPECIAL_KEY_CODES: Record<string, { key: string; code: string; vk: number 
   Enter: { key: 'Enter', code: 'Enter', vk: 13 },
   Backspace: { key: 'Backspace', code: 'Backspace', vk: 8 },
   Delete: { key: 'Delete', code: 'Delete', vk: 46 },
+  Insert: { key: 'Insert', code: 'Insert', vk: 45 },
   Tab: { key: 'Tab', code: 'Tab', vk: 9 },
   Escape: { key: 'Escape', code: 'Escape', vk: 27 },
   Space: { key: ' ', code: 'Space', vk: 32 },
   ' ': { key: ' ', code: 'Space', vk: 32 },
+  PageUp: { key: 'PageUp', code: 'PageUp', vk: 33 },
+  PageDown: { key: 'PageDown', code: 'PageDown', vk: 34 },
+  End: { key: 'End', code: 'End', vk: 35 },
+  Home: { key: 'Home', code: 'Home', vk: 36 },
   ArrowLeft: { key: 'ArrowLeft', code: 'ArrowLeft', vk: 37 },
   ArrowUp: { key: 'ArrowUp', code: 'ArrowUp', vk: 38 },
   ArrowRight: { key: 'ArrowRight', code: 'ArrowRight', vk: 39 },
   ArrowDown: { key: 'ArrowDown', code: 'ArrowDown', vk: 40 },
+  ContextMenu: { key: 'ContextMenu', code: 'ContextMenu', vk: 93 },
+  F1: { key: 'F1', code: 'F1', vk: 112 },
+  F2: { key: 'F2', code: 'F2', vk: 113 },
+  F3: { key: 'F3', code: 'F3', vk: 114 },
+  F4: { key: 'F4', code: 'F4', vk: 115 },
+  F5: { key: 'F5', code: 'F5', vk: 116 },
+  F6: { key: 'F6', code: 'F6', vk: 117 },
+  F7: { key: 'F7', code: 'F7', vk: 118 },
+  F8: { key: 'F8', code: 'F8', vk: 119 },
+  F9: { key: 'F9', code: 'F9', vk: 120 },
+  F10: { key: 'F10', code: 'F10', vk: 121 },
+  F11: { key: 'F11', code: 'F11', vk: 122 },
+  F12: { key: 'F12', code: 'F12', vk: 123 },
 };
 
 function modifiersToCdpMask(modifiers: readonly string[] = []): number {
@@ -175,14 +221,19 @@ export class MirrorRelay {
     string,
     { lastX: number; lastY: number; button: 'left' | 'middle' | 'right' }
   >();
+  private readonly heldKeysByPane = new Map<
+    string,
+    Map<string, ReturnType<typeof setTimeout>>
+  >();
   private readonly recentKeyActivations = new Map<string, KeyActivationRecord>();
   private readonly onDomQueryReply: (ev: IpcMainEvent, msg: unknown) => void;
   private readonly onMirrorCapture: (ev: IpcMainEvent, rawCapture: unknown) => void;
+  private readonly onKeyObserve: (ev: IpcMainEvent, rawObs: unknown) => void;
   private disposed = false;
 
   constructor(
     private readonly lookup: MirrorViewportLookup,
-    private readonly ipc: IpcMainLike = (electronMod as unknown as { ipcMain: IpcMainLike }).ipcMain,
+    private readonly ipc: IpcMainLike = resolveDefaultIpcMain(),
     private readonly now: () => number = () => Date.now(),
   ) {
     this.onDomQueryReply = (ev: IpcMainEvent, msg: unknown) => {
@@ -217,7 +268,29 @@ export class MirrorRelay {
       if (!this.checkIsMainFrame(senderWc, ev.senderFrame)) return;
 
       const info = this.lookup.findByWebContentsId(senderWc.id);
-      if (!info || !info.mirrorEnabled || !info.pairedWebContents) {
+      if (!info) return;
+
+      const guard = this.getGuard(info.tabId);
+      if (guard.isEcho(info.role)) {
+        return;
+      }
+
+      if (capture.kind === 'keydown' || capture.kind === 'keyup') {
+        this.lookup.onKeyboardEvent?.(info.tabId, info.role, {
+          kind: capture.kind,
+          key: capture.key,
+          code: capture.code,
+          modifiers: Array.isArray(capture.modifiers) ? capture.modifiers : [],
+          repeat: Boolean(capture.repeat),
+          tag: capture.fingerprint?.tag ?? 'unknown',
+          sensitive: Boolean(capture.sensitive),
+        });
+        if (capture.observeOnly) {
+          return;
+        }
+      }
+
+      if (!info.mirrorEnabled || !info.pairedWebContents) {
         return;
       }
       if (info.pairedWebContents.isDestroyed()) return;
@@ -225,11 +298,6 @@ export class MirrorRelay {
       const sourceOrigin = this.resolveOrigin(senderWc);
       const pairedOrigin = this.resolveOrigin(info.pairedWebContents);
       if (!sourceOrigin || !pairedOrigin || sourceOrigin !== pairedOrigin) {
-        return;
-      }
-
-      const guard = this.getGuard(info.tabId);
-      if (guard.isEcho(info.role)) {
         return;
       }
 
@@ -278,8 +346,31 @@ export class MirrorRelay {
       );
     };
 
+    this.onKeyObserve = (ev: IpcMainEvent, rawObs: unknown) => {
+      if (this.disposed) return;
+      if (!rawObs || typeof rawObs !== 'object') return;
+      const senderWc = ev.sender;
+      if (!senderWc || senderWc.isDestroyed()) return;
+      if (!this.checkIsMainFrame(senderWc, ev.senderFrame)) return;
+      const info = this.lookup.findByWebContentsId(senderWc.id);
+      if (!info) return;
+      if (this.getGuard(info.tabId).isEcho(info.role)) return;
+      const rec = rawObs as Record<string, unknown>;
+      if (rec.kind !== 'keydown' && rec.kind !== 'keyup') return;
+      this.lookup.onKeyboardEvent?.(info.tabId, info.role, {
+        kind: rec.kind,
+        key: typeof rec.key === 'string' ? rec.key : '',
+        code: typeof rec.code === 'string' ? rec.code : '',
+        modifiers: Array.isArray(rec.modifiers) ? (rec.modifiers as string[]) : [],
+        repeat: Boolean(rec.repeat),
+        tag: typeof rec.tag === 'string' ? rec.tag : 'input',
+        sensitive: Boolean(rec.sensitive),
+      });
+    };
+
     this.ipc.on('iron:dom-query-reply', this.onDomQueryReply);
     this.ipc.on('iron:mirror-capture', this.onMirrorCapture);
+    this.ipc.on('iron:key-observe', this.onKeyObserve);
   }
 
   private getTabEpoch(tabId: string): number {
@@ -407,6 +498,13 @@ export class MirrorRelay {
     this.recentKeyActivations.delete(tabId);
     this.activeDrags.delete(`${tabId}:portrait`);
     this.activeDrags.delete(`${tabId}:landscape`);
+    for (const paneKey of [`${tabId}:portrait`, `${tabId}:landscape`]) {
+      const held = this.heldKeysByPane.get(paneKey);
+      if (held) {
+        for (const t of held.values()) clearTimeout(t);
+        this.heldKeysByPane.delete(paneKey);
+      }
+    }
   }
 
   dispose(): void {
@@ -417,6 +515,7 @@ export class MirrorRelay {
     if (remove) {
       remove('iron:dom-query-reply', this.onDomQueryReply);
       remove('iron:mirror-capture', this.onMirrorCapture);
+      remove('iron:key-observe', this.onKeyObserve);
     }
     for (const [, pending] of this.pendingQueries) {
       clearTimeout(pending.timer);
@@ -428,6 +527,10 @@ export class MirrorRelay {
     this.tabQueueDepths.clear();
     this.tabEpochs.clear();
     this.activeDrags.clear();
+    for (const held of this.heldKeysByPane.values()) {
+      for (const t of held.values()) clearTimeout(t);
+    }
+    this.heldKeysByPane.clear();
     this.recentKeyActivations.clear();
   }
 
@@ -693,11 +796,13 @@ export class MirrorRelay {
     });
   }
 
-  async dispatchTrustedKey(
+  async dispatchTrustedKeyPhase(
     wc: WebContents,
+    phase: 'down' | 'up',
     rawKey: string,
     modifiers: readonly string[] = [],
     rawCode?: string,
+    repeat = false,
   ): Promise<void> {
     if (wc.isDestroyed()) return;
     const normalizedKey = rawKey === ' ' ? 'Space' : rawKey;
@@ -722,34 +827,37 @@ export class MirrorRelay {
           : rawKey.length === 1 && /^[a-zA-Z0-9]$/.test(rawKey)
             ? rawKey.toUpperCase().charCodeAt(0)
             : 0;
-        const commands =
-          normalizedKey.toLowerCase() === 'a' && (modMask & 2) !== 0 ? ['selectAll'] : undefined;
-        const isEnter = normalizedKey === 'Enter';
-        // Allow plain or Shift-modified single printable characters (modMask 0 or 8) to carry text.
-        const isPrintableSingle = !spec && rawKey.length === 1 && (modMask & ~8) === 0;
 
-        await this.sendDebuggerCommand(wc, 'Input.dispatchKeyEvent', {
-          type: isEnter || isPrintableSingle ? 'keyDown' : 'rawKeyDown',
-          key,
-          code,
-          windowsVirtualKeyCode: vk,
-          nativeVirtualKeyCode: vk,
-          modifiers: modMask,
-          ...(isEnter
-            ? { text: '\r', unmodifiedText: '\r' }
-            : isPrintableSingle
-              ? { text: rawKey, unmodifiedText: rawKey }
-              : {}),
-          ...(commands ? { commands } : {}),
-        });
-        await this.sendDebuggerCommand(wc, 'Input.dispatchKeyEvent', {
-          type: 'keyUp',
-          key,
-          code,
-          windowsVirtualKeyCode: vk,
-          nativeVirtualKeyCode: vk,
-          modifiers: modMask,
-        });
+        if (phase === 'down') {
+          const commands =
+            normalizedKey.toLowerCase() === 'a' && (modMask & 2) !== 0 ? ['selectAll'] : undefined;
+          const isEnter = normalizedKey === 'Enter';
+          const isPrintableSingle = !spec && rawKey.length === 1 && (modMask & ~8) === 0;
+          await this.sendDebuggerCommand(wc, 'Input.dispatchKeyEvent', {
+            type: isEnter || isPrintableSingle ? 'keyDown' : 'rawKeyDown',
+            key,
+            code,
+            windowsVirtualKeyCode: vk,
+            nativeVirtualKeyCode: vk,
+            modifiers: modMask,
+            ...(repeat ? { autoRepeat: true } : {}),
+            ...(isEnter
+              ? { text: '\r', unmodifiedText: '\r' }
+              : isPrintableSingle
+                ? { text: rawKey, unmodifiedText: rawKey }
+                : {}),
+            ...(commands ? { commands } : {}),
+          });
+        } else {
+          await this.sendDebuggerCommand(wc, 'Input.dispatchKeyEvent', {
+            type: 'keyUp',
+            key,
+            code,
+            windowsVirtualKeyCode: vk,
+            nativeVirtualKeyCode: vk,
+            modifiers: modMask,
+          });
+        }
         return;
       } catch {
         // Fallback below.
@@ -758,8 +866,21 @@ export class MirrorRelay {
 
     const electronKey = normalizedKey === 'Space' ? 'Space' : rawKey;
     const mods = modifiersToElectron(modifiers);
-    wc.sendInputEvent({ type: 'keyDown', keyCode: electronKey, modifiers: mods });
-    wc.sendInputEvent({ type: 'keyUp', keyCode: electronKey, modifiers: mods });
+    wc.sendInputEvent({
+      type: phase === 'down' ? 'keyDown' : 'keyUp',
+      keyCode: electronKey,
+      modifiers: mods,
+    });
+  }
+
+  async dispatchTrustedKey(
+    wc: WebContents,
+    rawKey: string,
+    modifiers: readonly string[] = [],
+    rawCode?: string,
+  ): Promise<void> {
+    await this.dispatchTrustedKeyPhase(wc, 'down', rawKey, modifiers, rawCode, false);
+    await this.dispatchTrustedKeyPhase(wc, 'up', rawKey, modifiers, rawCode, false);
   }
 
   async dispatchTrustedText(wc: WebContents, text: string): Promise<void> {
@@ -935,11 +1056,58 @@ export class MirrorRelay {
           queryMeta,
         );
         if (!canStillDispatch()) return;
-        if (!target.found || target.x === undefined || target.y === undefined) {
+        const fpTag = (capture.fingerprint?.tag || '').toLowerCase();
+        const isGlobalOrBodyKey =
+          fpTag === 'body' ||
+          fpTag === 'html' ||
+          capture.key === 'Escape' ||
+          /^F([1-9]|1[0-2])$/.test(capture.key) ||
+          capture.modifiers.some((m) => m === 'control' || m === 'meta' || m === 'alt');
+
+        if ((!target.found || target.x === undefined || target.y === undefined) && !isGlobalOrBodyKey) {
           this.emitMiss(tabId, capture.fingerprint, 'keydown:target-not-found', ctx?.senderWc);
           return;
         }
-        await this.dispatchTrustedKey(targetWc, capture.key, capture.modifiers, capture.code);
+
+        if (capture.holdUntilKeyup) {
+          const paneKey = `${tabId}:${targetRole}`;
+          const codeKey = capture.code || capture.key;
+          let paneMap = this.heldKeysByPane.get(paneKey);
+          if (!paneMap) {
+            paneMap = new Map();
+            this.heldKeysByPane.set(paneKey, paneMap);
+          }
+          const prevTimer = paneMap.get(codeKey);
+          if (prevTimer) clearTimeout(prevTimer);
+          const autoUpTimer = setTimeout(() => {
+            paneMap?.delete(codeKey);
+            if (canStillDispatch()) {
+              guard.beginReplaying(targetRole);
+              void this.dispatchTrustedKeyPhase(
+                targetWc,
+                'up',
+                capture.key,
+                capture.modifiers,
+                capture.code,
+                false,
+              ).finally(() => guard.endReplaying(targetRole));
+            }
+          }, 15_000);
+          autoUpTimer.unref?.();
+          paneMap.set(codeKey, autoUpTimer);
+
+          await this.dispatchTrustedKeyPhase(
+            targetWc,
+            'down',
+            capture.key,
+            capture.modifiers,
+            capture.code,
+            Boolean(capture.repeat),
+          );
+        } else {
+          await this.dispatchTrustedKey(targetWc, capture.key, capture.modifiers, capture.code);
+        }
+
         if (isActivationKey(capture.key)) {
           this.recentKeyActivations.set(tabId, {
             key: capture.key,
@@ -954,6 +1122,29 @@ export class MirrorRelay {
     }
 
     if (capture.kind === 'keyup') {
+      const paneKey = `${tabId}:${targetRole}`;
+      const codeKey = capture.code || capture.key;
+      const paneMap = this.heldKeysByPane.get(paneKey);
+      if (paneMap) {
+        const timer = paneMap.get(codeKey) ?? paneMap.get(capture.key);
+        if (timer) clearTimeout(timer);
+        paneMap.delete(codeKey);
+        paneMap.delete(capture.key);
+      }
+      guard.beginReplaying(targetRole);
+      try {
+        if (!canStillDispatch()) return;
+        await this.dispatchTrustedKeyPhase(
+          targetWc,
+          'up',
+          capture.key,
+          capture.modifiers,
+          capture.code,
+          false,
+        );
+      } finally {
+        guard.endReplaying(targetRole);
+      }
       return;
     }
 

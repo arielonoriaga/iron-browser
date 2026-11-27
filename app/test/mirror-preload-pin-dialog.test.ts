@@ -591,4 +591,36 @@ describe('mirror-preload PIN keydown & Kobalte/native dialog dismissal regressio
     expect(clicks[0]!.payload.fingerprint.dismissedOverlay).toBeUndefined();
     expect(clicks[0]!.payload.fingerprint.ariaLabel).toBe('Close');
   });
+
+  test('F-29: preventDefault() + stopPropagation() keydown followed immediately by keyup flushes keydown -> keyup in order without stuck held key', async () => {
+    const env = await loadPreloadInVm();
+    env.sent.length = 0;
+
+    // Target calls BOTH preventDefault() and stopPropagation() (bypassing window bubble listener),
+    // and keyup arrives BEFORE setTimeout(..., 0) runs!
+    await env.dispatchBlinkEvent(
+      'keydown',
+      { key: '3', code: 'Digit3', target: env.pinInput },
+      (ev) => {
+        ev.preventDefault();
+        ev.stopPropagation();
+      },
+    );
+    await env.dispatchBlinkEvent('keyup', {
+      key: '3',
+      code: 'Digit3',
+      target: env.pinInput,
+    });
+    await env.advanceTime(20);
+
+    const keyCaptures = env.sent.filter(
+      (s) =>
+        s.channel === 'iron:mirror-capture' &&
+        (s.payload.kind === 'keydown' || s.payload.kind === 'keyup'),
+    );
+    expect(keyCaptures.map((c) => `${c.payload.kind}:${c.payload.key}`)).toEqual([
+      'keydown:3',
+      'keyup:3',
+    ]);
+  });
 });

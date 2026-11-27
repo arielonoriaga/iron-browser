@@ -97,6 +97,34 @@ interface NativeBusBinding {
   busSessionStorageOp(handle: number, jsonPayload: string): string;
   busQuery(handle: number, jsonFilter: string): string;
   busClearTab(handle: number, tabId: string): boolean;
+  ptySpawn?(jsonPayload: string): string;
+  ptyWrite?(id: number, dataB64: string): string;
+  ptyResize?(id: number, cols: number, rows: number): boolean;
+  ptyPoll?(id: number): string;
+  ptyKill?(id: number): boolean;
+}
+
+export interface NativePtyBinding {
+  ptySpawn(jsonPayload: string): string;
+  ptyWrite(id: number, dataB64: string): string;
+  ptyResize(id: number, cols: number, rows: number): boolean;
+  ptyPoll(id: number): string;
+  ptyKill(id: number): boolean;
+}
+
+export function loadNativePtyBinding(): NativePtyBinding | null {
+  const b = loadNativeBusBinding();
+  if (
+    b &&
+    typeof b.ptySpawn === 'function' &&
+    typeof b.ptyWrite === 'function' &&
+    typeof b.ptyResize === 'function' &&
+    typeof b.ptyPoll === 'function' &&
+    typeof b.ptyKill === 'function'
+  ) {
+    return b as unknown as NativePtyBinding;
+  }
+  return null;
 }
 
 let cachedNativeBinding: NativeBusBinding | null | undefined;
@@ -115,15 +143,17 @@ function candidateNativeAddonPaths(): string[] {
     process.cwd(),
     path.resolve(process.cwd(), '..'),
   ];
-  try {
-    const reqSelf = createRequire(path.join(__dirname, 'index.js'));
-    const electronMod = reqSelf('electron') as { app?: { getAppPath?: () => string } } | undefined;
-    const appPath = electronMod?.app?.getAppPath?.();
-    if (typeof appPath === 'string' && appPath.length > 0) {
-      bases.unshift(appPath, path.resolve(appPath, '..'));
+  if (process.versions?.electron) {
+    try {
+      const reqSelf = createRequire(path.join(__dirname, 'index.js'));
+      const electronMod = reqSelf('electron') as { app?: { getAppPath?: () => string } } | undefined;
+      const appPath = electronMod?.app?.getAppPath?.();
+      if (typeof appPath === 'string' && appPath.length > 0) {
+        bases.unshift(appPath, path.resolve(appPath, '..'));
+      }
+    } catch {
+      // Ignore when running outside Electron main process.
     }
-  } catch {
-    // Ignore when running outside Electron main process.
   }
 
   const cargoTargetDir = process.env.CARGO_TARGET_DIR?.trim();

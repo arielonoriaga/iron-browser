@@ -2,6 +2,98 @@ export type ViewportRole = 'portrait' | 'landscape';
 export type ViewMode = 'single' | 'dual';
 export type SessionMode = 'shared' | 'isolated';
 export type ThemeMode = 'dark' | 'light';
+export type AgentDockMode = 'docked' | 'floating' | 'minimized';
+export type AgentCliPreset = 'agy' | 'claude' | 'codex' | 'opencode' | 'shell' | 'custom';
+
+export interface RunningAgentInstance {
+  target: string;
+  windowName: string;
+  command: string;
+  cwd: string;
+  pid: number;
+  isAgentLike: boolean;
+}
+
+export interface AgentSessionSnapshot {
+  active: boolean;
+  kind: 'none' | 'pty' | 'tmux';
+  label: string;
+  preset?: AgentCliPreset;
+  targetPane?: string;
+  cwd?: string;
+  pid?: number | null;
+  exited?: boolean;
+  exitCode?: number | null;
+  socketPath: string;
+}
+
+export interface AgentDockState {
+  mode: AgentDockMode;
+  width: number;
+  floatBounds: Rect;
+  session: AgentSessionSnapshot;
+}
+
+export interface WebGlViewportSummary {
+  contexts: number;
+  webgl2Contexts: number;
+  drawCallsPerFrame: number;
+  trianglesPerFrame: number;
+  verticesPerFrame: number;
+  instancedDrawCallsPerFrame: number;
+  shaderSwitchesPerFrame: number;
+  textureBindsPerFrame: number;
+  renderPassesPerFrame: number;
+  peakDrawCallsPerFrame: number;
+  totalDrawCalls: number;
+  resources: {
+    programs: number;
+    textures: number;
+    buffers: number;
+    framebuffers: number;
+    renderbuffers: number;
+    vaos: number;
+  };
+  contextLostCount: number;
+  contextLost: boolean;
+  renderer?: string;
+  vendor?: string;
+}
+
+export interface WebGlRecordedDrawCall {
+  seq: number;
+  canvasIndex: number;
+  passIndex: number;
+  fboTarget: string;
+  api: string;
+  mode: string;
+  count: number;
+  instances: number;
+  triangles: number;
+  vertices: number;
+  programId: number | null;
+  activeTextureUnit: number;
+  boundTexture2d: number | null;
+  blendEnabled: boolean;
+  depthTest: boolean;
+  cullFace: boolean;
+  scissorEnabled: boolean;
+  viewport: [number, number, number, number];
+}
+
+export interface RenderingOrderLayer {
+  paintOrder: number;
+  selector: string;
+  tag: string;
+  isCanvas: boolean;
+  canvasKind?: 'webgl2' | 'webgl' | '2d' | 'bitmaprenderer' | 'unknown';
+  zIndex: string;
+  position: string;
+  opacity: number;
+  createsStackingContext: boolean;
+  compositorReasons: string[];
+  bounds: { x: number; y: number; width: number; height: number };
+}
 
 export type NetworkConditionPreset = 'none' | 'fast-4g' | 'slow-4g' | '3g' | 'offline';
 export type EmulationProfileId = 'none' | 'sunmi-v2-pro' | 'low-end-android' | 'custom';
@@ -76,6 +168,9 @@ export interface LayoutInput {
   dockOpen: boolean;
   dockHeight: number;
   splitRatio: number;
+  agentDockMode?: AgentDockMode;
+  agentDockWidth?: number;
+  agentFloatBounds?: Rect;
 }
 
 export interface LayoutResult {
@@ -89,8 +184,10 @@ export interface LayoutResult {
   telemetryBar: Rect;
   devtoolsHeader: Rect | null;
   devtoolsView: Rect | null;
+  agentDock?: Rect | null;
   clampedSplitRatio: number;
   clampedDockHeight: number;
+  clampedAgentWidth?: number;
 }
 
 export interface ClippedElementDetail {
@@ -174,6 +271,7 @@ export interface ShellState {
   ecoMode: boolean;
   autoSleep: boolean;
   mirrorMiss?: MirrorMissInfo | null;
+  agentDock?: AgentDockState;
   history: HistoryEntry[];
   closedTabCount: number;
 }
@@ -235,6 +333,10 @@ export type MirrorCaptureEvent = (
       key: string;
       code: string;
       modifiers: string[];
+      repeat?: boolean;
+      holdUntilKeyup?: boolean;
+      sensitive?: boolean;
+      observeOnly?: boolean;
     }
   | {
       kind: 'wheel';
@@ -272,6 +374,7 @@ export interface ViewportMetrics {
   p95FrameMs: number;
   jankCount: number;
   recentFrameMs: number[];
+  webgl?: WebGlViewportSummary | null;
 }
 
 export interface TelemetrySnapshot {
@@ -330,6 +433,10 @@ export interface IronShellApi {
   removeHistoryItem(url: string): Promise<ShellState>;
   clearHistory(): Promise<ShellState>;
   reopenClosedTab(): Promise<ShellState>;
+  toggleAgentDock?(): Promise<ShellState>;
+  setAgentDockMode?(mode: AgentDockMode): Promise<ShellState>;
+  setAgentDockWidth?(width: number): Promise<ShellState>;
+  sendContextToAgent?(): Promise<boolean>;
   onStateUpdate(cb: (state: ShellState) => void): () => void;
   onTelemetry(cb: (snapshot: TelemetrySnapshot) => void): () => void;
   onFocusUrlBar(cb: () => void): () => void;

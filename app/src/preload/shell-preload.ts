@@ -45,6 +45,10 @@ const api: IronShellApi = {
   removeHistoryItem: (url) => ipcRenderer.invoke('shell:remove-history-item', { url }),
   clearHistory: () => ipcRenderer.invoke('shell:clear-history'),
   reopenClosedTab: () => ipcRenderer.invoke('shell:reopen-closed-tab'),
+  toggleAgentDock: () => ipcRenderer.invoke('shell:toggle-agent-dock'),
+  setAgentDockMode: (mode) => ipcRenderer.invoke('shell:set-agent-dock-mode', { mode }),
+  setAgentDockWidth: (width) => ipcRenderer.invoke('shell:set-agent-dock-width', { width }),
+  sendContextToAgent: () => ipcRenderer.invoke('shell:send-context-to-agent'),
   onStateUpdate: (cb) => {
     const listener = (_ev: Electron.IpcRendererEvent, state: ShellState) => cb(state);
     ipcRenderer.on('shell:state', listener);

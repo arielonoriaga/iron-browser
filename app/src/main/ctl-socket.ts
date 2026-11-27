@@ -802,6 +802,58 @@ export class ControlSocketServer {
         });
       }
 
+      case 'browser_webgl': {
+        const rawAction = params.action ?? 'snapshot';
+        if (
+          rawAction !== 'snapshot' &&
+          rawAction !== 'capture_frame' &&
+          rawAction !== 'rendering_order' &&
+          rawAction !== 'reset_counters'
+        ) {
+          throw new Error(
+            "browser_webgl action must be 'snapshot', 'capture_frame', 'rendering_order', or 'reset_counters'",
+          );
+        }
+        const rawTab =
+          typeof params.tab_id === 'string' && params.tab_id.trim().length > 0
+            ? params.tab_id.trim()
+            : typeof params.tab === 'string' && params.tab.trim().length > 0
+              ? params.tab.trim()
+              : undefined;
+        let viewport: ViewportRole | 'both' | undefined;
+        if (params.viewport !== undefined) {
+          if (
+            params.viewport !== 'portrait' &&
+            params.viewport !== 'landscape' &&
+            params.viewport !== 'both'
+          ) {
+            throw new Error("viewport must be 'portrait', 'landscape', or 'both'");
+          }
+          viewport = params.viewport;
+        }
+        const maxCalls =
+          typeof params.max_calls === 'number' && Number.isFinite(params.max_calls)
+            ? Math.min(Math.max(Math.floor(params.max_calls), 1), 2048)
+            : undefined;
+        const maxLayers =
+          typeof params.max_layers === 'number' && Number.isFinite(params.max_layers)
+            ? Math.min(Math.max(Math.floor(params.max_layers), 8), 200)
+            : undefined;
+        const timeoutMs =
+          typeof params.timeout_ms === 'number' && Number.isFinite(params.timeout_ms)
+            ? Math.min(Math.max(Math.floor(params.timeout_ms), 100), 3000)
+            : undefined;
+
+        return await this.tabManager.inspectWebGl({
+          tabId: rawTab,
+          viewport,
+          action: rawAction,
+          maxCalls,
+          maxLayers,
+          timeoutMs,
+        });
+      }
+
       case 'browser_health': {
         const lines =
           typeof params.lines === 'number' && Number.isFinite(params.lines)

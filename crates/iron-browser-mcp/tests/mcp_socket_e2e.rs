@@ -212,6 +212,22 @@ fn spawn_mock_browser_socket(
                     "lastCrashDump": Value::Null,
                     "recentLogs": ["{\"event\":\"lifecycle.ready\"}"]
                 }),
+                "browser_webgl" => json!({
+                    "ok": true,
+                    "tabId": "tab-1",
+                    "action": req.params.get("action").cloned().unwrap_or_else(|| json!("snapshot")),
+                    "viewports": {
+                        "portrait": {
+                            "summary": {
+                                "contexts": 1,
+                                "webgl2Contexts": 1,
+                                "drawCallsPerFrame": 14,
+                                "trianglesPerFrame": 280,
+                                "renderPassesPerFrame": 2
+                            }
+                        }
+                    }
+                }),
                 other => {
                     let resp = CtlRpcResponse {
                         id: json!(req.id),
@@ -243,8 +259,8 @@ fn spawn_mock_browser_socket(
 }
 
 #[test]
-fn mcp_end_to_end_exercises_all_eighteen_tools_over_framed_unix_socket() {
-    let (_dir, sock_path, server) = spawn_mock_browser_socket(18);
+fn mcp_end_to_end_exercises_all_nineteen_tools_over_framed_unix_socket() {
+    let (_dir, sock_path, server) = spawn_mock_browser_socket(19);
     let client = SocketClient::new(sock_path);
 
     let requests = vec![
@@ -269,6 +285,7 @@ fn mcp_end_to_end_exercises_all_eighteen_tools_over_framed_unix_socket() {
         json!({"jsonrpc":"2.0","id":18,"method":"tools/call","params":{"name":"browser_emulate","arguments":{"tab":"tab-1","profile":"sunmi-v2-pro","calibrate":true}}}),
         json!({"jsonrpc":"2.0","id":19,"method":"tools/call","params":{"name":"browser_profile","arguments":{"tab":"tab-1","viewport":"portrait","action":"stop","top":10}}}),
         json!({"jsonrpc":"2.0","id":20,"method":"tools/call","params":{"name":"browser_health","arguments":{"lines":25}}}),
+        json!({"jsonrpc":"2.0","id":21,"method":"tools/call","params":{"name":"browser_webgl","arguments":{"viewport":"portrait","action":"capture_frame","max_calls":64}}}),
     ];
 
     let mut wire_in = String::new();
@@ -283,7 +300,7 @@ fn mcp_end_to_end_exercises_all_eighteen_tools_over_framed_unix_socket() {
         .expect("serve_io succeeds");
 
     let received = server.join().expect("mock socket thread joined");
-    assert_eq!(received.len(), 18);
+    assert_eq!(received.len(), 19);
     // Verify browser_eval received clamped max_bytes = 512
     assert_eq!(received[8].method, "browser_eval");
     assert_eq!(received[8].params["max_bytes"], json!(512));
@@ -299,6 +316,9 @@ fn mcp_end_to_end_exercises_all_eighteen_tools_over_framed_unix_socket() {
     assert_eq!(received[16].params["top"], json!(10));
     assert_eq!(received[17].method, "browser_health");
     assert_eq!(received[17].params["lines"], json!(25));
+    assert_eq!(received[18].method, "browser_webgl");
+    assert_eq!(received[18].params["action"], json!("capture_frame"));
+    assert_eq!(received[18].params["max_calls"], json!(64));
 
     let lines: Vec<Value> = String::from_utf8(wire_out)
         .expect("utf8 output")
@@ -306,14 +326,14 @@ fn mcp_end_to_end_exercises_all_eighteen_tools_over_framed_unix_socket() {
         .map(|l| serde_json::from_str::<Value>(l).expect("valid json line"))
         .collect();
 
-    // 21 input lines minus 1 notification = 20 responses
-    assert_eq!(lines.len(), 20);
+    // 22 input lines minus 1 notification = 21 responses
+    assert_eq!(lines.len(), 21);
 
     // Initialize negotiated 2025-06-18
     assert_eq!(lines[0]["result"]["protocolVersion"], "2025-06-18");
 
-    // tools/list returns all 18 tools
-    assert_eq!(lines[1]["result"]["tools"].as_array().unwrap().len(), 18);
+    // tools/list returns all 19 tools
+    assert_eq!(lines[1]["result"]["tools"].as_array().unwrap().len(), 19);
 
     // browser_emulate response includes active profile & calibration result
     let emu_text = lines[17]["result"]["content"][0]["text"].as_str().unwrap();

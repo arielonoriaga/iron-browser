@@ -56,6 +56,10 @@
         <button id="btn-auto-sleep" class="pill-btn" title="Toggle Opt-in Auto-Sleep for Inactive Tabs">
           <span id="lbl-auto-sleep">Auto-Sleep</span>
         </button>
+        <button id="btn-agent-chat" class="pill-btn agent-chat-btn" title="Toggle Embedded Agent Chat & Running CLI Instances (Ctrl+`)">
+          <span id="agent-chat-dot" class="agent-chat-dot"></span>
+          <span id="lbl-agent-chat">Agent Chat</span>
+        </button>
         <button id="btn-theme" class="icon-btn" title="Toggle Celestial Dark / Light Theme" aria-label="Toggle Theme">
           <svg viewBox="0 0 16 16"><circle cx="8" cy="8" r="3.5"/><path d="M8 1.5v1.5M8 13v1.5M1.5 8H3M13 8h1.5M3.4 3.4l1.1 1.1M11.5 11.5l1.1 1.1M12.6 3.4l-1.1 1.1M4.5 11.5l-1.1 1.1"/></svg>
         </button>
@@ -84,6 +88,7 @@
         <div class="rail-hint"><kbd>Ctrl+M</kbd><span>Mirror Sync</span></div>
         <div class="rail-hint"><kbd>Ctrl+Shift+T</kbd><span>Reopen Tab</span></div>
         <div class="rail-hint"><kbd>Ctrl+\</kbd><span>Hide Rail</span></div>
+        <div class="rail-hint"><kbd>Ctrl+`</kbd><span>Agent Chat</span></div>
         <div class="rail-hint"><kbd>F12</kbd><span>DevTools Dock</span></div>
       </div>
     </aside>
@@ -98,6 +103,9 @@
 
     <!-- Split Resize Handle (6px, Dual Mode only) -->
     <div id="split-divider" class="split-divider" title="Drag to resize split"></div>
+
+    <!-- Agent Dock Resize Handle (Docked mode only) -->
+    <div id="agent-resize-handle" class="split-divider hidden" title="Drag to resize Agent Chat Dock"></div>
 
     <!-- Landscape Viewport Header (28px) -->
     <div id="landscape-header" class="vp-header">
@@ -127,6 +135,8 @@
         <span class="metric-item"><span class="metric-k">Heap</span> <span id="m-heap" class="metric-v">0 MB</span></span>
         <span class="metric-sep">·</span>
         <span class="metric-item"><span class="metric-k">DOM</span> <span id="m-dom" class="metric-v">0</span></span>
+        <span id="m-dc-sep" class="metric-sep hidden">·</span>
+        <span id="m-dc-wrap" class="metric-item hidden"><span class="metric-k">DC</span> <span id="m-dc" class="metric-v">0</span></span>
       </div>
 
       <div class="telemetry-pills">

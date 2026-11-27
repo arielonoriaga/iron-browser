@@ -64,6 +64,10 @@ let btnEcoEl!: HTMLButtonElement;
 let lblEcoEl!: HTMLElement;
 let btnAutoSleepEl!: HTMLButtonElement;
 let lblAutoSleepEl!: HTMLElement;
+let btnAgentChatEl: HTMLButtonElement | null = null;
+let lblAgentChatEl: HTMLElement | null = null;
+let agentChatDotEl: HTMLElement | null = null;
+let agentResizeHandleEl: HTMLElement | null = null;
 let btnThemeEl!: HTMLButtonElement;
 let btnNewTabEl!: HTMLButtonElement;
 let selectPortraitEl!: HTMLSelectElement;
@@ -85,6 +89,9 @@ let mRamEl!: HTMLElement;
 let mFrameEl!: HTMLElement;
 let mHeapEl!: HTMLElement;
 let mDomEl!: HTMLElement;
+let mDcWrapEl: HTMLElement | null = null;
+let mDcSepEl: HTMLElement | null = null;
+let mDcEl: HTMLElement | null = null;
 let mDedupEl!: HTMLElement;
 let sparklineLineEl: SVGPolylineElement | null = null;
 
@@ -140,6 +147,10 @@ function bindDomElements(doc: Document): void {
   lblEcoEl = $<HTMLElement>(doc, 'lbl-eco');
   btnAutoSleepEl = $<HTMLButtonElement>(doc, 'btn-auto-sleep');
   lblAutoSleepEl = $<HTMLElement>(doc, 'lbl-auto-sleep');
+  btnAgentChatEl = doc.getElementById('btn-agent-chat') as HTMLButtonElement | null;
+  lblAgentChatEl = doc.getElementById('lbl-agent-chat');
+  agentChatDotEl = doc.getElementById('agent-chat-dot');
+  agentResizeHandleEl = doc.getElementById('agent-resize-handle');
   btnThemeEl = $<HTMLButtonElement>(doc, 'btn-theme');
   btnNewTabEl = $<HTMLButtonElement>(doc, 'btn-new-tab');
   selectPortraitEl = $<HTMLSelectElement>(doc, 'select-portrait-preset');
@@ -156,6 +167,9 @@ function bindDomElements(doc: Document): void {
   mFrameEl = $<HTMLElement>(doc, 'm-frame');
   mHeapEl = $<HTMLElement>(doc, 'm-heap');
   mDomEl = $<HTMLElement>(doc, 'm-dom');
+  mDcWrapEl = doc.getElementById('m-dc-wrap');
+  mDcSepEl = doc.getElementById('m-dc-sep');
+  mDcEl = doc.getElementById('m-dc');
   mDedupEl = $<HTMLElement>(doc, 'm-dedup');
   sparklineLineEl = doc.getElementById('sparkline-line') as SVGPolylineElement | null;
 
@@ -247,6 +261,9 @@ function renderLayout(state: ShellState): void {
     dockOpen: state.dockOpen,
     dockHeight: state.dockHeight,
     splitRatio: state.splitRatio,
+    agentDockMode: state.agentDock?.mode,
+    agentDockWidth: state.agentDock?.width,
+    agentFloatBounds: state.agentDock?.floatBounds,
   });
 
   applyRect(topBarEl, layout.topBar);
@@ -256,6 +273,18 @@ function renderLayout(state: ShellState): void {
   applyRect(landscapeHeaderEl, layout.landscapeHeader);
   applyRect(telemetryBarEl, layout.telemetryBar);
   applyRect(devtoolsHeaderEl, layout.devtoolsHeader);
+  if (agentResizeHandleEl) {
+    if (state.agentDock?.mode === 'docked' && layout.agentDock) {
+      applyRect(agentResizeHandleEl, {
+        x: layout.agentDock.x - 4,
+        y: layout.agentDock.y,
+        width: 6,
+        height: layout.agentDock.height,
+      });
+    } else {
+      agentResizeHandleEl.classList.add('hidden');
+    }
+  }
 }
 
 export function renderEmulationPill(emulation: TabEmulationSummary | null | undefined): void {
@@ -362,6 +391,19 @@ export function renderState(state: ShellState): void {
 
   btnAutoSleepEl.classList.toggle('active', state.autoSleep);
   lblAutoSleepEl.textContent = state.autoSleep ? 'Auto-Sleep On' : 'Auto-Sleep';
+
+  if (btnAgentChatEl && lblAgentChatEl) {
+    const dock = state.agentDock;
+    const open = Boolean(dock && dock.mode !== 'minimized');
+    const live = Boolean(dock?.session.active);
+    btnAgentChatEl.classList.toggle('active', open);
+    agentChatDotEl?.classList.toggle('live', live);
+    lblAgentChatEl.textContent = live
+      ? `Agent: ${sanitizeMirrorMissLabel(dock!.session.label, 18)}`
+      : open
+        ? 'Agent Chat'
+        : 'Chat';
+  }
 
   btnDockToggleEl.classList.toggle('active', state.dockOpen);
   renderEmulationPill(active?.emulation);
@@ -531,6 +573,21 @@ export function renderTelemetry(snap: TelemetrySnapshot): void {
   mHeapEl.textContent = `${heapMb.toFixed(1)} MB`;
   mDomEl.textContent = `${domNodes}`;
 
+  if (mDcWrapEl && mDcSepEl && mDcEl) {
+    const pGl = snap.portrait?.webgl;
+    const lGl = snap.landscape?.webgl;
+    const glCount = (pGl?.contexts ?? 0) + (lGl?.contexts ?? 0);
+    if (glCount > 0) {
+      const dc = (pGl?.drawCallsPerFrame ?? 0) + (lGl?.drawCallsPerFrame ?? 0);
+      mDcEl.textContent = String(dc);
+      mDcWrapEl.classList.remove('hidden');
+      mDcSepEl.classList.remove('hidden');
+    } else {
+      mDcWrapEl.classList.add('hidden');
+      mDcSepEl.classList.add('hidden');
+    }
+  }
+
   if (sparklineLineEl && primaryFrame && primaryFrame.recentFrameMs.length > 1) {
     const samples = primaryFrame.recentFrameMs;
     const maxMs = Math.max(33.3, ...samples);
@@ -595,6 +652,29 @@ function wireEvents(): void {
   btnAutoSleepEl.addEventListener('click', () => {
     if (!currentState) return;
     void getApi().setAutoSleep(!currentState.autoSleep).then(renderState);
+  });
+  btnAgentChatEl?.addEventListener('click', () => {
+    const fn = getApi().toggleAgentDock;
+    if (typeof fn === 'function') {
+      void fn.call(getApi()).then(renderState);
+    }
+  });
+  agentResizeHandleEl?.addEventListener('pointerdown', (startEv) => {
+    if (!currentState || currentState.agentDock?.mode !== 'docked') return;
+    agentResizeHandleEl!.setPointerCapture(startEv.pointerId);
+    const onMove = (ev: PointerEvent) => {
+      const nextWidth = (win?.innerWidth ?? 1480) - ev.clientX;
+      const fn = getApi().setAgentDockWidth;
+      if (typeof fn === 'function') {
+        void fn.call(getApi(), nextWidth).then(renderState);
+      }
+    };
+    const onUp = () => {
+      agentResizeHandleEl?.removeEventListener('pointermove', onMove);
+      agentResizeHandleEl?.removeEventListener('pointerup', onUp);
+    };
+    agentResizeHandleEl!.addEventListener('pointermove', onMove);
+    agentResizeHandleEl!.addEventListener('pointerup', onUp);
   });
   btnThemeEl.addEventListener('click', () => {
     if (!currentState) return;
@@ -669,7 +749,9 @@ function wireEvents(): void {
     splitDividerEl.setPointerCapture(startEv.pointerId);
     splitDividerEl.classList.add('dragging');
     const railW = currentState.railCollapsed ? 0 : 216;
-    const contentW = Math.max(200, (win?.innerWidth ?? 1480) - railW);
+    const agentW =
+      currentState.agentDock?.mode === 'docked' ? (currentState.agentDock.width ?? 360) : 0;
+    const contentW = Math.max(200, (win?.innerWidth ?? 1480) - railW - agentW);
 
     const onMove = (ev: PointerEvent) => {
       const ratio = (ev.clientX - railW) / contentW;

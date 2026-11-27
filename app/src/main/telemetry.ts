@@ -7,6 +7,7 @@ import type {
   TelemetrySnapshot,
   ViewportMetrics,
   ViewportRole,
+  WebGlViewportSummary,
 } from '../shared/types';
 import { truncateUtf8 } from '../shared/frame';
 import {
@@ -37,6 +38,7 @@ export interface TelemetryServiceOptions {
     summary: string;
     tsMs: number;
   }) => void;
+  pollWebGl?: (wc: WebContents) => Promise<WebGlViewportSummary | null>;
 }
 
 const MAX_CONSOLE_ENTRIES = 400;
@@ -87,6 +89,7 @@ function sanitizeFrameStats(raw: unknown): FrameStats | null {
 
 export class TelemetryService {
   private readonly rafByWcId = new Map<number, { stats: FrameStats; updatedAtMs: number }>();
+  private readonly webglByWcId = new Map<number, WebGlViewportSummary | null>();
   private readonly cdpPerfByWcId = new Map<
     number,
     { jsHeapUsedMb: number; domNodes: number; layoutCount: number; recalcStyleCount: number }
@@ -100,6 +103,7 @@ export class TelemetryService {
   private readonly activePollMs: number;
   private readonly blurPollMs: number;
   private readonly onBusEvent?: TelemetryServiceOptions['onBusEvent'];
+  private readonly pollWebGl?: TelemetryServiceOptions['pollWebGl'];
   private readonly rafListener: (ev: IpcMainEvent, rawStats: unknown) => void;
   private nextConsoleId = 1;
   private timer: ReturnType<typeof setTimeout> | null = null;
@@ -121,6 +125,7 @@ export class TelemetryService {
     this.activePollMs = opts.activePollMs ?? ACTIVE_POLL_INTERVAL_MS;
     this.blurPollMs = opts.blurPollMs ?? BLUR_POLL_INTERVAL_MS;
     this.onBusEvent = opts.onBusEvent;
+    this.pollWebGl = opts.pollWebGl;
     const initGpu = buildGpuTelemetrySeparation(0, 0, null);
     this.lastSnapshot = {
       timestampMs: this.now(),
@@ -193,6 +198,7 @@ export class TelemetryService {
       unsub();
     }
     this.collectorUnsubs.clear();
+    this.webglByWcId.clear();
   }
 
   setThrottled(throttled: boolean): void {
@@ -413,6 +419,7 @@ export class TelemetryService {
       onDestroyed: () => {
         this.rafByWcId.delete(wc.id);
         this.cdpPerfByWcId.delete(wc.id);
+        this.webglByWcId.delete(wc.id);
         this.collectorUnsubs.delete(wc.id);
       },
     });
@@ -624,7 +631,20 @@ export class TelemetryService {
       p95FrameMs: raf.p95FrameMs,
       jankCount: raf.jankCount,
       recentFrameMs: raf.recentFrameMs,
+      webgl: this.webglByWcId.get(wc.id) ?? null,
     };
+  }
+
+  private async pollViewportWebGl(wc: WebContents | null): Promise<void> {
+    if (!wc || wc.isDestroyed() || !this.pollWebGl) return;
+    try {
+      const summary = await this.pollWebGl(wc);
+      if (!wc.isDestroyed()) {
+        this.webglByWcId.set(wc.id, summary && summary.contexts > 0 ? summary : null);
+      }
+    } catch {
+      // Ignore transient navigation errors.
+    }
   }
 
   sampleOnce(): Promise<TelemetrySnapshot> {
@@ -647,6 +667,8 @@ export class TelemetryService {
     await Promise.all([
       this.pollCdpPerformance(target?.portraitWc ?? null),
       this.pollCdpPerformance(target?.landscapeWc ?? null),
+      this.pollViewportWebGl(target?.portraitWc ?? null),
+      this.pollViewportWebGl(target?.landscapeWc ?? null),
     ]);
 
     const appMetrics = app.getAppMetrics();

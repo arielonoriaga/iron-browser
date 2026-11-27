@@ -187,6 +187,28 @@ pub fn definitions(hard_max_bytes: usize) -> Value {
             }
         }
     });
+    let webgl_tool = json!({
+        "name": "browser_webgl",
+        "description": "Inspect WebGL/WebGL2 draw calls, triangles/vertices, instanced draws, shader program switches, texture binds, FBO render passes, GPU resource counts, context-loss state, chronological single-frame draw-call execution order (capture_frame), and CSS/Canvas stacking-context & compositor layer rendering order across portrait, landscape, or both viewports.",
+        "annotations": {"readOnlyHint": true, "destructiveHint": false, "idempotentHint": true, "openWorldHint": false},
+        "inputSchema": {
+            "type": "object",
+            "additionalProperties": false,
+            "properties": {
+                "tab": tab_id,
+                "tab_id": tab_id,
+                "viewport": viewport_or_both,
+                "action": {
+                    "type": "string",
+                    "enum": ["snapshot", "capture_frame", "rendering_order", "reset_counters"],
+                    "default": "snapshot"
+                },
+                "max_calls": {"type": "integer", "minimum": 1, "maximum": 2048, "default": 256},
+                "max_layers": {"type": "integer", "minimum": 8, "maximum": 200, "default": 64},
+                "timeout_ms": {"type": "integer", "minimum": 100, "maximum": 3000, "default": 700}
+            }
+        }
+    });
 
     let tools = vec![
         json!({
@@ -443,11 +465,12 @@ pub fn definitions(hard_max_bytes: usize) -> Value {
         emulate_tool,
         profile_tool,
         health_tool,
+        webgl_tool,
     ];
     json!({"tools": tools})
 }
 
-const TOOL_NAMES: [&str; 18] = [
+const TOOL_NAMES: [&str; 19] = [
     "browser_tabs",
     "browser_open",
     "browser_navigate",
@@ -466,6 +489,7 @@ const TOOL_NAMES: [&str; 18] = [
     "browser_emulate",
     "browser_profile",
     "browser_health",
+    "browser_webgl",
 ];
 
 pub struct Session {
@@ -783,7 +807,7 @@ mod tests {
     fn all_tools_declare_four_boolean_annotations() {
         let defs = definitions(DEFAULT_MAX_BYTES);
         let tools = defs["tools"].as_array().expect("tools array");
-        assert_eq!(tools.len(), 18);
+        assert_eq!(tools.len(), 19);
         assert_eq!(tools.len(), TOOL_NAMES.len());
         for tool in tools {
             let ann = tool["annotations"].as_object().expect("annotations object");

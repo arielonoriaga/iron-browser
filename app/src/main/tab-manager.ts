@@ -12,6 +12,12 @@ import {
 import path from 'node:path';
 import { pathToFileURL } from 'node:url';
 import type { StructuredLogger } from './diagnostics';
+import type { AgentDockManager } from './agent-dock';
+import {
+  WebGlInspectorManager,
+  type WebGlInspectAction,
+  type WebGlViewportInspection,
+} from './webgl-inspector';
 import { clamp, computeFitScale, computeLayout } from '../shared/layout';
 import { truncateUtf8 } from '../shared/frame';
 import {
@@ -43,6 +49,7 @@ import type {
   TabSnapshot,
   TelemetrySnapshot,
   ThemeMode,
+  AgentDockMode,
   ViewMode,
   ViewportDimensions,
   ViewportRole,
@@ -304,10 +311,12 @@ export class TabManager implements MirrorViewportLookup {
   public readonly debuggerCoordinator: DebuggerCoordinator;
   public readonly slowDeviceEmulation: SlowDeviceEmulationManager;
   public readonly cpuProfiler: CpuProfilerManager;
+  public readonly webGlInspector: WebGlInspectorManager;
   public readonly mirrorRelay: MirrorRelay;
   public readonly requestDedup: RequestDedupMiddleware<WebContents>;
   public readonly wsSseMux: WsSseMux;
   public readonly telemetry: TelemetryService;
+  private agentDock: AgentDockManager | null = null;
 
   constructor(
     private readonly win: BrowserWindow,
@@ -327,6 +336,7 @@ export class TabManager implements MirrorViewportLookup {
     this.cpuProfiler = new CpuProfilerManager(this.debuggerCoordinator, () =>
       this.getProfilesDir(),
     );
+    this.webGlInspector = new WebGlInspectorManager(this.debuggerCoordinator);
     this.mirrorRelay = new MirrorRelay(this);
     this.requestDedup = new RequestDedupMiddleware(this.debuggerCoordinator, {
       resolveViewportContext: (wcId) => this.resolveDedupContext(wcId),
@@ -402,6 +412,7 @@ export class TabManager implements MirrorViewportLookup {
             tsMs: ev.tsMs,
           });
         },
+        pollWebGl: (wc) => this.webGlInspector.getViewportSummary(wc),
       },
     );
 
@@ -452,6 +463,7 @@ export class TabManager implements MirrorViewportLookup {
     view.webContents.setWindowOpenHandler(() => ({ action: 'deny' }));
     view.setVisible(false);
     this.win.contentView.addChildView(view);
+    this.agentDock?.ensureTopMost();
     this.devtoolsView = view;
     return view;
   }
@@ -694,6 +706,8 @@ export class TabManager implements MirrorViewportLookup {
     this.ensureSessionDownloadHandler((wc as { session?: Session }).session);
     view.setVisible(false);
     this.win.contentView.addChildView(view);
+    this.agentDock?.ensureTopMost();
+    void this.webGlInspector.syncViewport(wc);
 
     // Block unmanaged Electron popup windows; route valid http/https popups into managed tabs.
     wc.setWindowOpenHandler(({ url }) => {
@@ -1570,6 +1584,66 @@ export class TabManager implements MirrorViewportLookup {
     this.tabEventBus.beginGesture(tabId, role, action);
   }
 
+  private static readonly NON_SENSITIVE_NAV_KEYS = new Set([
+    'Enter',
+    'Tab',
+    'Escape',
+    'Backspace',
+    'Delete',
+    'Insert',
+    'Home',
+    'End',
+    'PageUp',
+    'PageDown',
+    'ArrowUp',
+    'ArrowDown',
+    'ArrowLeft',
+    'ArrowRight',
+    'ContextMenu',
+    'F1',
+    'F2',
+    'F3',
+    'F4',
+    'F5',
+    'F6',
+    'F7',
+    'F8',
+    'F9',
+    'F10',
+    'F11',
+    'F12',
+  ]);
+
+  onKeyboardEvent(
+    tabId: string,
+    role: ViewportRole,
+    ev: {
+      kind: 'keydown' | 'keyup';
+      key: string;
+      code: string;
+      modifiers: string[];
+      repeat: boolean;
+      tag: string;
+      sensitive: boolean;
+    },
+  ): void {
+    const hasCtrlOrMeta = ev.modifiers.some((m) => m === 'control' || m === 'meta');
+    const hasAlt = ev.modifiers.includes('alt');
+    const isPureShortcut = hasCtrlOrMeta && !hasAlt && /^[a-zA-Z]$/.test(ev.key);
+    const shouldRedact =
+      ev.sensitive && !TabManager.NON_SENSITIVE_NAV_KEYS.has(ev.key) && !isPureShortcut;
+    const safeKey = shouldRedact ? '[REDACTED]' : ev.key;
+    const modPrefix = ev.modifiers.length > 0 ? `${ev.modifiers.join('+')}+` : '';
+    const repeatSuffix = ev.repeat ? ' (repeat)' : '';
+    this.tabEventBus.publish({
+      tabId,
+      viewport: role,
+      domain: 'gesture',
+      kind: ev.kind,
+      summary: `${ev.kind} ${modPrefix}${safeKey} on <${ev.tag}>${repeatSuffix}`,
+    });
+  }
+
   onMirrorMiss(tabId: string, info: MirrorMissInfo, sourceWcId?: number): void {
     const tab = this.getTab(tabId);
     if (!tab) return;
@@ -1898,6 +1972,7 @@ export class TabManager implements MirrorViewportLookup {
               await Promise.all([
                 this.wsSseMux.syncViewport(wc, active),
                 this.requestDedup.setViewportEnabled(wc, active),
+                this.webGlInspector.syncViewport(wc),
               ]);
             }
             return;
@@ -1925,6 +2000,7 @@ export class TabManager implements MirrorViewportLookup {
             Promise.all([
               this.wsSseMux.syncViewport(wc, active),
               this.requestDedup.setViewportEnabled(wc, active),
+              this.webGlInspector.syncViewport(wc),
               ...(hit
                 ? [this.slowDeviceEmulation.syncViewport(hit.tab.id, hit.role, wc)]
                 : []),
@@ -2686,11 +2762,13 @@ export class TabManager implements MirrorViewportLookup {
       await Promise.all([
         this.wsSseMux.syncViewport(lWc, active),
         this.requestDedup.setViewportEnabled(lWc, active),
+        this.webGlInspector.syncViewport(lWc),
         this.slowDeviceEmulation.syncViewport(tab.id, 'landscape', lWc),
         ...(pWc
           ? [
               this.wsSseMux.syncViewport(pWc, active),
               this.requestDedup.setViewportEnabled(pWc, active),
+              this.webGlInspector.syncViewport(pWc),
               this.slowDeviceEmulation.syncViewport(tab.id, 'portrait', pWc),
             ]
           : []),
@@ -2947,6 +3025,7 @@ export class TabManager implements MirrorViewportLookup {
     }
     this.slowDeviceEmulation.disposeWebContents(wc.id);
     this.cpuProfiler.disposeWebContents(wc.id);
+    this.webGlInspector.disposeWebContents(wc.id);
     this.wsSseMux.disposeWebContents(wc.id);
     this.requestDedup.disposeWebContents(wc.id);
     this.debuggerCoordinator.detach(wc);
@@ -3000,6 +3079,7 @@ export class TabManager implements MirrorViewportLookup {
     const active = this.getActiveTab();
     const mode: ViewMode = active?.mode ?? 'single';
 
+    const agentState = this.agentDock?.getState();
     const layout = computeLayout({
       windowWidth,
       windowHeight,
@@ -3008,12 +3088,16 @@ export class TabManager implements MirrorViewportLookup {
       dockOpen: this.dockOpen,
       dockHeight: this.dockHeight,
       splitRatio: this.splitRatio,
+      agentDockMode: agentState?.mode,
+      agentDockWidth: agentState?.width,
+      agentFloatBounds: agentState?.floatBounds,
     });
     this.lastLayout = layout;
     this.splitRatio = layout.clampedSplitRatio;
     if (this.dockOpen) {
       this.dockHeight = layout.clampedDockHeight;
     }
+    this.agentDock?.applyBounds(layout.agentDock ?? null);
 
     if (
       active &&
@@ -3043,6 +3127,9 @@ export class TabManager implements MirrorViewportLookup {
         dockOpen: this.dockOpen,
         dockHeight: this.dockHeight,
         splitRatio: this.splitRatio,
+        agentDockMode: agentState?.mode,
+        agentDockWidth: agentState?.width,
+        agentFloatBounds: agentState?.floatBounds,
       });
       if (tab.landscapeView && !tab.landscapeView.webContents.isDestroyed()) {
         tab.landscapeView.setBounds(tabLayout.landscapeView);
@@ -5016,8 +5103,118 @@ export class TabManager implements MirrorViewportLookup {
       ecoMode: this.ecoMode,
       autoSleep: this.autoSleep,
       mirrorMiss: activeTab ? (this.mirrorMissByTab.get(activeTab.id) ?? null) : null,
+      ...(this.agentDock ? { agentDock: this.agentDock.getState() } : {}),
       history: [...this.history],
       closedTabCount: this.closedTabs.length,
+    };
+  }
+
+  attachAgentDock(dock: AgentDockManager): void {
+    this.agentDock = dock;
+    this.applyLayout();
+  }
+
+  toggleAgentDock(): ShellState {
+    this.agentDock?.toggle();
+    this.applyLayout();
+    return this.emitState(false);
+  }
+
+  setAgentDockMode(mode: AgentDockMode): ShellState {
+    this.agentDock?.setMode(mode);
+    this.applyLayout();
+    return this.emitState(false);
+  }
+
+  setAgentDockWidth(width: number): ShellState {
+    this.agentDock?.setWidth(width);
+    this.applyLayout();
+    return this.emitState(false);
+  }
+
+  sendContextToAgent(): boolean {
+    return this.agentDock?.injectBrowserContextToView() ?? false;
+  }
+
+  buildBrowserContextSnippet(): string {
+    const active = this.getActiveTab();
+    if (!active) return '[IronBrowser: no active tab]';
+    const safeUrl = redactMirrorUrl(active.url || '');
+    const snap = this.latestTelemetry;
+    const pGl = snap?.portrait?.webgl;
+    const lGl = snap?.landscape?.webgl;
+    const dc = (pGl?.drawCallsPerFrame ?? 0) + (lGl?.drawCallsPerFrame ?? 0);
+    const miss = this.mirrorMissByTab.get(active.id);
+    const parts = [
+      `tab=${active.id}`,
+      `url=${safeUrl}`,
+      `mode=${active.mode}`,
+      active.mode === 'dual'
+        ? `portrait=${active.portraitSize.width}x${active.portraitSize.height} landscape=${active.landscapeSize.width}x${active.landscapeSize.height}`
+        : `viewport=${active.landscapeSize.width}x${active.landscapeSize.height}`,
+      ...(dc > 0 ? [`webglDrawCalls=${dc}`] : []),
+      ...(miss ? [`mirrorMiss=${miss.reason}:${sanitizeMirrorMissLabel(miss.targetLabel, 24)}`] : []),
+    ];
+    return `[IronBrowser ${parts.join(' ')}]`;
+  }
+
+  async inspectWebGl(input: {
+    tabId?: string;
+    viewport?: ViewportRole | 'both';
+    action?: WebGlInspectAction;
+    maxCalls?: number;
+    maxLayers?: number;
+    timeoutMs?: number;
+  }): Promise<{
+    ok: true;
+    tabId: string;
+    url: string;
+    mode: ViewMode;
+    action: WebGlInspectAction;
+    viewports: Partial<Record<ViewportRole, WebGlViewportInspection>>;
+  }> {
+    const tab = input.tabId ? this.getTab(input.tabId) : this.getActiveTab();
+    if (!tab) {
+      throw new Error(`tab not found: ${input.tabId ?? 'active'}`);
+    }
+    await this.ensureTabMaterializedAndLoaded(tab);
+    const action: WebGlInspectAction = input.action ?? 'snapshot';
+    const targetRoles: ViewportRole[] =
+      input.viewport && input.viewport !== 'both'
+        ? [input.viewport]
+        : tab.mode === 'dual'
+          ? ['portrait', 'landscape']
+          : ['landscape'];
+
+    const viewports: Partial<Record<ViewportRole, WebGlViewportInspection>> = {};
+    await Promise.all(
+      targetRoles.map(async (role) => {
+        const view =
+          role === 'portrait'
+            ? tab.mode === 'dual'
+              ? tab.portraitView
+              : null
+            : tab.landscapeView;
+        if (!view || view.webContents.isDestroyed()) return;
+        const res = await this.webGlInspector.inspectViewport(view.webContents, {
+          action,
+          maxCalls: input.maxCalls,
+          maxLayers: input.maxLayers,
+          timeoutMs: input.timeoutMs,
+        });
+        if (res) {
+          viewports[role] = res;
+        }
+      }),
+    );
+
+    return {
+      ok: true,
+      tabId: tab.id,
+      url: redactMirrorUrl(tab.url) ?? tab.url,
+      mode: tab.mode,
+      action,
+      viewports,
     };
   }
 
@@ -5081,6 +5278,7 @@ export class TabManager implements MirrorViewportLookup {
     this.telemetry.dispose();
     this.slowDeviceEmulation.dispose();
     this.cpuProfiler.dispose();
+    this.webGlInspector.dispose();
     this.requestDedup.dispose();
     this.wsSseMux.dispose();
     this.mirrorRelay.dispose();

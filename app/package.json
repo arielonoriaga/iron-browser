@@ -8,8 +8,8 @@
   "scripts": {
     "build:native": "bash scripts/build-native.sh",
     "build:main": "bun build src/main/index.ts --outdir dist/main --target node --format cjs --external electron",
-    "build:preload": "bun build src/preload/shell-preload.ts src/preload/mirror-preload.ts --outdir dist/preload --target node --format cjs --external electron",
-    "build:renderer": "bun build src/renderer/shell.ts --outdir dist/renderer --target browser --format iife && cp src/renderer/index.html src/renderer/styles.css src/renderer/welcome.html dist/renderer/",
+    "build:preload": "bun build src/preload/shell-preload.ts src/preload/mirror-preload.ts src/preload/agent-preload.ts --outdir dist/preload --target node --format cjs --external electron",
+    "build:renderer": "bun build src/renderer/shell.ts src/renderer/agent-dock.ts --outdir dist/renderer --target browser --format iife && cp src/renderer/index.html src/renderer/styles.css src/renderer/welcome.html src/renderer/agent-dock.html src/renderer/agent-dock.css dist/renderer/",
     "build": "bun run build:native && bun run build:main && bun run build:preload && bun run build:renderer",
     "typecheck": "tsc --noEmit",
     "test": "bun test",

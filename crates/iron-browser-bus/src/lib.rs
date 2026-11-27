@@ -1,4 +1,5 @@
 pub mod napi;
+pub mod pty;
 
 use std::collections::{BTreeMap, HashMap, VecDeque};
 

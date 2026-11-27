@@ -10,6 +10,7 @@ use serde_json::json;
 
 use crate::{
     DEFAULT_MAX_EVENTS_PER_TAB, PublishInput, QueryFilter, SessionStorageOpInput, TabEventBusCore,
+    pty::{PtySpawnInput, pty_kill, pty_poll, pty_resize, pty_spawn, pty_write},
 };
 
 type NapiEnv = *mut c_void;
@@ -413,6 +414,107 @@ unsafe extern "C" fn napi_bus_clear_tab(env: NapiEnv, info: NapiCallbackInfo) ->
     }
 }
 
+unsafe extern "C" fn napi_pty_spawn(env: NapiEnv, info: NapiCallbackInfo) -> NapiValue {
+    unsafe {
+        with_napi_guard(env, |api| {
+            let Some([json_val]) = read_args::<1>(api, env, info) else {
+                return js_throw(api, env, c"ptySpawn requires 1 arg");
+            };
+            let Some(json_str) = read_utf8(api, env, json_val) else {
+                return js_throw(api, env, c"invalid ptySpawn payload");
+            };
+            let parsed: PtySpawnInput = match serde_json::from_str(&json_str) {
+                Ok(v) => v,
+                Err(e) => {
+                    let out = json!({ "ok": false, "error": format!("invalid ptySpawn json: {e}") });
+                    return make_utf8(api, env, &out.to_string());
+                }
+            };
+            let res = pty_spawn(parsed);
+            let serialized = serde_json::to_string(&res).unwrap_or_else(|_| {
+                "{\"ok\":false,\"error\":\"serialize error\"}".to_string()
+            });
+            make_utf8(api, env, &serialized)
+        })
+    }
+}
+
+unsafe extern "C" fn napi_pty_write(env: NapiEnv, info: NapiCallbackInfo) -> NapiValue {
+    unsafe {
+        with_napi_guard(env, |api| {
+            let Some([id_val, data_val]) = read_args::<2>(api, env, info) else {
+                return js_throw(api, env, c"ptyWrite requires 2 args");
+            };
+            let (Some(id), Some(data_b64)) =
+                (read_u32(api, env, id_val), read_utf8(api, env, data_val))
+            else {
+                return js_throw(api, env, c"invalid ptyWrite arguments");
+            };
+            let res = pty_write(id, &data_b64);
+            let serialized = serde_json::to_string(&res).unwrap_or_else(|_| {
+                "{\"ok\":false,\"bytesWritten\":0,\"error\":\"serialize error\"}".to_string()
+            });
+            make_utf8(api, env, &serialized)
+        })
+    }
+}
+
+unsafe extern "C" fn napi_pty_resize(env: NapiEnv, info: NapiCallbackInfo) -> NapiValue {
+    unsafe {
+        with_napi_guard(env, |api| {
+            let Some([id_val, cols_val, rows_val]) = read_args::<3>(api, env, info) else {
+                return js_throw(api, env, c"ptyResize requires 3 args");
+            };
+            let (Some(id), Some(cols), Some(rows)) = (
+                read_u32(api, env, id_val),
+                read_u32(api, env, cols_val),
+                read_u32(api, env, rows_val),
+            ) else {
+                return js_throw(api, env, c"invalid ptyResize arguments");
+            };
+            let ok = pty_resize(id, cols.min(u16::MAX as u32) as u16, rows.min(u16::MAX as u32) as u16);
+            let mut out: NapiValue = ptr::null_mut();
+            let _ = (api.get_boolean)(env, ok, &mut out);
+            out
+        })
+    }
+}
+
+unsafe extern "C" fn napi_pty_poll(env: NapiEnv, info: NapiCallbackInfo) -> NapiValue {
+    unsafe {
+        with_napi_guard(env, |api| {
+            let Some([id_val]) = read_args::<1>(api, env, info) else {
+                return js_throw(api, env, c"ptyPoll requires 1 arg");
+            };
+            let Some(id) = read_u32(api, env, id_val) else {
+                return js_throw(api, env, c"invalid ptyPoll argument");
+            };
+            let res = pty_poll(id);
+            let serialized = serde_json::to_string(&res).unwrap_or_else(|_| {
+                "{\"ok\":false,\"dataB64\":\"\",\"exited\":true,\"exitCode\":null,\"droppedBytes\":0}".to_string()
+            });
+            make_utf8(api, env, &serialized)
+        })
+    }
+}
+
+unsafe extern "C" fn napi_pty_kill(env: NapiEnv, info: NapiCallbackInfo) -> NapiValue {
+    unsafe {
+        with_napi_guard(env, |api| {
+            let Some([id_val]) = read_args::<1>(api, env, info) else {
+                return js_throw(api, env, c"ptyKill requires 1 arg");
+            };
+            let Some(id) = read_u32(api, env, id_val) else {
+                return js_throw(api, env, c"invalid ptyKill argument");
+            };
+            let ok = pty_kill(id);
+            let mut out: NapiValue = ptr::null_mut();
+            let _ = (api.get_boolean)(env, ok, &mut out);
+            out
+        })
+    }
+}
+
 unsafe fn export_fn(
     api: &NapiSymbols,
     env: NapiEnv,
@@ -484,6 +586,11 @@ pub unsafe extern "C" fn napi_register_module_v1(
             );
             export_fn(api, env, exports, c"busQuery", napi_bus_query);
             export_fn(api, env, exports, c"busClearTab", napi_bus_clear_tab);
+            export_fn(api, env, exports, c"ptySpawn", napi_pty_spawn);
+            export_fn(api, env, exports, c"ptyWrite", napi_pty_write);
+            export_fn(api, env, exports, c"ptyResize", napi_pty_resize);
+            export_fn(api, env, exports, c"ptyPoll", napi_pty_poll);
+            export_fn(api, env, exports, c"ptyKill", napi_pty_kill);
         }
     }));
     exports

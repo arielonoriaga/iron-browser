@@ -1,34 +1,37 @@
-# IronBrowser — Laptop Session Handoff (`Wave 4 + Backlog P1–P5 Complete → iron-design UI + Agent CLI Dock`)
+# IronBrowser — Laptop & `iron-term` Synchronization Handoff (`2026-11-27`)
 
-Migrated back from `desktop` (`exo`) to `laptop` (`ariel`) on **2026-11-26** with all code, tests, builds, launcher files, and the `iron-design` 3-Proposal UX Lab + Agent CLI Terminal Plan synced and verified.
-
----
-
-## 1. Completed & Verified in Shipping Repo (`~/Projects/iron-browser`)
-- **Wave 4 Complete (`100%` Green):**
-  - Bun `1.4.2` `node:vm` GlobalProxy fix (`app/test/ws-sse-mux.test.ts`), bounded CDP sync (`app/src/main/tab-manager.ts`), hidden-window `ForceRedraw` + Aura bounds-nudge capture (`~50–390ms`).
-  - `133/133` unit tests, `3/3` `smoke.e2e.ts`, `149/149` `runner.ts --tier=all` (`60` T1 + `60` T2 + `18` T3 + `8` T4 + `3` Smoke).
-- **Phase 3 (`BACKLOG.md` P1–P5 + Launcher + 14-Tool Rust MCP) Complete (`100%` Green):**
-  - **BL-00:** Symlink launcher resolution (`bin/iron-browser`) + portable XDG desktop installer (`packaging/install-desktop.sh`).
-  - **P1:** `{ requestedSize, effectiveCssSize, dpr, capturedPixels, sizeMismatch }` + `exact_size: true` capture & restore.
-  - **P2:** Saved repro recipes (`0600` atomic `O_NOFOLLOW`), paired `window.__ironSceneDriver` frame stepping, canvas-only crop, and 5×7 metadata-stamped filmstrip PNG export (`browser_repro`, `browser_filmstrip`).
-  - **P3:** Observational cross-pane diagnostic incident grouping (`browser_incidents`) with query/token redaction, keeping single-pane JS exceptions distinct and separate from R2 HTTP dedup.
-  - **P4:** Per-pane bounded partial dual screenshots + `{ stage, viewport, error }`, `layoutAudit.clippedItems` (`selector`, `bounds`, `overflowPx` with password redaction), and `highlight_clipped: true` visual overlay.
-  - **P5:** `browser_trace_start` / `browser_trace_stop` rolling frame-time buffer, `before`/`during`/`after` windows around app `performance.mark`/`measure` (`biome_crossing`), and `gpuProcessCpuPercent` labeled separately from `gpuExecutionTimeMs`.
-  - **Independent Adversarial Review (`Pass 1`–`Pass 6`):** All `9` findings (`F-01`–`F-09`) resolved; `PASS` (`0` open findings). Full evidence in `DESKTOP_COMPLETION_REPORT.md`.
-  - Working tree left **uncommitted** as requested.
+Synced between `desktop` (`/home/exo/Projects/iron-browser`) and `laptop` (`/home/ariel/Projects/iron-browser`) on `main` (`origin/main`).
 
 ---
 
-## 2. `iron-design` Full Browser UI Redesign + Embedded Agent CLI Terminal Plan
+## 1. What Shipped & Verified Across `536f79f` → `6d1bc86` → `f5f8f36`
 
-Per `iron-design` (`V13`: zero shipping-repo UI edits before owner selects a direction), all briefs, plans, and the live interactive 3-proposal UX Lab live in **`~/.cache/iron-browser-ux-lab/`** on both `laptop` and `desktop`:
+1. **Dual-Viewport Runtime, Dedup Stack & SFS2X Binary Multiplexing (`536f79f`):**
+   - Simultaneous `390×844` Portrait + `1280×720` Landscape `WebContentsView` compositor, 3-Tier semantic/canvas `MirrorRelay` (with State-Aware Toggle Guard, synthetic-click suppression, and redacted Mirror-Miss telemetry), `Eco` DPR cap, lazy restored tabs, opt-in `Auto-Sleep`, and cache-clearing reload.
+   - `RequestDedupMiddleware` (idempotent cross-pane `POST`/`PUT`/`PATCH`/`DELETE` replay with JSON correlation-ID remapping and gzip/br/deflate support).
+   - `WsSseMux` symmetric `WebSocket` + `EventSource` multiplexer + **SmartFoxServer 2X (`SFS2X`)** binary codec (`app/src/shared/sfs-codec.ts`) handling numbered cluster shard failover (`game5` ↔ `game8`), late-joining follower Handshake/Login staging, outbound binary `Bet`/`Cashout` deduplication, and one-shot 302 launch redirect convergence (verified on Spribe Aviator).
+   - `--smoke` invisible offscreen launch (`--class=iron-browser-e2e`) with compositor `ForceRedraw` + Aura bounds-nudge capture (`~50–390ms`) so background E2Es never pop onto active monitors.
+   - Backlog **P1–P5**: `viewportReport` (`sizeMismatch` + `exact_size`), `browser_repro` + `browser_filmstrip` (`window.__ironSceneDriver` lockstep stepping + 5×7 stamped PNG strip), `browser_incidents` (cross-pane failure grouping), `highlight_clipped` + partial dual screenshots, and `browser_trace_start`/`stop` (`before`/`during`/`after` mark windows + `gpuProcessCpuPercent` separated from `gpuExecutionTimeMs`).
 
-- **UX Audit & Brief:** `~/.cache/iron-browser-ux-lab/UX.md`
-- **Celestial Design Tokens:** `~/.cache/iron-browser-ux-lab/DESIGN.md`
-- **Embedded Agent CLI Architecture (`Docked Left` + `Minimizable` + `Floatable/Draggable`):** `~/.cache/iron-browser-ux-lab/AGENT_TERMINAL_PLAN.md`
-- **Interactive 3-Proposal UX Lab:** `~/.cache/iron-browser-ux-lab/lab/` (served via `~/.claude/coordinator/runq serve ~/.cache/iron-browser-ux-lab/lab --project iron-browser`)
+2. **Native Rust Node-API `TabEventBus` + `sessionStorage` Sync + Effect Dedup + 15th MCP Tool (`6d1bc86`):**
+   - Built zero-dependency Rust `cdylib` (`crates/iron-browser-bus/src/{lib.rs,napi.rs}` → `app/dist/native/iron_browser_bus.node`, `~877.7 ns/op` round-trip) with TypeScript wrapper (`app/src/main/tab-event-bus.ts`).
+   - **Causal `gestureSeq` (`1000ms` window):** Links mirrored clicks/keys/scrolls to downstream `http_dedup`, `ws_mux`, `storage`, `download`, `popup`, and `navigation` events.
+   - **Consume-once `claimEffect`:** Deduplicates mirrored `will-download` file saves (with path-traversal/dotfile/symlink-safe `reserveSafeDownloadPath`) and `window.open` popups across Portrait + Landscape.
+   - **Cross-viewport `sessionStorage` replication & reload hydration:** Pre-script `Proxy` shim syncs `sessionStorage` live across Shared Dual panes (`512 KB`/origin cap, strict `http`/`https` origin isolation, isolated from `iron-iso-<tabId>` tabs).
+   - **15th MCP tool `browser_events`:** Added to `ControlSocketServer` (`app/src/main/ctl-socket.ts`) and `crates/iron-browser-mcp` (`filter` by `tab_id`, `domain`, `viewport`, `since_seq`, `gesture_seq`, `limit`).
+   - **Runtime evaluation (`Bun.WebView`):** Evaluated Bun's `Bun.WebView` (`WKWebView` / CDP subprocess) — lacks multi-subview `WebContentsView` embedding inside one window, partitioned `session` per viewport, `Fetch.fulfillRequest` response-body replay with per-pane header/correlation remapping, and `will-download` interception; keeping Electron multi-`WebContentsView` + Rust N-API `TabEventBus` gives sub-microsecond bus performance without losing Chromium compositor & CDP primitives.
 
-### Next Step on Laptop
-1. Test the 3 proposals (`A · Studio Workbench`, `B · Canvas HUD + Float PiP`, `C · Forensic Time-Travel` — or request a Gen-2 hybrid like `60% A + 40% B/C`) in the live UX Lab.
-2. Run `/irondev` against `~/.cache/iron-browser-ux-lab/{UX.md,DESIGN.md,AGENT_TERMINAL_PLAN.md}` to implement `UI-M1` (Shell Redesign), `UI-M2` (`node-pty` + `@xterm/xterm` inside top-most `agentView: WebContentsView` supporting `Docked Left`, `Minimized`, and `Floatable/Draggable`), and `UI-M3` (Direct `Pick Element` / `@incident` / `@clipped` / live MCP tool-call bridge).
+3. **SPA In-Page `spa_sync` Without Reload, Subframe Guard & Live `stake.com` Verification (`f5f8f36`):**
+   - Guarded `did-navigate-in-page` against `isMainFrame === false` subframe `pushState`.
+   - Replaced cold `wc.loadURL` reload on main-frame `did-navigate-in-page` with a coalesced `260ms` in-page `spa_sync` supporting both delegated anchor routers (SvelteKit on `stake.com`, including `>180ms` async route loads) and `popstate` routers (React/Next/Vue), with `spaSyncInFlight` echo suppression and a 2-hop `spaSyncChain` canonicalizer bound (reset on user/`ctl` gestures and programmatic navigations).
+   - Aligned `getShellState().loading` and `shouldSuppress` with `wcLoadStates` (fixing Chromium's transient `wc.isLoading() === true` during `did-navigate-in-page`).
+   - Verified live on `https://stake.com` (`dedupCount: 11`: `8` GraphQL/feature-flag POST replays + `3` WS/SSE muxes, `sessionStorage` & `15/15` `localStorage` parity, synchronized live player counters, zero WebSocket teardown across SPA route transitions).
+
+---
+
+## 2. How `iron-term` & Embedded Agent Dock Connect to This Version
+
+- **MCP Sidecar (`~/.local/bin/iron-browser-mcp` / `iron-browser mcp`):** Exposes all **15** tools (`browser_events` is tool #15). Accepts `--socket <ctl.sock>` (defaults to `$IRON_BROWSER_SOCKET` or `$XDG_RUNTIME_DIR/iron-browser/ctl.sock`) and `--max-bytes <256..262144>`.
+- **Live Causal Bus Polling for `iron-term` & `AGENT_TERMINAL_PLAN.md`:**
+  - `iron-term` agents or IronBrowser's planned `AgentPtyService` (`~/.cache/iron-browser-ux-lab/AGENT_TERMINAL_PLAN.md`) can tail `browser_events(since_seq: lastSeq)` or inspect a specific interaction via `browser_events(gesture_seq: N)` to trace `gesture → spa_sync / http_dedup / ws_mux / storage / download / popup / console / network` in one deterministic call.
+  - All URL summaries on the bus automatically redact sensitive query and hash-route tokens (`token`, `jwt`, `code`, `secret`, `session`, etc.).

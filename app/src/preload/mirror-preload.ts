@@ -643,38 +643,103 @@ function resolveElementFromFingerprint(
   return { element: null, tier: 3 };
 }
 
-function countVisibleOverlays(): number {
-  const nodes = safeQuerySelectorAll(
-    'dialog[open], [role="dialog"], [role="alertdialog"], [aria-modal="true"]',
-  );
-  let count = 0;
-  for (const n of nodes) {
-    if (isVisibleElement(n.element)) count += 1;
+const DIALOG_OVERLAY_SELECTOR =
+  'dialog[open], [role="dialog"], [role="alertdialog"], [aria-modal="true"]';
+
+function isActiveOverlayElement(el: Element): boolean {
+  if (!isVisibleElement(el)) return false;
+  if (
+    el.hasAttribute('data-closed') ||
+    el.getAttribute('data-state') === 'closed' ||
+    el.getAttribute('aria-hidden') === 'true'
+  ) {
+    return false;
   }
-  return count;
+  if (closestAcrossShadow(el, '[data-closed], [data-state="closed"], [aria-hidden="true"]')) {
+    return false;
+  }
+  return true;
+}
+
+function getActiveOverlayElements(): Element[] {
+  const nodes = safeQuerySelectorAll(DIALOG_OVERLAY_SELECTOR);
+  const active: Element[] = [];
+  for (const n of nodes) {
+    if (isActiveOverlayElement(n.element)) active.push(n.element);
+  }
+  return active;
+}
+
+function countVisibleOverlays(): number {
+  return getActiveOverlayElements().length;
+}
+
+/**
+ * Returns true if the user clicked an interactive element or card content INSIDE a dialog
+ * (as opposed to clicking a backdrop, native `<dialog>` `::backdrop` outside its rect,
+ * or a full-screen `[role="dialog"]` wrapper directly).
+ */
+function isClickInsideDialogCard(
+  el: Element,
+  rawTarget: EventTarget | null,
+  clientX: number,
+  clientY: number,
+): boolean {
+  const dialogEl = closestAcrossShadow(el, DIALOG_OVERLAY_SELECTOR);
+  if (!dialogEl) return false;
+  const win = getWindowOf(dialogEl);
+  const rect = dialogEl.getBoundingClientRect();
+  if (rawTarget === dialogEl) {
+    if (getTagName(dialogEl) === 'dialog') {
+      const insideRect =
+        clientX >= rect.left &&
+        clientX <= rect.right &&
+        clientY >= rect.top &&
+        clientY <= rect.bottom;
+      return insideRect;
+    }
+    const vw = Math.max(win.innerWidth, 1);
+    const vh = Math.max(win.innerHeight, 1);
+    if (rect.width >= vw * 0.6 && rect.height >= vh * 0.6 && dialogEl.children.length > 0) {
+      return false;
+    }
+  }
+  return true;
 }
 
 function findPointOutsideDialogs(): { x: number; y: number } | null {
-  const dialogs = safeQuerySelectorAll(
-    'dialog[open], [role="dialog"], [role="alertdialog"], [aria-modal="true"]',
-  )
-    .filter((d) => isVisibleElement(d.element))
-    .map((d) => d.element);
+  const dialogs = getActiveOverlayElements();
+  if (dialogs.length === 0) return null;
   const vw = Math.max(window.innerWidth, 1);
   const vh = Math.max(window.innerHeight, 1);
   const probes: Array<[number, number]> = [
-    [6, 6],
-    [vw - 6, 6],
-    [6, vh - 6],
-    [vw - 6, vh - 6],
-    [Math.round(vw / 2), 6],
-    [6, Math.round(vh / 2)],
+    [4, 4],
+    [vw - 4, 4],
+    [4, vh - 4],
+    [vw - 4, vh - 4],
+    [Math.round(vw / 2), 4],
+    [4, Math.round(vh / 2)],
+    [vw - 4, Math.round(vh / 2)],
+    [Math.round(vw / 2), vh - 4],
   ];
   for (const [px, py] of probes) {
     if (px < 0 || py < 0 || px >= vw || py >= vh) continue;
-    const hit = document.elementFromPoint(px, py);
+    const deep = inspectElementDeep(px, py);
+    const hit = deep?.element ?? document.elementFromPoint(px, py);
     if (!hit) continue;
-    const insideDialog = dialogs.some((d) => d === hit || d.contains(hit));
+    const insideDialog = dialogs.some((d) => {
+      if (d === hit) {
+        const r = d.getBoundingClientRect();
+        if (getTagName(d) === 'dialog') {
+          return px >= r.left && px <= r.right && py >= r.top && py <= r.bottom;
+        }
+        if (r.width >= vw * 0.6 && r.height >= vh * 0.6 && d.children.length > 0) {
+          return false;
+        }
+        return true;
+      }
+      return d.contains(hit);
+    });
     if (!insideDialog) {
       return { x: px, y: py };
     }
@@ -766,6 +831,7 @@ function setupCaptureListeners(): void {
     button: 'left' | 'middle' | 'right';
     modifiers: string[];
     overlaysBefore: number;
+    clickedInsideDialog: boolean;
     pointerType?: string;
     timer: ReturnType<typeof setTimeout>;
   } | null = null;
@@ -788,6 +854,42 @@ function setupCaptureListeners(): void {
   } | null = null;
 
   let suppressNextDragClick: { el: Element; expiresAt: number } | null = null;
+  let suppressDismissedClickUntil = 0;
+
+  const pendingClickMeta = new WeakMap<
+    Event,
+    {
+      el: Element;
+      fp: ElementFingerprint;
+      preToggleState: ReturnType<typeof extractElementToggleState>;
+      overlaysBeforeClick: number;
+      clickedInsideDialog: boolean;
+      dismissedDuringPointerDown: boolean;
+      button: 'left' | 'middle' | 'right';
+      rawDetail: number;
+      modifiers: string[];
+      meta: ReturnType<typeof buildCaptureMeta>;
+    }
+  >();
+  const handledClickEvents = new WeakSet<Event>();
+
+  const pendingPreventDefaultKey = new WeakMap<
+    Event,
+    {
+      el: Element;
+      fp: ElementFingerprint | null;
+      meta: ReturnType<typeof buildCaptureMeta> | null;
+      preIdent: Pick<
+        ElementFingerprint,
+        'testId' | 'id' | 'ariaLabel' | 'title' | 'name' | 'role'
+      >;
+      inEditable: boolean;
+      key: string;
+      code: string;
+      modifiers: string[];
+    }
+  >();
+  const handledKeyEvents = new WeakSet<Event>();
 
   let recentActivationKey: {
     el: Element;
@@ -887,22 +989,26 @@ function setupCaptureListeners(): void {
           return;
         }
         clearPendingPointerDown();
+        suppressDismissedClickUntil = 0;
         const fp = buildFingerprint(el, ev.clientX, ev.clientY, rawTarget);
         const overlaysBefore = countVisibleOverlays();
         const button = mouseButtonName(ev.button);
         const modifiers = getModifiers(ev);
         const pointerType = ev.pointerType || undefined;
 
+        const clickedInsideDialog = isClickInsideDialogCard(el, rawTarget, ev.clientX, ev.clientY);
         const timer = setTimeout(() => {
           if (!pendingPointerDown || pendingPointerDown.el !== el) return;
           const entry = pendingPointerDown;
           pendingPointerDown = null;
+          if (entry.clickedInsideDialog || entry.overlaysBefore === 0) return;
           const overlaysAfter = countVisibleOverlays();
           const dismissed =
             !entry.el.isConnected ||
             !isVisibleElement(entry.el) ||
             overlaysAfter < entry.overlaysBefore;
           if (dismissed) {
+            suppressDismissedClickUntil = performance.now() + 500;
             sendCapture({
               kind: 'click',
               fingerprint: { ...entry.fingerprint, dismissedOverlay: true },
@@ -920,6 +1026,7 @@ function setupCaptureListeners(): void {
           button,
           modifiers,
           overlaysBefore,
+          clickedInsideDialog,
           pointerType,
           timer,
         };
@@ -993,11 +1100,58 @@ function setupCaptureListeners(): void {
       { capture: true, passive: true },
     );
 
+    const finalizeClickCapture = (ev: MouseEvent) => {
+      if (handledClickEvents.has(ev)) return;
+      const entry = pendingClickMeta.get(ev);
+      if (!entry) return;
+      handledClickEvents.add(ev);
+      pendingClickMeta.delete(ev);
+
+      if (
+        !entry.clickedInsideDialog &&
+        !entry.fp.dismissedOverlay &&
+        entry.overlaysBeforeClick > 0 &&
+        countVisibleOverlays() < entry.overlaysBeforeClick
+      ) {
+        entry.fp.dismissedOverlay = true;
+      }
+      const postToggleState = entry.el.isConnected
+        ? extractElementToggleState(entry.el)
+        : entry.preToggleState;
+      sendCapture({
+        kind: 'click',
+        fingerprint: entry.fp,
+        button: entry.button,
+        clickCount: entry.rawDetail,
+        modifiers: entry.modifiers,
+        ...entry.meta,
+        ...(postToggleState ? { toggleState: postToggleState } : {}),
+      });
+    };
+
     win.addEventListener(
       'click',
       (ev) => {
         if (!ev.isTrusted) return;
+        const pendingPd = pendingPointerDown;
         clearPendingPointerDown();
+        if (suppressDismissedClickUntil > 0) {
+          const until = suppressDismissedClickUntil;
+          suppressDismissedClickUntil = 0;
+          if (performance.now() <= until) {
+            return;
+          }
+        }
+        const overlaysBeforeClick = countVisibleOverlays();
+        const dismissedDuringPointerDown = Boolean(
+          pendingPd &&
+            !pendingPd.clickedInsideDialog &&
+            pendingPd.overlaysBefore > 0 &&
+            (!pendingPd.el.isConnected ||
+              !isVisibleElement(pendingPd.el) ||
+              overlaysBeforeClick < pendingPd.overlaysBefore),
+        );
+
         const rawTarget = getEventRawTarget(ev);
         const el = interactiveElement(rawTarget);
         if (!el) return;
@@ -1032,17 +1186,13 @@ function setupCaptureListeners(): void {
           }
         }
 
-        const rect = el.getBoundingClientRect();
+        const clickedInsideDialog = isClickInsideDialogCard(el, rawTarget, ev.clientX, ev.clientY);
         const preToggleState = extractElementToggleState(el);
         const fp = buildFingerprint(el, ev.clientX, ev.clientY, rawTarget);
         if (preToggleState) {
           fp.toggleState = preToggleState;
         }
-        if (
-          fp.clickedSelfDirect &&
-          rect.width >= window.innerWidth * 0.6 &&
-          rect.height >= window.innerHeight * 0.6
-        ) {
+        if (!clickedInsideDialog && dismissedDuringPointerDown) {
           fp.dismissedOverlay = true;
         }
         const button = mouseButtonName(ev.button);
@@ -1050,20 +1200,31 @@ function setupCaptureListeners(): void {
         const pointerType = (ev as MouseEvent & { pointerType?: string }).pointerType || undefined;
         const meta = buildCaptureMeta(el, ev.clientX, ev.clientY, pointerType);
 
-        queueMicrotask(() => {
-          const postToggleState = el.isConnected ? extractElementToggleState(el) : preToggleState;
-          sendCapture({
-            kind: 'click',
-            fingerprint: fp,
-            button,
-            clickCount: rawDetail,
-            modifiers,
-            ...meta,
-            ...(postToggleState ? { toggleState: postToggleState } : {}),
-          });
+        pendingClickMeta.set(ev, {
+          el,
+          fp,
+          preToggleState,
+          overlaysBeforeClick,
+          clickedInsideDialog,
+          dismissedDuringPointerDown,
+          button,
+          rawDetail,
+          modifiers,
+          meta,
         });
+        // Macrotask fallback in case a target listener calls ev.stopPropagation().
+        setTimeout(() => finalizeClickCapture(ev), 0);
       },
       { capture: true, passive: true },
+    );
+
+    win.addEventListener(
+      'click',
+      (ev) => {
+        if (!ev.isTrusted) return;
+        finalizeClickCapture(ev);
+      },
+      { capture: false, passive: true },
     );
 
     win.addEventListener(
@@ -1120,10 +1281,30 @@ function setupCaptureListeners(): void {
       { capture: true, passive: true },
     );
 
+    const finalizePreventDefaultKey = (ev: KeyboardEvent) => {
+      if (handledKeyEvents.has(ev)) return;
+      const entry = pendingPreventDefaultKey.get(ev);
+      if (!entry) return;
+      handledKeyEvents.add(ev);
+      pendingPreventDefaultKey.delete(ev);
+      if (!ev.defaultPrevented && entry.inEditable) return;
+      const fp: ElementFingerprint =
+        entry.fp ?? { ...buildFingerprint(entry.el), ...entry.preIdent };
+      const meta = entry.meta ?? buildCaptureMeta(entry.el);
+      sendCapture({
+        kind: 'keydown',
+        fingerprint: fp,
+        key: entry.key,
+        code: entry.code,
+        modifiers: entry.modifiers,
+        ...meta,
+      });
+    };
+
     win.addEventListener(
       'keydown',
       (ev) => {
-        if (!ev.isTrusted) return;
+        if (!ev.isTrusted || ev.isComposing) return;
         const relayKeys = new Set([
           'Enter',
           'Escape',
@@ -1135,17 +1316,62 @@ function setupCaptureListeners(): void {
           'Space',
           ' ',
         ]);
+        const bareModifiers = new Set([
+          'Shift',
+          'Control',
+          'Alt',
+          'Meta',
+          'CapsLock',
+          'NumLock',
+          'ScrollLock',
+          'Dead',
+          'Process',
+          'Unidentified',
+        ]);
         const rawTarget = getEventRawTarget(ev);
-        const inEditable = isEditableElement(rawTarget);
-        if (inEditable && (ev.key === ' ' || ev.key === 'Space')) {
-          return;
-        }
-        if (!relayKeys.has(ev.key) && !ev.ctrlKey && !ev.metaKey && !ev.altKey) {
-          return;
-        }
         const activeDoc = win.document ?? doc;
-        const el = interactiveElement(rawTarget ?? activeDoc.activeElement ?? document.activeElement);
+        const targetNode = rawTarget ?? activeDoc.activeElement ?? document.activeElement;
+        const isTextEditable = isEditableElement(targetNode);
+        if (isTextEditable && (ev.key === ' ' || ev.key === 'Space')) {
+          return;
+        }
+        const inEditable = isTextEditable || isSelectElement(targetNode);
+        const el = interactiveElement(targetNode);
         if (!el) return;
+
+        const isAlwaysRelayed = relayKeys.has(ev.key) || ev.ctrlKey || ev.metaKey || ev.altKey;
+        if (!isAlwaysRelayed) {
+          if (bareModifiers.has(ev.key)) return;
+          // On trusted browser events, Blink drains microtasks right after the capture listener
+          // (BEFORE target/bubble listeners like SolidJS Numpad's onKeyDown run). Inspect
+          // ev.defaultPrevented in the bubble phase (+ macrotask fallback if stopPropagation()
+          // was called). Pre-build full fingerprints only for non-editable or PIN/readOnly inputs
+          // so ordinary text typing avoids DOM walks while pre-mutation identity is preserved.
+          const shouldPrebuildFp =
+            !inEditable ||
+            el.getAttribute('inputmode') === 'none' ||
+            (isInputElement(el) && el.readOnly);
+          pendingPreventDefaultKey.set(ev, {
+            el,
+            fp: shouldPrebuildFp ? buildFingerprint(el) : null,
+            meta: shouldPrebuildFp ? buildCaptureMeta(el) : null,
+            preIdent: {
+              testId: el.getAttribute('data-testid') || undefined,
+              id: el.getAttribute('id') || undefined,
+              ariaLabel: el.getAttribute('aria-label') || undefined,
+              title: el.getAttribute('title') || undefined,
+              name: el.getAttribute('name') || undefined,
+              role: implicitRole(el) || undefined,
+            },
+            inEditable,
+            key: ev.key,
+            code: ev.code,
+            modifiers: getModifiers(ev),
+          });
+          setTimeout(() => finalizePreventDefaultKey(ev), 0);
+          return;
+        }
+
         if (ev.key === 'Enter' || ev.key === ' ' || ev.key === 'Space') {
           recentActivationKey = {
             el,
@@ -1164,6 +1390,15 @@ function setupCaptureListeners(): void {
         });
       },
       { capture: true, passive: true },
+    );
+
+    win.addEventListener(
+      'keydown',
+      (ev) => {
+        if (!ev.isTrusted) return;
+        finalizePreventDefaultKey(ev);
+      },
+      { capture: false, passive: true },
     );
 
     win.addEventListener(
@@ -1435,6 +1670,28 @@ function setupDomQueryBridge(): void {
                 };
               })();
 
+          // If the source click dismissed a modal/dialog (e.g. Kobalte/Radix onPointerDownOutside
+          // unmounting the backdrop so click landed on <body> or an animated portal), click an
+          // uncovered point outside the paired viewport's active dialog. If the paired viewport
+          // has no active dialog (already closed), return found:false instead of falling through
+          // to click document.body / arbitrary page center UI.
+          if (fp?.dismissedOverlay) {
+            const outside = findPointOutsideDialogs();
+            if (outside) {
+              reply({
+                found: true,
+                tier: 2,
+                x: outside.x,
+                y: outside.y,
+                isCanvas: false,
+                tag: 'overlay-outside',
+              });
+              return;
+            }
+            reply({ found: false, tier: 2, x: 0, y: 0, isCanvas: false });
+            return;
+          }
+
           if (resolved.element) {
             if (scrollIntoView && !fp?.dismissedOverlay) {
               resolved.element.scrollIntoView({ block: 'nearest', inline: 'nearest' });
@@ -1508,21 +1765,6 @@ function setupDomQueryBridge(): void {
               },
             });
             return;
-          }
-
-          if (fp?.dismissedOverlay) {
-            const outside = findPointOutsideDialogs();
-            if (outside) {
-              reply({
-                found: true,
-                tier: 2,
-                x: outside.x,
-                y: outside.y,
-                isCanvas: false,
-                tag: 'overlay-outside',
-              });
-              return;
-            }
           }
 
           if (fp && fp.isCanvas) {

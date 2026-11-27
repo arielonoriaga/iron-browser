@@ -106,8 +106,26 @@ function candidateNativeAddonPaths(): string[] {
   const envPath = process.env.IRON_BROWSER_BUS_ADDON?.trim();
   if (envPath) candidates.push(envPath);
 
-  // Resolve relative to both `app/dist/main` (bundled Electron) and `app/src/main` (Bun unit tests).
-  const bases = [__dirname, process.cwd(), path.resolve(process.cwd(), '..')];
+  // Resolve relative to `__dirname` (`app/dist/main` or `app/src/main`), Electron's `app.getAppPath()`,
+  // and `process.cwd()` so launching IronBrowser from external repos always finds `iron_browser_bus.node`.
+  const bases = [
+    __dirname,
+    path.resolve(__dirname, '..'),
+    path.resolve(__dirname, '../..'),
+    process.cwd(),
+    path.resolve(process.cwd(), '..'),
+  ];
+  try {
+    const reqSelf = createRequire(path.join(__dirname, 'index.js'));
+    const electronMod = reqSelf('electron') as { app?: { getAppPath?: () => string } } | undefined;
+    const appPath = electronMod?.app?.getAppPath?.();
+    if (typeof appPath === 'string' && appPath.length > 0) {
+      bases.unshift(appPath, path.resolve(appPath, '..'));
+    }
+  } catch {
+    // Ignore when running outside Electron main process.
+  }
+
   const cargoTargetDir = process.env.CARGO_TARGET_DIR?.trim();
   if (cargoTargetDir) {
     candidates.push(path.join(cargoTargetDir, 'release', 'iron_browser_bus.node'));
@@ -129,7 +147,12 @@ function loadNativeBusBinding(): NativeBusBinding | null {
   if (cachedNativeBinding !== undefined) {
     return cachedNativeBinding;
   }
-  const req = createRequire(path.join(process.cwd(), 'package.json'));
+  let req: NodeRequire;
+  try {
+    req = createRequire(__filename);
+  } catch {
+    req = createRequire(path.join(__dirname, 'index.js'));
+  }
   for (const candidate of candidateNativeAddonPaths()) {
     try {
       if (!fs.existsSync(candidate)) continue;
@@ -243,6 +266,7 @@ export class TabEventBus {
     Map<string, { seq: number; sourceRole: string; tsMs: number; windowMs: number; gestureSeq: number | null }>
   >();
   private readonly fbSessionStorage = new Map<string, Map<string, Map<string, string>>>();
+  private readonly lastSessionStorageWriteByTab = new Map<string, number>();
 
   constructor(opts: { maxEventsPerTab?: number; now?: () => number } = {}) {
     this.maxEventsPerTab = Math.min(Math.max(opts.maxEventsPerTab ?? 2048, 64), 16_384);
@@ -425,6 +449,10 @@ export class TabEventBus {
     return { allowed: true, seq, ownerSeq: seq, gestureSeq: currentGesture };
   }
 
+  getLastSessionStorageWriteMs(tabId: string): number {
+    return this.lastSessionStorageWriteByTab.get(tabId) ?? 0;
+  }
+
   sessionStorageSet(
     tabId: string,
     origin: string,
@@ -435,12 +463,16 @@ export class TabEventBus {
   ): SessionStorageMutationResult {
     if (this.disposed || !tabId) return { ok: false, changed: false, error: 'disposed' };
     if (this.native && this.handle !== null) {
-      return JSON.parse(
+      const res = JSON.parse(
         this.native.busSessionStorageOp(
           this.handle,
           JSON.stringify({ op: 'set', tabId, origin, viewport, key, value, tsMs }),
         ),
       ) as SessionStorageMutationResult;
+      if (res.ok && res.changed) {
+        this.lastSessionStorageWriteByTab.set(tabId, tsMs);
+      }
+      return res;
     }
     if (!isValidHttpOrigin(origin)) {
       return { ok: false, changed: false, error: 'invalid http/https origin' };
@@ -461,6 +493,7 @@ export class TabEventBus {
     const changed = bucket.get(key) !== value;
     if (changed) {
       bucket.set(key, value);
+      this.lastSessionStorageWriteByTab.set(tabId, tsMs);
       const seq = this.fbSeq++;
       this.fbPush({
         seq,
@@ -484,12 +517,16 @@ export class TabEventBus {
   ): SessionStorageMutationResult {
     if (this.disposed || !tabId) return { ok: false, changed: false, error: 'disposed' };
     if (this.native && this.handle !== null) {
-      return JSON.parse(
+      const res = JSON.parse(
         this.native.busSessionStorageOp(
           this.handle,
           JSON.stringify({ op: 'remove', tabId, origin, viewport, key, tsMs }),
         ),
       ) as SessionStorageMutationResult;
+      if (res.ok && res.changed) {
+        this.lastSessionStorageWriteByTab.set(tabId, tsMs);
+      }
+      return res;
     }
     if (!isValidHttpOrigin(origin)) {
       return { ok: false, changed: false, error: 'invalid http/https origin' };
@@ -497,6 +534,7 @@ export class TabEventBus {
     const bucket = this.fbSessionStorage.get(tabId)?.get(origin);
     const removed = bucket ? bucket.delete(key) : false;
     if (removed) {
+      this.lastSessionStorageWriteByTab.set(tabId, tsMs);
       const seq = this.fbSeq++;
       this.fbPush({
         seq,
@@ -519,12 +557,16 @@ export class TabEventBus {
   ): SessionStorageMutationResult {
     if (this.disposed || !tabId) return { ok: false, changed: false, error: 'disposed' };
     if (this.native && this.handle !== null) {
-      return JSON.parse(
+      const res = JSON.parse(
         this.native.busSessionStorageOp(
           this.handle,
           JSON.stringify({ op: 'clear', tabId, origin, viewport, tsMs }),
         ),
       ) as SessionStorageMutationResult;
+      if (res.ok && res.changed) {
+        this.lastSessionStorageWriteByTab.set(tabId, tsMs);
+      }
+      return res;
     }
     if (!isValidHttpOrigin(origin)) {
       return { ok: false, changed: false, error: 'invalid http/https origin' };
@@ -533,6 +575,7 @@ export class TabEventBus {
     const cleared = Boolean(bucket && bucket.size > 0);
     bucket?.clear();
     if (cleared) {
+      this.lastSessionStorageWriteByTab.set(tabId, tsMs);
       const seq = this.fbSeq++;
       this.fbPush({
         seq,
@@ -565,6 +608,7 @@ export class TabEventBus {
 
   sessionStorageClearTab(tabId: string): boolean {
     if (this.disposed || !tabId) return false;
+    this.lastSessionStorageWriteByTab.delete(tabId);
     if (this.native && this.handle !== null) {
       const res = JSON.parse(
         this.native.busSessionStorageOp(
@@ -629,6 +673,7 @@ export class TabEventBus {
 
   clearTab(tabId: string): void {
     if (this.disposed || !tabId) return;
+    this.lastSessionStorageWriteByTab.delete(tabId);
     if (this.native && this.handle !== null) {
       this.native.busClearTab(this.handle, tabId);
       return;
@@ -643,6 +688,7 @@ export class TabEventBus {
     if (this.disposed) return;
     this.disposed = true;
     this.listeners.clear();
+    this.lastSessionStorageWriteByTab.clear();
     if (this.native && this.handle !== null) {
       this.native.busDestroy(this.handle);
       this.handle = null;

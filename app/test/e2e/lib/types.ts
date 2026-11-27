@@ -92,6 +92,7 @@ export interface TabSnapshotDto {
   devtoolsTarget: ViewportRole;
   audioSource: AudioSource;
   dedupCount?: number;
+  emulation?: Record<string, unknown>;
 }
 
 export interface ViewportMetricsDto {
@@ -127,6 +128,7 @@ export interface TelemetrySnapshotDto {
   failedNetworkCount: number;
   paused: boolean;
   mirrorMiss?: MirrorMissInfoDto | null;
+  emulation?: Record<string, unknown> | null;
 }
 
 export interface ConsoleEntryDto {
@@ -299,6 +301,8 @@ export interface ControlSocketClientApi {
     tabId?: string,
     maxBytes?: number,
   ): Promise<EvalResultDto>;
+  emulate<T = Record<string, unknown>>(params: Record<string, unknown>): Promise<T>;
+  profile<T = Record<string, unknown>>(params: Record<string, unknown>): Promise<T>;
   events(opts?: {
     tabId?: string;
     domain?: string;
@@ -329,6 +333,7 @@ export interface ControlSocketClientApi {
     tabId?: string,
     opts?: WaitForTabReadyOptions,
   ): Promise<TabSnapshotDto>;
+  health<T = Record<string, unknown>>(lines?: number): Promise<T>;
   close(): void;
 }
 

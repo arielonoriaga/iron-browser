@@ -603,6 +603,16 @@ svg {
   white-space: nowrap;
 }
 
+.emu-pill {
+  border-color: var(--accent);
+  color: var(--accent);
+  background: var(--accent-soft);
+  max-width: 240px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
 .dock-toggle-btn {
   height: 20px;
   padding: 0 8px;

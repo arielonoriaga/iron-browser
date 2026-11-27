@@ -3,7 +3,10 @@ use std::io::{self, BufRead, Read, Write};
 use anyhow::Result;
 use serde_json::{Value, json};
 
-use crate::{frame::truncate_utf8, socket::SocketClient};
+use crate::{
+    frame::truncate_utf8,
+    socket::{DEFAULT_SOCKET_IO_TIMEOUT, LONG_SOCKET_IO_TIMEOUT, SocketClient},
+};
 
 const MAX_REQUEST: usize = 512 * 1024;
 const VERSIONS: [&str; 3] = ["2025-06-18", "2025-03-26", "2024-11-05"];
@@ -106,15 +109,93 @@ pub fn definitions(hard_max_bytes: usize) -> Value {
             "height": {"type": "number", "minimum": 1, "maximum": 3840}
         }
     });
+    let emulate_network_custom = json!({
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+            "offline": {"type": "boolean"},
+            "latency": {"type": "number", "minimum": 0, "maximum": 60000},
+            "latency_ms": {"type": "number", "minimum": 0, "maximum": 60000},
+            "down": {"type": "number", "minimum": -1},
+            "down_kbps": {"type": "number", "minimum": -1},
+            "download_kbps": {"type": "number", "minimum": -1},
+            "download_bytes_per_sec": {"type": "number", "minimum": -1},
+            "up": {"type": "number", "minimum": -1},
+            "up_kbps": {"type": "number", "minimum": -1},
+            "upload_kbps": {"type": "number", "minimum": -1},
+            "upload_bytes_per_sec": {"type": "number", "minimum": -1}
+        }
+    });
+    let emulate_tool = json!({
+        "name": "browser_emulate",
+        "description": "Apply or reset per-viewport slow-device CDP emulation (profiles: sunmi-v2-pro, low-end-android, none; or custom cpu_rate 1..20, network preset/custom latency/down/up, device preset, user_agent, hardware_concurrency, device_memory, reduced_motion, save_data, and optional host-to-target CPU rate calibration) surviving tab reloads and navigations.",
+        "annotations": {"readOnlyHint": false, "destructiveHint": false, "idempotentHint": true, "openWorldHint": false},
+        "inputSchema": {
+            "type": "object",
+            "additionalProperties": false,
+            "properties": {
+                "tab": tab_id,
+                "tab_id": tab_id,
+                "viewport": viewport_or_both,
+                "profile": {"type": "string", "enum": ["none", "sunmi-v2-pro", "low-end-android"]},
+                "cpu_rate": {"type": "number", "minimum": 1, "maximum": 20},
+                "network": {
+                    "oneOf": [
+                        {"type": "string", "enum": ["none", "fast-4g", "slow-4g", "3g", "offline"]},
+                        emulate_network_custom
+                    ]
+                },
+                "preset": {"type": "string", "maxLength": 64},
+                "user_agent": {"type": ["string", "null"], "maxLength": 512},
+                "hardware_concurrency": {"type": ["integer", "null"], "minimum": 0, "maximum": 128},
+                "device_memory": {"type": ["number", "null"], "minimum": 0, "maximum": 64},
+                "reduced_motion": {"type": "boolean"},
+                "save_data": {"type": "boolean"},
+                "target_score": {"type": "number", "minimum": 1},
+                "calibrate": {"type": "boolean", "default": false},
+                "reset": {"type": "boolean", "default": false}
+            }
+        }
+    });
+    let profile_tool = json!({
+        "name": "browser_profile",
+        "description": "Start or stop an off-thread V8 CDP CPU profile (Profiler.start / Profiler.stop) on portrait or landscape (compatible with active slow-device CPU throttling and page navigations), writing a size-capped 0600 .cpuprofile file to disk and returning a bottom-up hotspot summary (selfMs + totalMs per function + script URL:line, plus selfMs per script URL).",
+        "annotations": {"readOnlyHint": false, "destructiveHint": false, "idempotentHint": false, "openWorldHint": false},
+        "inputSchema": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["action"],
+            "properties": {
+                "tab": tab_id,
+                "tab_id": tab_id,
+                "viewport": viewport,
+                "action": {"type": "string", "enum": ["start", "stop"]},
+                "top": {"type": "integer", "minimum": 1, "maximum": 200, "default": 25},
+                "interval_us": {"type": "integer", "minimum": 200, "maximum": 10000, "default": 1000}
+            }
+        }
+    });
+    let health_tool = json!({
+        "name": "browser_health",
+        "description": "Inspect IronBrowser process health and post-mortem diagnostics (works even if the browser crashed or ctl.sock is offline): socket reachability, main-thread watchdog stall count, pending RPCs, active CPU profiles, per-viewport renderer state (crashed/unresponsive/exitCode), latest Crashpad minidump path, and the last N structured lines of main.log.",
+        "annotations": {"readOnlyHint": true, "destructiveHint": false, "idempotentHint": true, "openWorldHint": false},
+        "inputSchema": {
+            "type": "object",
+            "additionalProperties": false,
+            "properties": {
+                "lines": {"type": "integer", "minimum": 1, "maximum": 500, "default": 50}
+            }
+        }
+    });
 
-    json!({"tools": [
-        {
+    let tools = vec![
+        json!({
             "name": "browser_tabs",
             "description": "List open IronBrowser tabs, URLs, view modes (single/dual), mirror state, session partition mode, active tab ID, and effective viewport sizing report (requestedSize, effectiveCssSize, dpr, capturedPixels, sizeMismatch).",
             "annotations": {"readOnlyHint": true, "destructiveHint": false, "idempotentHint": true, "openWorldHint": false},
             "inputSchema": {"type": "object", "additionalProperties": false, "properties": {}}
-        },
-        {
+        }),
+        json!({
             "name": "browser_open",
             "description": "Open a new IronBrowser tab in single or dual (Portrait + Landscape) mode with optional shared/isolated session partition and viewport dimensions, immediately reporting effective viewport sizing and sizeMismatch.",
             "annotations": {"readOnlyHint": false, "destructiveHint": false, "idempotentHint": false, "openWorldHint": true},
@@ -132,8 +213,8 @@ pub fn definitions(hard_max_bytes: usize) -> Value {
                     "landscape_size": dims
                 }
             }
-        },
-        {
+        }),
+        json!({
             "name": "browser_navigate",
             "description": "Navigate an IronBrowser tab to a URL, syncing both Portrait and Landscape viewports in dual mode.",
             "annotations": {"readOnlyHint": false, "destructiveHint": false, "idempotentHint": true, "openWorldHint": true},
@@ -146,8 +227,8 @@ pub fn definitions(hard_max_bytes: usize) -> Value {
                     "url": {"type": "string", "minLength": 1, "maxLength": 4096}
                 }
             }
-        },
-        {
+        }),
+        json!({
             "name": "browser_screenshot",
             "description": "Capture PNG screenshot(s) of portrait, landscape, or both viewports with independent per-pane timeout recovery, effective viewport sizing report, layoutAudit (including clippedItems selectors/bounds/overflowPx), optional exact_size override, and optional highlight_clipped visual overlay.",
             "annotations": {"readOnlyHint": true, "destructiveHint": false, "idempotentHint": true, "openWorldHint": false},
@@ -163,14 +244,14 @@ pub fn definitions(hard_max_bytes: usize) -> Value {
                     "timeout_ms": {"type": "integer", "minimum": 150, "maximum": 8000}
                 }
             }
-        },
-        {
+        }),
+        json!({
             "name": "browser_metrics",
-            "description": "Return live structured telemetry: gpuProcessCpuPercent (host GPU-process CPU%, labeled separately from gpuExecutionTimeMs), Portrait/Landscape OS CPU% & RAM MB, rAF FPS & p95 frame ms, CDP JS heap & DOM nodes, console error count, and failed network count.",
+            "description": "Return live structured telemetry: gpuProcessCpuPercent (host GPU-process CPU%, labeled separately from gpuExecutionTimeMs), Portrait/Landscape OS CPU% & RAM MB, rAF FPS & p95 frame ms, CDP JS heap & DOM nodes, console error count, failed network count, and active slow-device emulation state.",
             "annotations": {"readOnlyHint": true, "destructiveHint": false, "idempotentHint": true, "openWorldHint": false},
             "inputSchema": {"type": "object", "additionalProperties": false, "properties": {}}
-        },
-        {
+        }),
+        json!({
             "name": "browser_interact",
             "description": "Dispatch a trusted Chromium interaction (click, type, scroll, key, hover) via CSS selector or normalized coordinates, optionally mirrored across both viewports.",
             "annotations": {"readOnlyHint": false, "destructiveHint": false, "idempotentHint": false, "openWorldHint": true},
@@ -191,8 +272,8 @@ pub fn definitions(hard_max_bytes: usize) -> Value {
                     "mirror": {"type": "boolean"}
                 }
             }
-        },
-        {
+        }),
+        json!({
             "name": "browser_console",
             "description": "Read recent bounded console logs/warnings/errors from portrait, landscape, or both viewports, with optional diagnostic incident grouping.",
             "annotations": {"readOnlyHint": true, "destructiveHint": false, "idempotentHint": true, "openWorldHint": false},
@@ -207,8 +288,8 @@ pub fn definitions(hard_max_bytes: usize) -> Value {
                     "include_incidents": {"type": "boolean", "default": false}
                 }
             }
-        },
-        {
+        }),
+        json!({
             "name": "browser_network",
             "description": "Inspect recent HTTP/WebSocket requests filtered by status (all, failed, 4xx, 5xx) with timing, encoded byte size, and optional diagnostic incident grouping.",
             "annotations": {"readOnlyHint": true, "destructiveHint": false, "idempotentHint": true, "openWorldHint": false},
@@ -223,8 +304,8 @@ pub fn definitions(hard_max_bytes: usize) -> Value {
                     "include_incidents": {"type": "boolean", "default": false}
                 }
             }
-        },
-        {
+        }),
+        json!({
             "name": "browser_eval",
             "description": "Evaluate a JS expression in portrait or landscape viewport with a hard UTF-8 serialized byte ceiling (max_bytes).",
             "annotations": {"readOnlyHint": false, "destructiveHint": false, "idempotentHint": false, "openWorldHint": true},
@@ -239,8 +320,8 @@ pub fn definitions(hard_max_bytes: usize) -> Value {
                     "max_bytes": max_bytes
                 }
             }
-        },
-        {
+        }),
+        json!({
             "name": "browser_incidents",
             "description": "Group matching cross-pane HTTP failures (method + sanitizedPath + status) and linked console errors across Portrait and Landscape while keeping single-pane JS exceptions distinct (observational, separate from R2 HTTP dedup).",
             "annotations": {"readOnlyHint": true, "destructiveHint": false, "idempotentHint": true, "openWorldHint": false},
@@ -254,8 +335,8 @@ pub fn definitions(hard_max_bytes: usize) -> Value {
                     "limit": limit
                 }
             }
-        },
-        {
+        }),
+        json!({
             "name": "browser_repro",
             "description": "Manage saved reproduction recipes (save, load, list, delete, open) and step both Portrait and Landscape panes in lockstep to an exact frame, seed, phase, and multiplier via the dev scene-driver hook.",
             "annotations": {"readOnlyHint": false, "destructiveHint": false, "idempotentHint": false, "openWorldHint": true},
@@ -285,8 +366,8 @@ pub fn definitions(hard_max_bytes: usize) -> Value {
                     "clip_region": clip_rect
                 }
             }
-        },
-        {
+        }),
+        json!({
             "name": "browser_filmstrip",
             "description": "Step across a frame range or saved reproduction recipe across both Portrait and Landscape panes, optionally cropping a canvas/clip region, and export a labelled PNG filmstrip stamped with frame, seed, multiplier, and phase metadata.",
             "annotations": {"readOnlyHint": false, "destructiveHint": false, "idempotentHint": true, "openWorldHint": false},
@@ -311,10 +392,10 @@ pub fn definitions(hard_max_bytes: usize) -> Value {
                     "max_tile_width": {"type": "integer", "minimum": 120, "maximum": 1920}
                 }
             }
-        },
-        {
+        }),
+        json!({
             "name": "browser_trace_start",
-            "description": "Start a short bounded rolling frame-time and User Timing (performance.mark / performance.measure) trace across Portrait and Landscape viewports.",
+            "description": "Start a short bounded rolling frame-time and User Timing (performance.mark / performance.measure) trace across Portrait and Landscape viewports, including active slow-device emulation metadata.",
             "annotations": {"readOnlyHint": false, "destructiveHint": false, "idempotentHint": true, "openWorldHint": false},
             "inputSchema": {
                 "type": "object",
@@ -325,10 +406,10 @@ pub fn definitions(hard_max_bytes: usize) -> Value {
                     "max_frames": {"type": "integer", "minimum": 60, "maximum": 3600, "default": 1800}
                 }
             }
-        },
-        {
+        }),
+        json!({
             "name": "browser_trace_stop",
-            "description": "Stop an active performance trace and return side-by-side frame durations, before/during/after mark breakdowns, and gpuProcessCpuPercent labeled separately from gpuExecutionTimeMs.",
+            "description": "Stop an active performance trace and return side-by-side frame durations, before/during/after mark breakdowns, active slow-device emulation state, and gpuProcessCpuPercent labeled separately from gpuExecutionTimeMs.",
             "annotations": {"readOnlyHint": false, "destructiveHint": false, "idempotentHint": false, "openWorldHint": false},
             "inputSchema": {
                 "type": "object",
@@ -337,8 +418,8 @@ pub fn definitions(hard_max_bytes: usize) -> Value {
                     "tab_id": tab_id
                 }
             }
-        },
-        {
+        }),
+        json!({
             "name": "browser_events",
             "description": "Query the native Rust TabEventBus causal stream (gestures, HTTP/WS/SFS2X dedup, sessionStorage sync, popup & download dedup claims, navigation, console/network errors, mirror misses, and perf traces) filtered by tab, domain, viewport, since_seq, or causal gesture_seq.",
             "annotations": {"readOnlyHint": true, "destructiveHint": false, "idempotentHint": true, "openWorldHint": false},
@@ -358,11 +439,15 @@ pub fn definitions(hard_max_bytes: usize) -> Value {
                     "limit": limit
                 }
             }
-        }
-    ]})
+        }),
+        emulate_tool,
+        profile_tool,
+        health_tool,
+    ];
+    json!({"tools": tools})
 }
 
-const TOOL_NAMES: [&str; 15] = [
+const TOOL_NAMES: [&str; 18] = [
     "browser_tabs",
     "browser_open",
     "browser_navigate",
@@ -378,6 +463,9 @@ const TOOL_NAMES: [&str; 15] = [
     "browser_trace_start",
     "browser_trace_stop",
     "browser_events",
+    "browser_emulate",
+    "browser_profile",
+    "browser_health",
 ];
 
 pub struct Session {
@@ -523,7 +611,27 @@ impl Session {
             obj.insert("max_bytes".into(), json!(effective_cap));
         }
 
-        match client.call(name, arguments) {
+        if name == "browser_health" {
+            let lines = arguments
+                .get("lines")
+                .and_then(Value::as_u64)
+                .map(|v| v as usize)
+                .unwrap_or(50)
+                .clamp(1, 500);
+            let health = client.query_health(lines);
+            return Ok(self.format_tool_result(name, health, effective_cap));
+        }
+
+        let timeout = if name == "browser_profile"
+            || name == "browser_filmstrip"
+            || (name == "browser_emulate" && arguments.get("calibrate") == Some(&json!(true)))
+        {
+            LONG_SOCKET_IO_TIMEOUT
+        } else {
+            DEFAULT_SOCKET_IO_TIMEOUT
+        };
+
+        match client.call_with_timeout(name, arguments, timeout) {
             Ok(value) => Ok(self.format_tool_result(name, value, effective_cap)),
             Err(err) => {
                 let msg = format!("{err:#}");
@@ -675,7 +783,7 @@ mod tests {
     fn all_tools_declare_four_boolean_annotations() {
         let defs = definitions(DEFAULT_MAX_BYTES);
         let tools = defs["tools"].as_array().expect("tools array");
-        assert_eq!(tools.len(), 15);
+        assert_eq!(tools.len(), 18);
         assert_eq!(tools.len(), TOOL_NAMES.len());
         for tool in tools {
             let ann = tool["annotations"].as_object().expect("annotations object");

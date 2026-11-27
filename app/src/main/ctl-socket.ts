@@ -3,13 +3,38 @@ import net from 'node:net';
 import os from 'node:os';
 import path from 'node:path';
 import { encodeFrame, FrameDecoder } from '../shared/frame';
-import type { CtlRpcRequest, CtlRpcResponse, SessionMode, ViewMode, ViewportRole } from '../shared/types';
+import type {
+  CtlRpcRequest,
+  CtlRpcResponse,
+  NetworkConditionPreset,
+  SessionMode,
+  ViewMode,
+  ViewportRole,
+} from '../shared/types';
+import type { CustomNetworkInput } from './slow-device-emulation';
+import {
+  resolveCrashDumpsDir,
+  resolveStateLogDir,
+  scanLatestCrashDump,
+  tailLogLines,
+  type MainThreadWatchdog,
+  type PendingRpcSummary,
+  type StructuredLogger,
+} from './diagnostics';
 import {
   validateClipRegionInput,
   validateViewportSizeInput,
 } from '../shared/repro-recipe';
 import { normalizeUrl } from '../shared/url';
 import type { TabManager } from './tab-manager';
+
+export interface ControlSocketDiagnostics {
+  logger?: StructuredLogger | null;
+  watchdog?: MainThreadWatchdog | null;
+  logPath?: string;
+  crashDumpsDir?: string;
+  startedAtMs?: number;
+}
 
 /**
  * Exact path parity with `crates/iron-browser-mcp/src/socket.rs`:
@@ -74,10 +99,45 @@ async function isSocketAlive(socketPath: string): Promise<boolean> {
 export class ControlSocketServer {
   private server: net.Server | null = null;
   private boundBySelf = false;
+  private nextInternalRpcSeq = 1;
+  private readonly inFlightRpcs = new Map<
+    number,
+    {
+      id: number | string;
+      method: string;
+      startedAtMs: number;
+      tabId?: string;
+      viewport?: string;
+    }
+  >();
+  private readonly diagnostics: ControlSocketDiagnostics;
+  private readonly startedAtMs: number;
   public readonly socketPath: string;
 
-  constructor(private readonly tabManager: TabManager, socketPath?: string) {
+  constructor(
+    private readonly tabManager: TabManager,
+    socketPath?: string,
+    diagnostics: ControlSocketDiagnostics = {},
+  ) {
     this.socketPath = socketPath ?? resolveControlSocketPath();
+    this.diagnostics = diagnostics;
+    this.startedAtMs = diagnostics.startedAtMs ?? Date.now();
+  }
+
+  getPendingRpcs(): PendingRpcSummary[] {
+    const now = Date.now();
+    return Array.from(this.inFlightRpcs.values()).map((r) => ({
+      id: r.id,
+      method: r.method,
+      startedAtMs: r.startedAtMs,
+      ageMs: Math.max(0, now - r.startedAtMs),
+      ...(r.tabId ? { tabId: r.tabId } : {}),
+      ...(r.viewport ? { viewport: r.viewport } : {}),
+    }));
+  }
+
+  private syncWatchdogRpcs(): void {
+    this.diagnostics.watchdog?.setPendingRpcs(Array.from(this.inFlightRpcs.values()));
   }
 
   async start(): Promise<string> {
@@ -189,16 +249,64 @@ export class ControlSocketServer {
       }
     };
 
+    const rpcTrackKey = this.nextInternalRpcSeq++;
+    const startedAtMs = Date.now();
+    const tabHint =
+      typeof params.tab_id === 'string'
+        ? params.tab_id
+        : typeof params.tab === 'string'
+          ? params.tab
+          : undefined;
+    const viewportHint = typeof params.viewport === 'string' ? params.viewport : undefined;
+
+    this.inFlightRpcs.set(rpcTrackKey, {
+      id,
+      method,
+      startedAtMs,
+      tabId: tabHint,
+      viewport: viewportHint,
+    });
+    this.syncWatchdogRpcs();
+    this.diagnostics.logger?.info('rpc.begin', {
+      id,
+      method,
+      ...(tabHint ? { tabId: tabHint } : {}),
+      ...(viewportHint ? { viewport: viewportHint } : {}),
+      inFlight: this.inFlightRpcs.size,
+    });
+
     try {
       const result = await this.dispatch(method, params);
+      const durationMs = Math.max(0, Date.now() - startedAtMs);
+      this.inFlightRpcs.delete(rpcTrackKey);
+      this.syncWatchdogRpcs();
+      this.diagnostics.logger?.info('rpc.end', {
+        id,
+        method,
+        ok: true,
+        durationMs,
+        inFlight: this.inFlightRpcs.size,
+      });
       reply({ id, ok: true, result });
     } catch (err) {
+      const durationMs = Math.max(0, Date.now() - startedAtMs);
+      const errMsg = err instanceof Error ? err.message : String(err);
+      this.inFlightRpcs.delete(rpcTrackKey);
+      this.syncWatchdogRpcs();
+      this.diagnostics.logger?.error('rpc.end', {
+        id,
+        method,
+        ok: false,
+        durationMs,
+        error: errMsg,
+        inFlight: this.inFlightRpcs.size,
+      });
       reply({
         id,
         ok: false,
         error: {
           code: -32000,
-          message: err instanceof Error ? err.message : String(err),
+          message: errMsg,
         },
       });
     }
@@ -321,6 +429,8 @@ export class ControlSocketServer {
           y: typeof params.y === 'number' ? params.y : undefined,
           ratioY: typeof params.ratio_y === 'number' ? params.ratio_y : undefined,
           mirror: typeof params.mirror === 'boolean' ? params.mirror : undefined,
+          simulateHuman:
+            typeof params.simulate_human === 'boolean' ? params.simulate_human : undefined,
         });
       }
 
@@ -576,6 +686,147 @@ export class ControlSocketServer {
         return {
           tabId: tabId ?? null,
           ...res,
+        };
+      }
+
+      case 'browser_emulate': {
+        const rawTab =
+          typeof params.tab_id === 'string' && params.tab_id.trim().length > 0
+            ? params.tab_id.trim()
+            : typeof params.tab === 'string' && params.tab.trim().length > 0
+              ? params.tab.trim()
+              : undefined;
+        const viewport =
+          params.viewport === 'portrait' ||
+          params.viewport === 'landscape' ||
+          params.viewport === 'both'
+            ? params.viewport
+            : undefined;
+        let profile: 'none' | 'sunmi-v2-pro' | 'low-end-android' | undefined;
+        if (params.profile !== undefined) {
+          if (
+            params.profile !== 'none' &&
+            params.profile !== 'sunmi-v2-pro' &&
+            params.profile !== 'low-end-android'
+          ) {
+            throw new Error("profile must be one of 'none'|'sunmi-v2-pro'|'low-end-android'");
+          }
+          profile = params.profile;
+        }
+        const cpuRate =
+          typeof params.cpu_rate === 'number' ? params.cpu_rate : undefined;
+        let network: NetworkConditionPreset | CustomNetworkInput | undefined;
+        if (typeof params.network === 'string') {
+          network = params.network as NetworkConditionPreset;
+        } else if (
+          params.network &&
+          typeof params.network === 'object' &&
+          !Array.isArray(params.network)
+        ) {
+          network = params.network as CustomNetworkInput;
+        } else if (params.network !== undefined) {
+          throw new Error('network must be a preset string or an object');
+        }
+        const preset = typeof params.preset === 'string' ? params.preset : undefined;
+        const userAgent =
+          params.user_agent === null || typeof params.user_agent === 'string'
+            ? params.user_agent
+            : undefined;
+        const hardwareConcurrency =
+          params.hardware_concurrency === null || typeof params.hardware_concurrency === 'number'
+            ? params.hardware_concurrency
+            : undefined;
+        const deviceMemory =
+          params.device_memory === null || typeof params.device_memory === 'number'
+            ? params.device_memory
+            : undefined;
+        const reducedMotion =
+          typeof params.reduced_motion === 'boolean' ? params.reduced_motion : undefined;
+        const saveData =
+          typeof params.save_data === 'boolean' ? params.save_data : undefined;
+        const targetScore =
+          typeof params.target_score === 'number' ? params.target_score : undefined;
+        const calibrate = params.calibrate === true;
+        const reset = params.reset === true;
+
+        return await this.tabManager.emulate({
+          tabId: rawTab,
+          viewport,
+          profile,
+          cpuRate,
+          network,
+          preset,
+          userAgent,
+          hardwareConcurrency,
+          deviceMemory,
+          reducedMotion,
+          saveData,
+          targetScore,
+          calibrate,
+          reset,
+        });
+      }
+
+      case 'browser_profile': {
+        const action = params.action;
+        if (action !== 'start' && action !== 'stop') {
+          throw new Error("browser_profile action must be 'start' or 'stop'");
+        }
+        const rawTab =
+          typeof params.tab_id === 'string' && params.tab_id.trim().length > 0
+            ? params.tab_id.trim()
+            : typeof params.tab === 'string' && params.tab.trim().length > 0
+              ? params.tab.trim()
+              : undefined;
+        let viewport: ViewportRole | undefined;
+        if (params.viewport !== undefined) {
+          if (params.viewport !== 'portrait' && params.viewport !== 'landscape') {
+            throw new Error("viewport must be 'portrait' or 'landscape'");
+          }
+          viewport = params.viewport;
+        }
+        const top =
+          typeof params.top === 'number' && Number.isFinite(params.top)
+            ? Math.min(Math.max(Math.floor(params.top), 1), 200)
+            : undefined;
+        const intervalUs =
+          typeof params.interval_us === 'number' && Number.isFinite(params.interval_us)
+            ? Math.min(Math.max(Math.round(params.interval_us), 200), 10_000)
+            : undefined;
+        return await this.tabManager.profileCpu({
+          tabId: rawTab,
+          viewport,
+          action,
+          top,
+          intervalUs,
+        });
+      }
+
+      case 'browser_health': {
+        const lines =
+          typeof params.lines === 'number' && Number.isFinite(params.lines)
+            ? Math.min(Math.max(Math.floor(params.lines), 1), 500)
+            : 50;
+        const logPath =
+          this.diagnostics.logger?.logPath ??
+          this.diagnostics.logPath ??
+          path.join(resolveStateLogDir(), 'main.log');
+        const crashDumpsDir =
+          this.diagnostics.crashDumpsDir ?? resolveCrashDumpsDir();
+        return {
+          ok: true,
+          socketReachable: true,
+          pid: process.pid,
+          uptimeMs: Math.max(0, Date.now() - this.startedAtMs),
+          socketPath: this.socketPath,
+          logPath,
+          crashDumpsDir,
+          watchdog: this.diagnostics.watchdog?.getSnapshot() ?? null,
+          pendingRpcs: this.getPendingRpcs(),
+          activeProfiles: this.tabManager.cpuProfiler.getActiveSessions(),
+          viewports: this.tabManager.getViewportHealthSnapshot(),
+          lastCrashDump: scanLatestCrashDump(crashDumpsDir),
+          recentLogs: tailLogLines(logPath, lines),
         };
       }
 

@@ -923,6 +923,9 @@ export class WsSseMux {
       case 'upstream-sse-error':
         this.handleUpstreamSseError(ctx, initiatorOrigin, msg.clientSocketId, msg.fatal, msg.retryMs);
         break;
+      case 'upstream-sse-bypass':
+        this.handleUpstreamSseBypass(ctx, initiatorOrigin, msg.clientSocketId);
+        break;
       case 'ss-hello':
         this.handleSessionStorageHello(ctx, initiatorOrigin);
         break;
@@ -1848,6 +1851,29 @@ export class WsSseMux {
         clientSocketId: follower.clientSocketId,
         fatal: isFatal,
         ...(retry !== undefined ? { retryMs: retry } : {}),
+      });
+    }
+  }
+
+  private handleUpstreamSseBypass(
+    ctx: WsMuxViewportContext,
+    initiatorOrigin: string,
+    clientSocketId: string,
+  ): void {
+    const channel = this.getOwnedChannel(ctx.wc.id, clientSocketId, 'sse');
+    if (!channel || channel.initiatorOrigin !== initiatorOrigin) return;
+
+    const followers = Array.from(channel.followers.values());
+    this.destroyChannelState(channel);
+
+    for (const follower of followers) {
+      const fCtx = this.getEligibleFollowerCtx(channel, follower.wcId);
+      if (!fCtx) continue;
+      this.safeSendToRenderer(fCtx.wc, {
+        type: 'mux-grant',
+        clientSocketId: follower.clientSocketId,
+        kind: 'sse',
+        role: 'bypass',
       });
     }
   }

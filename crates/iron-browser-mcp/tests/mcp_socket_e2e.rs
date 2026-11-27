@@ -161,6 +161,57 @@ fn spawn_mock_browser_socket(
                         {"seq": 4, "tsMs": 1020, "tabId": "tab-1", "viewport": "landscape", "domain": "download", "kind": "dedup_suppressed", "summary": "suppressed duplicate download -> owner #3", "gestureSeq": 1}
                     ]
                 }),
+                "browser_emulate" => json!({
+                    "ok": true,
+                    "tabId": req.params.get("tab").or_else(|| req.params.get("tab_id")).cloned().unwrap_or_else(|| json!("tab-1")),
+                    "emulation": {
+                        "active": req.params.get("reset") != Some(&json!(true)) && req.params.get("profile") != Some(&json!("none")),
+                        "profile": req.params.get("profile").cloned().unwrap_or_else(|| json!("custom")),
+                        "label": "Sunmi V2 Pro · 6× CPU · slow-4g",
+                        "portrait": {
+                            "cpuRate": req.params.get("cpu_rate").cloned().unwrap_or_else(|| json!(6)),
+                            "deviceMemory": req.params.get("device_memory").cloned().unwrap_or_else(|| json!(2)),
+                            "hardwareConcurrency": req.params.get("hardware_concurrency").cloned().unwrap_or_else(|| json!(4))
+                        }
+                    },
+                    "calibration": if req.params.get("calibrate") == Some(&json!(true)) {
+                        json!({"hostScore": 96000, "targetScore": 18000, "chosenRate": 5, "resultingScore": 19100})
+                    } else {
+                        Value::Null
+                    }
+                }),
+                "browser_profile" => json!({
+                    "ok": true,
+                    "action": req.params["action"],
+                    "tabId": req.params.get("tab").or_else(|| req.params.get("tab_id")).cloned().unwrap_or_else(|| json!("tab-1")),
+                    "viewport": req.params.get("viewport").cloned().unwrap_or_else(|| json!("portrait")),
+                    "profilePath": if req.params["action"] == json!("stop") {
+                        json!("/tmp/profile-tab-1-portrait.cpuprofile")
+                    } else {
+                        Value::Null
+                    },
+                    "summary": if req.params["action"] == json!("stop") {
+                        json!({
+                            "activeMs": 142.5,
+                            "functions": [{"functionName": "reconcileCart", "location": "https://app.test/pos.js:88", "selfMs": 95.2, "totalMs": 110.4}],
+                            "scripts": [{"url": "https://app.test/pos.js", "selfMs": 120.0}]
+                        })
+                    } else {
+                        Value::Null
+                    }
+                }),
+                "browser_health" => json!({
+                    "ok": true,
+                    "socketReachable": true,
+                    "pid": 12345,
+                    "uptimeMs": 9000,
+                    "watchdog": {"running": true, "stallCount": 0, "shuttingDown": false},
+                    "pendingRpcs": [],
+                    "activeProfiles": [],
+                    "viewports": [{"tabId": "tab-1", "viewport": "portrait", "crashed": false, "unresponsive": false}],
+                    "lastCrashDump": Value::Null,
+                    "recentLogs": ["{\"event\":\"lifecycle.ready\"}"]
+                }),
                 other => {
                     let resp = CtlRpcResponse {
                         id: json!(req.id),
@@ -192,8 +243,8 @@ fn spawn_mock_browser_socket(
 }
 
 #[test]
-fn mcp_end_to_end_exercises_all_fifteen_tools_over_framed_unix_socket() {
-    let (_dir, sock_path, server) = spawn_mock_browser_socket(15);
+fn mcp_end_to_end_exercises_all_eighteen_tools_over_framed_unix_socket() {
+    let (_dir, sock_path, server) = spawn_mock_browser_socket(18);
     let client = SocketClient::new(sock_path);
 
     let requests = vec![
@@ -215,6 +266,9 @@ fn mcp_end_to_end_exercises_all_fifteen_tools_over_framed_unix_socket() {
         json!({"jsonrpc":"2.0","id":15,"method":"tools/call","params":{"name":"browser_trace_start","arguments":{"max_duration_ms":2000}}}),
         json!({"jsonrpc":"2.0","id":16,"method":"tools/call","params":{"name":"browser_trace_stop","arguments":{}}}),
         json!({"jsonrpc":"2.0","id":17,"method":"tools/call","params":{"name":"browser_events","arguments":{"domain":"download","gesture_seq":1}}}),
+        json!({"jsonrpc":"2.0","id":18,"method":"tools/call","params":{"name":"browser_emulate","arguments":{"tab":"tab-1","profile":"sunmi-v2-pro","calibrate":true}}}),
+        json!({"jsonrpc":"2.0","id":19,"method":"tools/call","params":{"name":"browser_profile","arguments":{"tab":"tab-1","viewport":"portrait","action":"stop","top":10}}}),
+        json!({"jsonrpc":"2.0","id":20,"method":"tools/call","params":{"name":"browser_health","arguments":{"lines":25}}}),
     ];
 
     let mut wire_in = String::new();
@@ -229,7 +283,7 @@ fn mcp_end_to_end_exercises_all_fifteen_tools_over_framed_unix_socket() {
         .expect("serve_io succeeds");
 
     let received = server.join().expect("mock socket thread joined");
-    assert_eq!(received.len(), 15);
+    assert_eq!(received.len(), 18);
     // Verify browser_eval received clamped max_bytes = 512
     assert_eq!(received[8].method, "browser_eval");
     assert_eq!(received[8].params["max_bytes"], json!(512));
@@ -237,6 +291,14 @@ fn mcp_end_to_end_exercises_all_fifteen_tools_over_framed_unix_socket() {
     assert_eq!(received[3].params["highlight_clipped"], json!(true));
     assert_eq!(received[14].method, "browser_events");
     assert_eq!(received[14].params["domain"], json!("download"));
+    assert_eq!(received[15].method, "browser_emulate");
+    assert_eq!(received[15].params["profile"], json!("sunmi-v2-pro"));
+    assert_eq!(received[15].params["calibrate"], json!(true));
+    assert_eq!(received[16].method, "browser_profile");
+    assert_eq!(received[16].params["action"], json!("stop"));
+    assert_eq!(received[16].params["top"], json!(10));
+    assert_eq!(received[17].method, "browser_health");
+    assert_eq!(received[17].params["lines"], json!(25));
 
     let lines: Vec<Value> = String::from_utf8(wire_out)
         .expect("utf8 output")
@@ -244,14 +306,21 @@ fn mcp_end_to_end_exercises_all_fifteen_tools_over_framed_unix_socket() {
         .map(|l| serde_json::from_str::<Value>(l).expect("valid json line"))
         .collect();
 
-    // 18 input lines minus 1 notification = 17 responses
-    assert_eq!(lines.len(), 17);
+    // 21 input lines minus 1 notification = 20 responses
+    assert_eq!(lines.len(), 20);
 
     // Initialize negotiated 2025-06-18
     assert_eq!(lines[0]["result"]["protocolVersion"], "2025-06-18");
 
-    // tools/list returns all 15 tools
-    assert_eq!(lines[1]["result"]["tools"].as_array().unwrap().len(), 15);
+    // tools/list returns all 18 tools
+    assert_eq!(lines[1]["result"]["tools"].as_array().unwrap().len(), 18);
+
+    // browser_emulate response includes active profile & calibration result
+    let emu_text = lines[17]["result"]["content"][0]["text"].as_str().unwrap();
+    let emu_json: Value = serde_json::from_str(emu_text).expect("emulate response json");
+    assert_eq!(emu_json["ok"], true);
+    assert_eq!(emu_json["emulation"]["profile"], "sunmi-v2-pro");
+    assert_eq!(emu_json["calibration"]["chosenRate"], 5);
 
     // browser_screenshot returns 2 image blocks + 1 layoutAudit text block
     let shot_content = lines[5]["result"]["content"].as_array().unwrap();
@@ -335,4 +404,89 @@ fn mcp_reports_clean_tool_error_when_browser_socket_is_offline() {
             .unwrap()
             .contains("is IronBrowser running?")
     );
+}
+
+#[test]
+fn browser_emulate_forwards_custom_overrides_and_reset_over_socket() {
+    let (_dir, sock_path, server) = spawn_mock_browser_socket(2);
+    let client = SocketClient::new(sock_path);
+
+    let input = [
+        json!({"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18","capabilities":{},"clientInfo":{"name":"emu-test","version":"1"}}}),
+        json!({"jsonrpc":"2.0","method":"notifications/initialized"}),
+        json!({"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"browser_emulate","arguments":{
+            "tab_id":"tab-9",
+            "viewport":"portrait",
+            "cpu_rate":8,
+            "network":{"latency_ms":220,"down_kbps":900,"up_kbps":400},
+            "hardware_concurrency":4,
+            "device_memory":2,
+            "reduced_motion":true,
+            "save_data":true
+        }}}),
+        json!({"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"browser_emulate","arguments":{
+            "tab":"tab-9",
+            "reset":true
+        }}}),
+    ]
+    .iter()
+    .map(|v| serde_json::to_string(v).unwrap())
+    .collect::<Vec<_>>()
+    .join("\n")
+        + "\n";
+
+    let mut out = Vec::new();
+    serve_io(&client, 16384, Cursor::new(input.as_bytes()), &mut out).expect("serve_io");
+
+    let received = server.join().expect("mock socket thread joined");
+    assert_eq!(received.len(), 2);
+    assert_eq!(received[0].method, "browser_emulate");
+    assert_eq!(received[0].params["cpu_rate"], json!(8));
+    assert_eq!(received[0].params["network"]["latency_ms"], json!(220));
+    assert_eq!(received[0].params["device_memory"], json!(2));
+    assert_eq!(received[1].method, "browser_emulate");
+    assert_eq!(received[1].params["reset"], json!(true));
+
+    let responses: Vec<Value> = String::from_utf8(out)
+        .unwrap()
+        .lines()
+        .map(|l| serde_json::from_str(l).unwrap())
+        .collect();
+    assert_eq!(responses.len(), 3);
+    let apply_payload: Value =
+        serde_json::from_str(responses[1]["result"]["content"][0]["text"].as_str().unwrap())
+            .unwrap();
+    assert_eq!(apply_payload["emulation"]["active"], true);
+    assert_eq!(apply_payload["emulation"]["portrait"]["cpuRate"], 8);
+
+    let reset_payload: Value =
+        serde_json::from_str(responses[2]["result"]["content"][0]["text"].as_str().unwrap())
+            .unwrap();
+    assert_eq!(reset_payload["emulation"]["active"], false);
+}
+
+#[test]
+fn browser_health_returns_offline_logs_and_crash_dump_when_socket_unreachable() {
+    let dir = tempdir().expect("tempdir");
+    let missing_sock = dir.path().join("offline.sock");
+    let log_dir = dir.path().join("logs");
+    let crash_dir = dir.path().join("Crashpad").join("completed");
+    std::fs::create_dir_all(&log_dir).unwrap();
+    std::fs::create_dir_all(&crash_dir).unwrap();
+    std::fs::write(
+        log_dir.join("main.log"),
+        "{\"event\":\"lifecycle.startup\"}\n{\"event\":\"process.uncaught_exception\"}\n",
+    )
+    .unwrap();
+    let dmp_path = crash_dir.join("crash-1.dmp");
+    std::fs::write(&dmp_path, b"MDMPfake").unwrap();
+
+    let report = iron_browser_mcp::socket::collect_offline_health(&missing_sock, "conn refused", 10);
+    assert_eq!(report["ok"], false);
+    assert_eq!(report["socketReachable"], false);
+    let logs = iron_browser_mcp::socket::tail_log_file(&log_dir.join("main.log"), 10);
+    assert_eq!(logs.len(), 2);
+    let dump = iron_browser_mcp::socket::scan_latest_crash_dump(&dir.path().join("Crashpad"));
+    assert_eq!(dump["path"], dmp_path.display().to_string());
+    assert_eq!(dump["totalDumps"], 1);
 }

@@ -450,6 +450,22 @@ pub unsafe extern "C" fn napi_register_module_v1(
     exports: NapiValue,
 ) -> NapiValue {
     let _ = catch_unwind(AssertUnwindSafe(|| {
+        // Disable kernel pipe core-dump streaming by default unless IRON_BROWSER_CORE_DUMP=1 so
+        // systemd-coredump never wedges a crashing 1.45 TB V8 address space in anon_pipe_write
+        // while holding ctl.sock open (Crashpad still writes minidumps via ptrace).
+        #[cfg(unix)]
+        if std::env::var("IRON_BROWSER_CORE_DUMP").as_deref() != Ok("1") {
+            unsafe {
+                let mut cur = libc::rlimit {
+                    rlim_cur: 0,
+                    rlim_max: 0,
+                };
+                if libc::getrlimit(libc::RLIMIT_CORE, &mut cur) == 0 && cur.rlim_cur != 0 {
+                    cur.rlim_cur = 0;
+                    let _ = libc::setrlimit(libc::RLIMIT_CORE, &cur);
+                }
+            }
+        }
         let Some(api) = api() else {
             return;
         };

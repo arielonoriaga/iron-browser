@@ -20,6 +20,15 @@ export const DEVICE_PRESETS: readonly DevicePreset[] = [
     category: 'portrait',
   },
   {
+    id: 'sunmi-v2-pro',
+    label: 'Sunmi V2 Pro (360×720)',
+    width: 360,
+    height: 720,
+    dpr: 2,
+    touch: true,
+    category: 'portrait',
+  },
+  {
     id: 'iphone-15-pro-max',
     label: 'Pro Max (430×932)',
     width: 430,

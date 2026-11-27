@@ -83,8 +83,11 @@ function makeButtonFp(overrides: Partial<ElementFingerprint> = {}): ElementFinge
 }
 
 async function flushMicrotasks(turns = 6): Promise<void> {
-  for (let i = 0; i < turns; i += 1) {
-    await Promise.resolve();
+  for (let m = 0; m < 4; m += 1) {
+    for (let i = 0; i < turns; i += 1) {
+      await Promise.resolve();
+    }
+    await new Promise<void>((resolve) => setImmediate(resolve));
   }
 }
 
@@ -1158,5 +1161,86 @@ describe('MirrorRelay M4A security & replication', () => {
     expect(guard.isEcho('landscape')).toBe(true);
     now += 141;
     expect(guard.isEcho('landscape')).toBe(false);
+  });
+
+  test('dispatchTrustedKey preserves Digit code and text for preventDefault PIN keydown relay', async () => {
+    const portrait = new FakeWebContents(91);
+    const landscape = new FakeWebContents(92);
+    const { relay, ipc } = createRelay({
+      findByWebContentsId: (id) =>
+        id === landscape.id
+          ? {
+              tabId: 'tab-pin',
+              role: 'landscape',
+              mirrorEnabled: true,
+              pairedWebContents: portrait as unknown as WebContents,
+              pairedScale: 1,
+            }
+          : null,
+    });
+
+    const pinFp: ElementFingerprint = {
+      tag: 'input',
+      role: 'textbox',
+      ariaLabel: 'PIN',
+      cssPath: 'input:nth-of-type(1)',
+      isCanvas: false,
+      relViewportX: 0.5,
+      relViewportY: 0.5,
+    };
+
+    const replayP = relay.replayEvent('tab-pin', 'portrait', portrait as unknown as WebContents, {
+      kind: 'keydown',
+      fingerprint: pinFp,
+      key: '4',
+      code: 'Digit4',
+      modifiers: [],
+    });
+    await flushMicrotasks();
+    expect(portrait.sentQueries.length).toBe(1);
+    expect(portrait.sentQueries[0]!.args).toMatchObject({ focusTarget: true, scrollIntoView: false });
+    ipc.emit('iron:dom-query-reply', makeIpcEvent(portrait), {
+      reqId: portrait.sentQueries[0]!.reqId,
+      result: { found: true, x: 10, y: 10 },
+    });
+    await replayP;
+
+    const keyCmds = portrait.debugger.commands.filter((c) => c.method === 'Input.dispatchKeyEvent');
+    expect(keyCmds.length).toBe(2);
+    expect(keyCmds[0]!.params).toMatchObject({
+      type: 'keyDown',
+      key: '4',
+      code: 'Digit4',
+      text: '4',
+      unmodifiedText: '4',
+      windowsVirtualKeyCode: 52,
+    });
+    expect(keyCmds[1]!.params).toMatchObject({
+      type: 'keyUp',
+      key: '4',
+      code: 'Digit4',
+    });
+
+    // Punctuation & Shift+digit must NOT collide with navigation VK codes (e.g. '.' != VK_DELETE 46, '!' != VK_PRIOR 33).
+    portrait.debugger.commands.length = 0;
+    await relay.dispatchTrustedKey(portrait as unknown as WebContents, '.', [], 'Period');
+    await relay.dispatchTrustedKey(portrait as unknown as WebContents, '!', ['shift'], 'Digit1');
+    const punctCmds = portrait.debugger.commands.filter(
+      (c) => c.method === 'Input.dispatchKeyEvent' && c.params?.type === 'keyDown',
+    );
+    expect(punctCmds.length).toBe(2);
+    expect(punctCmds[0]!.params).toMatchObject({
+      key: '.',
+      code: 'Period',
+      text: '.',
+      windowsVirtualKeyCode: 0,
+    });
+    expect(punctCmds[1]!.params).toMatchObject({
+      key: '!',
+      code: 'Digit1',
+      text: '!',
+      modifiers: 8,
+      windowsVirtualKeyCode: 0,
+    });
   });
 });

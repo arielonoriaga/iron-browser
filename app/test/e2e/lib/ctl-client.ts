@@ -393,6 +393,18 @@ export class ControlSocketClient implements ControlSocketClientApi {
     return this.request<EvalResultDto>('browser_eval', params);
   }
 
+  emulate<T = Record<string, unknown>>(params: Record<string, unknown>): Promise<T> {
+    return this.request<T>('browser_emulate', params);
+  }
+
+  profile<T = Record<string, unknown>>(params: Record<string, unknown>): Promise<T> {
+    return this.request<T>('browser_profile', params, 40_000);
+  }
+
+  health<T = Record<string, unknown>>(lines = 50): Promise<T> {
+    return this.request<T>('browser_health', { lines }, 10_000);
+  }
+
   events(opts?: {
     tabId?: string;
     domain?: string;

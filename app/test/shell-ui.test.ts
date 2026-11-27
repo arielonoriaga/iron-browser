@@ -222,6 +222,8 @@ class FakeDocument {
       ['m-dom', 'span'],
       ['m-dedup', 'span'],
       ['sparkline-line', 'polyline'],
+      ['pill-emulation', 'button', ['hidden']],
+      ['emu-pill-label', 'span'],
       ['pill-mirror-miss', 'button', ['hidden']],
       ['mirror-miss-label', 'span'],
       ['pill-console', 'button'],
@@ -355,6 +357,10 @@ function makeFakeShellApi(initialState: ShellState) {
     },
     setPreset: async (role, presetId) => {
       calls.push({ method: 'setPreset', args: [role, presetId] });
+      return initialState;
+    },
+    setEmulationProfile: async (profile, viewport, tabId) => {
+      calls.push({ method: 'setEmulationProfile', args: [profile, viewport, tabId] });
       return initialState;
     },
     setRailCollapsed: async (collapsed) => {
@@ -947,6 +953,96 @@ describe('M4B Shell UI (shell.ts)', () => {
     expect(histList.innerHtmlWrites).toBe(writesAfterBootHist + 1);
     expect(histList.children.length).toBe(3);
   });
+
+  test('Slow-device emulation pill renders active profile, hides when inactive, and toggles from preset menu', async () => {
+    const doc = new FakeDocument();
+    const state = makeSampleState();
+    const { api, calls } = makeFakeShellApi(state);
+    await mountShell(doc as unknown as Document, api);
+
+    const emuPill = doc.getElementById('pill-emulation')!;
+    const emuLabel = doc.getElementById('emu-pill-label')!;
+    const portraitSelect = doc.getElementById('select-portrait-preset')!;
+
+    // Default: inactive -> hidden
+    expect(emuPill.classList.contains('hidden')).toBe(true);
+    expect(emuPill.disabled).toBe(true);
+
+    // Selecting emu:sunmi-v2-pro from preset menu invokes setEmulationProfile('sunmi-v2-pro', 'both')
+    portraitSelect.value = 'emu:sunmi-v2-pro';
+    portraitSelect.dispatchEvent({ type: 'change' });
+    expect(portraitSelect.value).toBe('iphone-15');
+    expect(calls.some((c) => c.method === 'setEmulationProfile' && c.args[0] === 'sunmi-v2-pro')).toBe(
+      true,
+    );
+
+    // Render active emulation summary -> shows #pill-emulation
+    const tab = state.tabs[0]!;
+    renderState(
+      makeSampleState({
+        tabs: [
+          {
+            ...tab,
+            emulation: {
+              active: true,
+              profile: 'sunmi-v2-pro',
+              label: 'Sunmi V2 Pro · 6× CPU · slow-4g',
+              portrait: {
+                active: true,
+                profile: 'sunmi-v2-pro',
+                cpuRate: 6,
+                network: {
+                  preset: 'slow-4g',
+                  offline: false,
+                  latencyMs: 150,
+                  downloadBytesPerSec: 200_000,
+                  uploadBytesPerSec: 93_750,
+                },
+                presetId: 'sunmi-v2-pro',
+                userAgent: 'Android 7.1',
+                hardwareConcurrency: 4,
+                deviceMemory: 2,
+                reducedMotion: false,
+                saveData: false,
+                targetScore: 18_000,
+                lastCalibration: null,
+              },
+              landscape: {
+                active: true,
+                profile: 'sunmi-v2-pro',
+                cpuRate: 6,
+                network: {
+                  preset: 'slow-4g',
+                  offline: false,
+                  latencyMs: 150,
+                  downloadBytesPerSec: 200_000,
+                  uploadBytesPerSec: 93_750,
+                },
+                presetId: null,
+                userAgent: 'Android 7.1',
+                hardwareConcurrency: 4,
+                deviceMemory: 2,
+                reducedMotion: false,
+                saveData: false,
+                targetScore: 18_000,
+                lastCalibration: null,
+              },
+            },
+          },
+        ],
+      }),
+    );
+
+    expect(emuPill.classList.contains('hidden')).toBe(false);
+    expect(emuPill.disabled).toBe(false);
+    expect(emuLabel.textContent).toContain('Sunmi V2 Pro');
+
+    // Clicking #pill-emulation resets to 'none'
+    emuPill.click();
+    expect(
+      calls.some((c) => c.method === 'setEmulationProfile' && c.args[0] === 'none'),
+    ).toBe(true);
+  });
 });
 
 describe('M4B Main IPCs (index.ts) & TabManager Wiring', () => {
@@ -1014,6 +1110,10 @@ describe('M4B Main IPCs (index.ts) & TabManager Wiring', () => {
       copyMirrorMissDebug: () => {
         fakeMgrCalls.push('copyMirrorMissDebug');
         return true;
+      },
+      setEmulationProfile: (profile: string, viewport?: string, tabId?: string) => {
+        fakeMgrCalls.push(`setEmulationProfile:${profile}:${viewport ?? 'both'}:${tabId ?? ''}`);
+        return { ok: true };
       },
     };
     const localHandlers = new Map<string, (ev: unknown, args: unknown) => unknown>();
@@ -1184,6 +1284,49 @@ describe('M4B Main IPCs (index.ts) & TabManager Wiring', () => {
       const tab2Id = t2State.tabs[1]!.id;
       const tab2Obj = mgr.getTab(tab2Id)!;
       expect(tab2Obj.landscapeView!.getBounds().width).toBeGreaterThan(0);
+
+      // F-24: Single-mode browser_emulate syncs landscapePresetId/viewportReport, honors setPreset, and preserves portrait throttle across Single->Dual
+      const singleMgr = mgr as unknown as {
+        createTab(opts: { url: string; mode: 'single' | 'dual'; activate?: boolean }): ShellState;
+        emulate(params: Record<string, unknown>): Promise<Record<string, unknown>>;
+        setPreset(role: 'portrait' | 'landscape', presetId: string, tabId?: string): ShellState;
+        toggleDualMode(tabId?: string): ShellState;
+        slowDeviceEmulation: {
+          getViewportState(tabId: string, role: 'portrait' | 'landscape'): {
+            active: boolean;
+            cpuRate: number;
+            presetId: string | null;
+          };
+        };
+      };
+      const t3State = singleMgr.createTab({ url: 'https://app.test/single', mode: 'single', activate: true });
+      const tab3Id = t3State.activeTabId!;
+      const l3Wc = mgr.getViewportWebContents(tab3Id, 'landscape')!;
+      await new Promise((r) => setTimeout(r, 15));
+      l3Wc.emit('did-finish-load');
+      l3Wc.emit('did-stop-loading');
+      await singleMgr.emulate({ tabId: tab3Id, profile: 'sunmi-v2-pro' });
+      const afterSingleEmu = mgr.getShellState().tabs.find((t) => t.id === tab3Id)!;
+      expect(afterSingleEmu.landscapePresetId).toBe('sunmi-v2-pro');
+      expect(afterSingleEmu.viewportReport?.landscape?.sizeMismatch).toBe(false);
+
+      // Single -> Dual restores landscape desktop preset while keeping portrait active at 6x CPU!
+      const afterToDual = singleMgr.toggleDualMode(tab3Id).tabs.find((t) => t.id === tab3Id)!;
+      expect(afterToDual.landscapePresetId).toBe('desktop-hd');
+      expect(afterToDual.portraitPresetId).toBe('sunmi-v2-pro');
+      expect(singleMgr.slowDeviceEmulation.getViewportState(tab3Id, 'portrait').active).toBe(true);
+      expect(singleMgr.slowDeviceEmulation.getViewportState(tab3Id, 'portrait').cpuRate).toBe(6);
+
+      const p3Wc = mgr.getViewportWebContents(tab3Id, 'portrait')!;
+      await new Promise((r) => setTimeout(r, 15));
+      p3Wc.emit('did-finish-load');
+      p3Wc.emit('did-stop-loading');
+
+      // Manual setPreset during active emulation is honored and not clobbered on reset
+      singleMgr.setPreset('portrait', 'iphone-se', tab3Id);
+      await singleMgr.emulate({ tabId: tab3Id, reset: true });
+      const afterManualReset = mgr.getShellState().tabs.find((t) => t.id === tab3Id)!;
+      expect(afterManualReset.portraitPresetId).toBe('iphone-se');
 
       // Bug 2: dockOpen: true + dispose() is idempotent and does not reattach debuggers
       mgr.setDockOpen(true);

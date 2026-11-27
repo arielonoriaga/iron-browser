@@ -30,6 +30,15 @@ export const MAX_TOTAL_BUFFERED_BYTES = 16 * 1024 * 1024;
 
 const fatalUtf8Decoder = new TextDecoder('utf-8', { fatal: true });
 
+const yieldOutOfFetchEvent = (): Promise<void> =>
+  new Promise<void>((resolve) => {
+    if (typeof setImmediate === 'function') {
+      setImmediate(resolve);
+    } else {
+      setTimeout(resolve, 0);
+    }
+  });
+
 function hasNonTextPostDataEntries(entries: unknown): boolean {
   if (entries === undefined) return false;
   if (!Array.isArray(entries)) return true;
@@ -682,10 +691,27 @@ export class RequestDedupMiddleware<T extends DebuggerTarget = WebContents> {
     }
   }
 
+  private async sendFetchCommand<R = unknown>(
+    wc: T,
+    method: string,
+    params: Record<string, unknown>,
+  ): Promise<R> {
+    // Chromium 134 (Electron 35) InterceptionJob UAF guard:
+    // InterceptionJob::NotifyClient emits Fetch.requestPaused synchronously inside
+    // RequestBodyCollector::Collect() before assigning `this->body_collector_`.
+    // Continuing/fulfilling/failing/reading inside the same V8 MicrotasksScope destroys
+    // InterceptionJob before Collect() returns (PartitionAlloc 0xefef... SIGSEGV).
+    await yieldOutOfFetchEvent();
+    if (wc.isDestroyed() || !this.coordinator.isAttached(wc)) {
+      throw new Error(`Debugger detached before ${method}`);
+    }
+    return this.coordinator.sendCommand<R>(wc, method, params);
+  }
+
   private async safeContinueRequest(wc: T, requestId: string): Promise<void> {
     if (wc.isDestroyed() || !this.coordinator.isAttached(wc)) return;
     try {
-      await this.coordinator.sendCommand(wc, 'Fetch.continueRequest', { requestId });
+      await this.sendFetchCommand(wc, 'Fetch.continueRequest', { requestId });
     } catch {
       // Request may already be cancelled/closed.
     }
@@ -698,11 +724,11 @@ export class RequestDedupMiddleware<T extends DebuggerTarget = WebContents> {
   ): Promise<void> {
     if (wc.isDestroyed() || !this.coordinator.isAttached(wc)) return;
     try {
-      await this.coordinator.sendCommand(wc, 'Fetch.continueResponse', { requestId });
+      await this.sendFetchCommand(wc, 'Fetch.continueResponse', { requestId });
     } catch {
       if (responseErrorReason && !wc.isDestroyed() && this.coordinator.isAttached(wc)) {
         try {
-          await this.coordinator.sendCommand(wc, 'Fetch.failRequest', {
+          await this.sendFetchCommand(wc, 'Fetch.failRequest', {
             requestId,
             errorReason: responseErrorReason,
           });
@@ -905,7 +931,7 @@ export class RequestDedupMiddleware<T extends DebuggerTarget = WebContents> {
         }
 
         try {
-          await this.coordinator.sendCommand(wc, 'Fetch.fulfillRequest', fulfillParams);
+          await this.sendFetchCommand(wc, 'Fetch.fulfillRequest', fulfillParams);
           const nextCount = (this.dedupCountByTab.get(ctx.tabId) ?? 0) + 1;
           this.dedupCountByTab.set(ctx.tabId, nextCount);
           this.options.onDedupIncrement?.(wc.id, 1);
@@ -1035,7 +1061,7 @@ export class RequestDedupMiddleware<T extends DebuggerTarget = WebContents> {
       if (!shouldSkipResponseBodyFetch(responseCode)) {
         let bodyTimer: ReturnType<typeof setTimeout> | null = null;
         const bodyRes = (await Promise.race([
-          this.coordinator.sendCommand<{ body?: string; base64Encoded?: boolean }>(
+          this.sendFetchCommand<{ body?: string; base64Encoded?: boolean }>(
             wc,
             'Fetch.getResponseBody',
             { requestId },

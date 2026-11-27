@@ -1,32 +1,87 @@
-import { app, BrowserWindow, ipcMain, screen, type IpcMainInvokeEvent } from 'electron';
+import * as electron from 'electron';
+import type { BrowserWindow as BrowserWindowType, IpcMainInvokeEvent } from 'electron';
+
+const { app, BrowserWindow, crashReporter, ipcMain, screen } = electron;
 import path from 'node:path';
 import { pathToFileURL } from 'node:url';
 import type { SessionMode, ThemeMode, ViewMode, ViewportRole } from '../shared/types';
 import { type PersistedWindowBounds } from '../shared/session-store';
 import { normalizeUrl } from '../shared/url';
 import { ControlSocketServer } from './ctl-socket';
+import {
+  MainThreadWatchdog,
+  resolveCrashDumpsDir,
+  resolveStateLogDir,
+  StructuredLogger,
+} from './diagnostics';
 import { loadPersistedSession, savePersistedSession } from './session-file';
 import { TabManager } from './tab-manager';
 
+const BOOT_STARTED_AT_MS = Date.now();
+const isSmokeBoot = process.env.IRON_BROWSER_SMOKE === '1' || process.argv.includes('--smoke');
+
 const userDataOverride = process.env.IRON_BROWSER_USER_DATA?.trim();
-if (userDataOverride) {
+if (userDataOverride && typeof app?.setPath === 'function') {
   app.setPath('userData', path.resolve(userDataOverride));
 }
 
-// Wayland Ozone auto-detection + lean Chromium switches.
-app.commandLine.appendSwitch('ozone-platform-hint', 'auto');
-app.commandLine.appendSwitch('enable-features', 'UseOzonePlatform,WaylandWindowDecorations');
+function safeGetUserDataPath(): string | undefined {
+  try {
+    if (typeof app?.getPath === 'function') {
+      return app.getPath('userData');
+    }
+  } catch {
+    // Ignore when imported inside unit-test VMs with stubbed electron.app.
+  }
+  return userDataOverride ? path.resolve(userDataOverride) : undefined;
+}
 
-let mainWindow: BrowserWindow | null = null;
+const configuredUserDataDir = safeGetUserDataPath();
+const crashDumpsDir = resolveCrashDumpsDir(configuredUserDataDir);
+if (typeof app?.setPath === 'function') {
+  try {
+    app.setPath('crashDumps', crashDumpsDir);
+  } catch {
+    // Ignore if crashDumps path cannot be set in stubbed test environments.
+  }
+}
+if (crashReporter && typeof crashReporter.start === 'function') {
+  try {
+    crashReporter.start({
+      submitURL: '',
+      uploadToServer: false,
+      compress: false,
+    });
+  } catch {
+    // Ignore Crashpad init errors in headless/stubbed environments.
+  }
+}
+
+// Wayland Ozone auto-detection + lean Chromium switches.
+if (app?.commandLine && typeof app.commandLine.appendSwitch === 'function') {
+  app.commandLine.appendSwitch('ozone-platform-hint', 'auto');
+  app.commandLine.appendSwitch('enable-features', 'UseOzonePlatform,WaylandWindowDecorations');
+}
+
+let mainWindow: BrowserWindowType | null = null;
 let tabManager: TabManager | null = null;
 let ctlServer: ControlSocketServer | null = null;
+let diagLogger: StructuredLogger | null = null;
+let watchdog: MainThreadWatchdog | null = null;
 let sessionFilePath: string | null = null;
 let persistTimer: ReturnType<typeof setTimeout> | null = null;
 let lastNormalBounds: PersistedWindowBounds | undefined;
 let sessionRestored = false;
 let sessionFlushed = false;
+let quitReason = 'external_or_user_close';
 
-function captureWindowBounds(win: BrowserWindow | null): PersistedWindowBounds | undefined {
+function requestQuitWithReason(reason: string): void {
+  quitReason = reason;
+  diagLogger?.info('lifecycle.request_quit', { reason });
+  app.quit();
+}
+
+function captureWindowBounds(win: BrowserWindowType | null): PersistedWindowBounds | undefined {
   if (!win || win.isDestroyed()) return lastNormalBounds;
   const maximized = win.isMaximized();
   const bounds = maximized ? win.getNormalBounds() : win.getBounds();
@@ -54,6 +109,7 @@ function flushSessionNow(): void {
     const snapshot = tabManager.exportPersistedSession(captureWindowBounds(mainWindow));
     savePersistedSession(sessionFilePath, snapshot);
   } catch (err) {
+    diagLogger?.error('session.save_error', { error: err });
     process.stderr.write(`IronBrowser session save error: ${String(err)}\n`);
   }
 }
@@ -95,7 +151,7 @@ function parseInitialUrlFromArgv(): string | undefined {
   return undefined;
 }
 
-export function assertShellSender(ev: IpcMainInvokeEvent, win: BrowserWindow): void {
+export function assertShellSender(ev: IpcMainInvokeEvent, win: BrowserWindowType): void {
   if (
     win.isDestroyed() ||
     win.webContents.isDestroyed() ||
@@ -158,7 +214,7 @@ export interface ShortcutTarget {
     | 'setDockOpen'
     | 'reload'
   > | null;
-  mainWindow: Pick<BrowserWindow, 'webContents'> | null;
+  mainWindow: Pick<BrowserWindowType, 'webContents'> | null;
 }
 
 export function dispatchGlobalShortcut(
@@ -218,7 +274,7 @@ function handleGlobalShortcut(input: Electron.Input): boolean {
 }
 
 export function registerIpcHandlers(
-  win: BrowserWindow,
+  win: BrowserWindowType,
   mgr: TabManager,
   ipc: Pick<Electron.IpcMain, 'handle'> = ipcMain,
 ): void {
@@ -300,6 +356,21 @@ export function registerIpcHandlers(
     );
   });
 
+  handleShell('shell:set-emulation-profile', (raw) => {
+    const obj = asObject(raw);
+    const profile = asEnum<'none' | 'sunmi-v2-pro' | 'low-end-android'>(
+      obj.profile,
+      ['none', 'sunmi-v2-pro', 'low-end-android'],
+      'profile',
+    );
+    const viewport =
+      obj.viewport !== undefined
+        ? asEnum<ViewportRole | 'both'>(obj.viewport, ['portrait', 'landscape', 'both'], 'viewport')
+        : 'both';
+    const tabId = obj.tabId !== undefined ? asNonEmptyString(obj.tabId, 'tabId') : undefined;
+    return mgr.setEmulationProfile(profile, viewport, tabId);
+  });
+
   handleShell('shell:set-rail-collapsed', (raw) => {
     const obj = asObject(raw);
     return mgr.setRailCollapsed(asBoolean(obj.collapsed, 'collapsed'));
@@ -370,14 +441,45 @@ export function registerIpcHandlers(
   handleShell('shell:copy-mirror-miss-debug', () => mgr.copyMirrorMissDebug());
 }
 
+function getPendingShutdownSummary(): Record<string, unknown> {
+  return {
+    pendingRpcs: ctlServer?.getPendingRpcs() ?? [],
+    activeProfiles: tabManager?.cpuProfiler.getActiveSessions() ?? [],
+    openTabs: tabManager?.getShellState().tabs.length ?? 0,
+  };
+}
+
 async function createMainWindow(): Promise<void> {
-  const isSmoke = process.env.IRON_BROWSER_SMOKE === '1' || process.argv.includes('--smoke');
+  const isSmoke = isSmokeBoot;
+  const userDataDir = app.getPath('userData');
+  const logDir = resolveStateLogDir({ isSmoke, userDataDir });
+  try {
+    diagLogger = new StructuredLogger(logDir);
+    watchdog = new MainThreadWatchdog(diagLogger.logPath);
+    watchdog.start();
+  } catch (err) {
+    process.stderr.write(`IronBrowser diagnostics init warning: ${String(err)}\n`);
+  }
+
+  diagLogger?.info('lifecycle.startup', {
+    version: '0.1.0',
+    electronVersion: process.versions.electron ?? 'unknown',
+    nodeVersion: process.versions.node ?? 'unknown',
+    smoke: isSmoke,
+    userDataDir,
+    logPath: diagLogger?.logPath ?? null,
+    crashDumpsDir,
+  });
+  process.stderr.write(
+    `IronBrowser diagnostics: log=${diagLogger?.logPath ?? 'disabled'} crashDumps=${crashDumpsDir}\n`,
+  );
+
   const explicitStateFile = process.env.IRON_BROWSER_STATE_FILE?.trim();
   sessionFilePath = explicitStateFile
     ? explicitStateFile
     : isSmoke
       ? null
-      : path.join(app.getPath('userData'), 'session-state.json');
+      : path.join(userDataDir, 'session-state.json');
 
   const savedSession = sessionFilePath ? loadPersistedSession(sessionFilePath) : null;
   const savedWin = savedSession?.window;
@@ -433,8 +535,23 @@ async function createMainWindow(): Promise<void> {
     scheduleSessionSave();
   });
   win.on('close', () => {
+    quitReason = 'main_window_closed';
+    diagLogger?.info('lifecycle.main_window_close');
     flushSessionNow();
     sessionFlushed = true;
+  });
+
+  win.webContents.on('unresponsive', () => {
+    diagLogger?.warn('shell.unresponsive');
+  });
+  win.webContents.on('responsive', () => {
+    diagLogger?.info('shell.responsive');
+  });
+  win.webContents.on('render-process-gone', (_ev, details) => {
+    diagLogger?.error('shell.render_process_gone', {
+      reason: details?.reason ?? 'unknown',
+      exitCode: details?.exitCode ?? null,
+    });
   });
 
   // Lock main shell window against external navigation or popup windows.
@@ -451,7 +568,9 @@ async function createMainWindow(): Promise<void> {
     }
   });
 
-  const mgr = new TabManager(win, mirrorPreloadPath, handleGlobalShortcut, scheduleSessionSave);
+  const mgr = new TabManager(win, mirrorPreloadPath, handleGlobalShortcut, scheduleSessionSave, {
+    logger: diagLogger,
+  });
   tabManager = mgr;
   registerIpcHandlers(win, mgr);
 
@@ -462,9 +581,19 @@ async function createMainWindow(): Promise<void> {
   sessionRestored = true;
   mgr.telemetry.start();
 
-  const ctl = new ControlSocketServer(mgr);
+  const ctl = new ControlSocketServer(mgr, undefined, {
+    logger: diagLogger,
+    watchdog,
+    logPath: diagLogger?.logPath,
+    crashDumpsDir,
+    startedAtMs: BOOT_STARTED_AT_MS,
+  });
   ctlServer = ctl;
   const sockPath = await ctl.start();
+  diagLogger?.info('lifecycle.ready', {
+    socketPath: sockPath,
+    uptimeMs: Date.now() - BOOT_STARTED_AT_MS,
+  });
 
   if (isSmoke) {
     process.stdout.write(`IRON_BROWSER_READY ${sockPath}\n`);
@@ -472,49 +601,100 @@ async function createMainWindow(): Promise<void> {
     if (smokeExitArg) {
       const ms = Number(smokeExitArg.split('=')[1] ?? 500);
       setTimeout(() => {
-        app.quit();
+        requestQuitWithReason('smoke_exit_timer');
       }, Number.isFinite(ms) ? Math.max(100, ms) : 500);
     }
   }
 }
 
-app.whenReady().then(() => {
-  void createMainWindow().catch((err) => {
-    process.stderr.write(`IronBrowser startup error: ${String(err)}\n`);
-    app.exit(1);
+if (typeof app?.whenReady === 'function') {
+  process.on('uncaughtException', (err) => {
+    diagLogger?.fatal('process.uncaught_exception', {
+      error: err,
+      ...getPendingShutdownSummary(),
+    });
+    process.stderr.write(`IronBrowser uncaughtException: ${err?.stack ?? String(err)}\n`);
   });
-});
 
-app.on('window-all-closed', () => {
-  app.quit();
-});
+  process.on('unhandledRejection', (reason) => {
+    diagLogger?.error('process.unhandled_rejection', {
+      reason: reason instanceof Error ? reason : String(reason),
+      ...getPendingShutdownSummary(),
+    });
+    process.stderr.write(
+      `IronBrowser unhandledRejection: ${reason instanceof Error ? (reason.stack ?? reason.message) : String(reason)}\n`,
+    );
+  });
 
-let shuttingDown = false;
+  app.on('child-process-gone', (_ev, details) => {
+    diagLogger?.error('app.child_process_gone', {
+      type: details?.type ?? 'unknown',
+      reason: details?.reason ?? 'unknown',
+      exitCode: details?.exitCode ?? null,
+      serviceName: details?.serviceName ?? null,
+      name: details?.name ?? null,
+    });
+  });
 
-app.on('before-quit', () => {
-  if (shuttingDown) return;
-  shuttingDown = true;
-  flushSessionNow();
-  sessionFlushed = true;
-  ctlServer?.close();
-  tabManager?.dispose();
-});
+  app.whenReady().then(() => {
+    void createMainWindow().catch((err) => {
+      diagLogger?.fatal('lifecycle.startup_failed', { error: err });
+      process.stderr.write(`IronBrowser startup error: ${String(err)}\n`);
+      app.exit(1);
+    });
+  });
 
-function handleShutdownSignal(): void {
-  if (shuttingDown) return;
-  shuttingDown = true;
-  flushSessionNow();
-  sessionFlushed = true;
-  ctlServer?.close();
-  tabManager?.dispose();
-  if (mainWindow && !mainWindow.isDestroyed()) {
-    mainWindow.destroy();
-  }
-  app.quit();
-  setTimeout(() => {
-    app.exit(0);
-  }, 250).unref();
+  app.on('window-all-closed', () => {
+    if (quitReason === 'external_or_user_close') {
+      quitReason = 'window_all_closed';
+    }
+    diagLogger?.info('lifecycle.window_all_closed', { reason: quitReason });
+    app.quit();
+  });
+
+  let shuttingDown = false;
+
+  app.on('before-quit', () => {
+    if (shuttingDown) return;
+    shuttingDown = true;
+    const pending = getPendingShutdownSummary();
+    diagLogger?.info('lifecycle.before_quit', { reason: quitReason, ...pending });
+    watchdog?.notifyShutdown(quitReason, pending);
+    flushSessionNow();
+    sessionFlushed = true;
+    ctlServer?.close();
+    tabManager?.dispose();
+  });
+
+  app.on('will-quit', () => {
+    diagLogger?.info('lifecycle.will_quit', { reason: quitReason });
+  });
+
+  app.on('quit', (_ev, exitCode) => {
+    diagLogger?.info('lifecycle.quit', { reason: quitReason, exitCode });
+    watchdog?.stop();
+  });
+
+  const handleShutdownSignal = (sig: string): void => {
+    quitReason = `signal:${sig}`;
+    if (shuttingDown) return;
+    shuttingDown = true;
+    const pending = getPendingShutdownSummary();
+    diagLogger?.info('lifecycle.signal', { signal: sig, ...pending });
+    watchdog?.notifyShutdown(quitReason, pending);
+    flushSessionNow();
+    sessionFlushed = true;
+    ctlServer?.close();
+    tabManager?.dispose();
+    if (mainWindow && !mainWindow.isDestroyed()) {
+      mainWindow.destroy();
+    }
+    app.quit();
+    setTimeout(() => {
+      app.exit(0);
+    }, 250).unref();
+  };
+
+  process.once('SIGTERM', () => handleShutdownSignal('SIGTERM'));
+  process.once('SIGINT', () => handleShutdownSignal('SIGINT'));
 }
-
-process.once('SIGTERM', handleShutdownSignal);
-process.once('SIGINT', handleShutdownSignal);

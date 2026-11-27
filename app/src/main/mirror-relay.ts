@@ -78,7 +78,7 @@ export interface MirrorViewportLookup {
     pairedWebContents: WebContents | null;
     pairedScale: number;
   } | null;
-  onMirrorMiss?: (tabId: string, info: MirrorMissInfo) => void;
+  onMirrorMiss?: (tabId: string, info: MirrorMissInfo, sourceWcId?: number) => void;
   onGesture?: (tabId: string, role: ViewportRole, action: string) => void;
   getOrigin?: (wc: WebContents) => string | null;
   isMainFrame?: (wc: WebContents, frame: unknown) => boolean;
@@ -371,12 +371,16 @@ export class MirrorRelay {
       .slice(0, 32);
     const safeUrl =
       senderWc && !senderWc.isDestroyed() ? redactMirrorUrl(senderWc.getURL()) : undefined;
-    this.lookup.onMirrorMiss(tabId, {
-      reason,
-      targetLabel: sanitized || 'element',
-      timestamp: this.now(),
-      ...(safeUrl ? { url: safeUrl } : {}),
-    });
+    this.lookup.onMirrorMiss(
+      tabId,
+      {
+        reason,
+        targetLabel: sanitized || 'element',
+        timestamp: this.now(),
+        ...(safeUrl ? { url: safeUrl } : {}),
+      },
+      senderWc && !senderWc.isDestroyed() ? senderWc.id : undefined,
+    );
   }
 
   getGuard(tabId: string): EchoLoopGuard {
@@ -460,13 +464,37 @@ export class MirrorRelay {
     });
   }
 
+  private async sendDebuggerCommand(
+    wc: WebContents,
+    method: string,
+    params: Record<string, unknown>,
+  ): Promise<unknown> {
+    if (wc.isDestroyed() || !wc.debugger.isAttached()) {
+      throw new Error(`Debugger detached before ${method}`);
+    }
+    // Yield out of Electron's C++ WebContentsDebugger::DispatchProtocolMessage V8 MicrotasksScope
+    // after sendCommand resolves/rejects so follow-up CDP commands never re-entrantly mutate
+    // pending_requests_.
+    try {
+      return await wc.debugger.sendCommand(method, params);
+    } finally {
+      await new Promise<void>((resolve) => {
+        if (typeof setImmediate === 'function') {
+          setImmediate(resolve);
+        } else {
+          setTimeout(resolve, 0);
+        }
+      });
+    }
+  }
+
   private sendBoundedMouseMoved(
     wc: WebContents,
     params: Record<string, unknown>,
     timeoutMs = 150,
   ): Promise<'ok' | 'timeout' | 'error'> {
     let timer: ReturnType<typeof setTimeout> | null = null;
-    const cmdPromise = wc.debugger.sendCommand('Input.dispatchMouseEvent', params).then(
+    const cmdPromise = this.sendDebuggerCommand(wc, 'Input.dispatchMouseEvent', params).then(
       () => 'ok' as const,
       () => 'error' as const,
     );
@@ -508,7 +536,7 @@ export class MirrorRelay {
       });
       if (wc.isDestroyed()) return;
       try {
-        await wc.debugger.sendCommand('Input.dispatchMouseEvent', {
+        await this.sendDebuggerCommand(wc, 'Input.dispatchMouseEvent', {
           type: 'mousePressed',
           x,
           y,
@@ -516,7 +544,7 @@ export class MirrorRelay {
           clickCount: count,
           modifiers: modMask,
         });
-        await wc.debugger.sendCommand('Input.dispatchMouseEvent', {
+        await this.sendDebuggerCommand(wc, 'Input.dispatchMouseEvent', {
           type: 'mouseReleased',
           x,
           y,
@@ -570,7 +598,7 @@ export class MirrorRelay {
         }
       } else {
         try {
-          await wc.debugger.sendCommand('Input.dispatchMouseEvent', payload);
+          await this.sendDebuggerCommand(wc, 'Input.dispatchMouseEvent', payload);
           return;
         } catch {
           // Fallback below.
@@ -643,7 +671,7 @@ export class MirrorRelay {
     const clampedY = Math.max(-5000, Math.min(5000, deltaY));
     if (wc.debugger.isAttached()) {
       try {
-        await wc.debugger.sendCommand('Input.dispatchMouseEvent', {
+        await this.sendDebuggerCommand(wc, 'Input.dispatchMouseEvent', {
           type: 'mouseWheel',
           x,
           y,
@@ -669,6 +697,7 @@ export class MirrorRelay {
     wc: WebContents,
     rawKey: string,
     modifiers: readonly string[] = [],
+    rawCode?: string,
   ): Promise<void> {
     if (wc.isDestroyed()) return;
     const normalizedKey = rawKey === ' ' ? 'Space' : rawKey;
@@ -678,31 +707,42 @@ export class MirrorRelay {
     if (wc.debugger.isAttached()) {
       try {
         const key = spec ? spec.key : rawKey;
-        const code = spec
-          ? spec.code
-          : rawKey.length === 1 && /[a-zA-Z]/.test(rawKey)
-            ? `Key${rawKey.toUpperCase()}`
-            : rawKey;
+        const safeRawCode = typeof rawCode === 'string' && rawCode.trim().length > 0 ? rawCode.trim() : '';
+        const code =
+          safeRawCode ||
+          (spec
+            ? spec.code
+            : rawKey.length === 1 && /[a-zA-Z]/.test(rawKey)
+              ? `Key${rawKey.toUpperCase()}`
+              : rawKey.length === 1 && /[0-9]/.test(rawKey)
+                ? `Digit${rawKey}`
+                : rawKey);
         const vk = spec
           ? spec.vk
-          : rawKey.length === 1
+          : rawKey.length === 1 && /^[a-zA-Z0-9]$/.test(rawKey)
             ? rawKey.toUpperCase().charCodeAt(0)
             : 0;
         const commands =
           normalizedKey.toLowerCase() === 'a' && (modMask & 2) !== 0 ? ['selectAll'] : undefined;
         const isEnter = normalizedKey === 'Enter';
+        // Allow plain or Shift-modified single printable characters (modMask 0 or 8) to carry text.
+        const isPrintableSingle = !spec && rawKey.length === 1 && (modMask & ~8) === 0;
 
-        await wc.debugger.sendCommand('Input.dispatchKeyEvent', {
-          type: isEnter ? 'keyDown' : 'rawKeyDown',
+        await this.sendDebuggerCommand(wc, 'Input.dispatchKeyEvent', {
+          type: isEnter || isPrintableSingle ? 'keyDown' : 'rawKeyDown',
           key,
           code,
           windowsVirtualKeyCode: vk,
           nativeVirtualKeyCode: vk,
           modifiers: modMask,
-          ...(isEnter ? { text: '\r', unmodifiedText: '\r' } : {}),
+          ...(isEnter
+            ? { text: '\r', unmodifiedText: '\r' }
+            : isPrintableSingle
+              ? { text: rawKey, unmodifiedText: rawKey }
+              : {}),
           ...(commands ? { commands } : {}),
         });
-        await wc.debugger.sendCommand('Input.dispatchKeyEvent', {
+        await this.sendDebuggerCommand(wc, 'Input.dispatchKeyEvent', {
           type: 'keyUp',
           key,
           code,
@@ -719,9 +759,6 @@ export class MirrorRelay {
     const electronKey = normalizedKey === 'Space' ? 'Space' : rawKey;
     const mods = modifiersToElectron(modifiers);
     wc.sendInputEvent({ type: 'keyDown', keyCode: electronKey, modifiers: mods });
-    if (rawKey.length === 1 && mods.length === 0) {
-      wc.sendInputEvent({ type: 'char', keyCode: rawKey });
-    }
     wc.sendInputEvent({ type: 'keyUp', keyCode: electronKey, modifiers: mods });
   }
 
@@ -729,7 +766,7 @@ export class MirrorRelay {
     if (wc.isDestroyed() || text.length === 0) return;
     if (wc.debugger.isAttached()) {
       try {
-        await wc.debugger.sendCommand('Input.insertText', { text });
+        await this.sendDebuggerCommand(wc, 'Input.insertText', { text });
         return;
       } catch {
         // Fallback below.
@@ -891,6 +928,7 @@ export class MirrorRelay {
           'resolveTarget',
           {
             fingerprint: capture.fingerprint,
+            scrollIntoView: false,
             focusTarget: true,
           },
           1500,
@@ -901,7 +939,7 @@ export class MirrorRelay {
           this.emitMiss(tabId, capture.fingerprint, 'keydown:target-not-found', ctx?.senderWc);
           return;
         }
-        await this.dispatchTrustedKey(targetWc, capture.key, capture.modifiers);
+        await this.dispatchTrustedKey(targetWc, capture.key, capture.modifiers, capture.code);
         if (isActivationKey(capture.key)) {
           this.recentKeyActivations.set(tabId, {
             key: capture.key,

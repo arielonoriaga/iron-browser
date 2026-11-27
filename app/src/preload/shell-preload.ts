@@ -24,6 +24,12 @@ const api: IronShellApi = {
   toggleSessionMode: () => ipcRenderer.invoke('shell:toggle-session-mode'),
   setSessionMode: (mode) => ipcRenderer.invoke('shell:set-session-mode', { mode }),
   setPreset: (role, presetId) => ipcRenderer.invoke('shell:set-preset', { role, presetId }),
+  setEmulationProfile: (profile, viewport, tabId) =>
+    ipcRenderer.invoke('shell:set-emulation-profile', {
+      profile,
+      ...(viewport !== undefined ? { viewport } : {}),
+      ...(tabId !== undefined ? { tabId } : {}),
+    }),
   setRailCollapsed: (collapsed) => ipcRenderer.invoke('shell:set-rail-collapsed', { collapsed }),
   setDockOpen: (open) => ipcRenderer.invoke('shell:set-dock-open', { open }),
   setDockHeight: (height) => ipcRenderer.invoke('shell:set-dock-height', { height }),

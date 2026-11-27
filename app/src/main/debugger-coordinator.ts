@@ -194,9 +194,18 @@ export class DebuggerCoordinator {
       throw new Error(`Cannot send CDP command ${method}: debugger not attached`);
     }
 
+    const isElectronRuntime = Boolean(
+      typeof process !== 'undefined' && process.versions && process.versions.electron,
+    );
+    let result: T;
     try {
-      return (await wc.debugger.sendCommand(method, params)) as T;
+      result = (await wc.debugger.sendCommand(method, params)) as T;
     } catch (err) {
+      if (isElectronRuntime) {
+        // Yield out of Electron's C++ WebContentsDebugger::DispatchProtocolMessage V8 MicrotasksScope
+        // before any caller issues a follow-up sendCommand/detach that could mutate pending_requests_.
+        await new Promise<void>((resolve) => setImmediate(resolve));
+      }
       const entry = this.entries.get(wc.id);
       if (entry && !wc.isDestroyed() && !this.isAttached(wc)) {
         entry.detachEpoch += 1;
@@ -205,6 +214,11 @@ export class DebuggerCoordinator {
       const msg = err instanceof Error ? err.message : String(err);
       throw new Error(`CDP command ${method} failed: ${msg}`);
     }
+    if (isElectronRuntime) {
+      // Break synchronous Promise microtask re-entrancy into WebContentsDebugger::pending_requests_.
+      await new Promise<void>((resolve) => setImmediate(resolve));
+    }
+    return result;
   }
 
   async reattachAndRestore(

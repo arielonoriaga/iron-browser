@@ -126,10 +126,12 @@ class FakeWebContents extends EventEmitter implements DebuggerTarget {
 }
 
 async function flushMicrotasks(rounds = 10): Promise<void> {
-  for (let i = 0; i < rounds; i += 1) {
-    await Promise.resolve();
+  for (let m = 0; m < 6; m += 1) {
+    for (let i = 0; i < rounds; i += 1) {
+      await Promise.resolve();
+    }
+    await new Promise<void>((resolve) => setImmediate(resolve));
   }
-  await new Promise<void>((resolve) => setImmediate(resolve));
 }
 
 function emitRequestPaused(

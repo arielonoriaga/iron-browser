@@ -3,6 +3,7 @@ import type {
   ConsoleEntry,
   FrameStats,
   NetworkEntry,
+  TabEmulationSummary,
   TelemetrySnapshot,
   ViewportMetrics,
   ViewportRole,
@@ -20,6 +21,7 @@ export interface ActiveTabTarget {
   tabId: string;
   portraitWc: WebContents | null;
   landscapeWc: WebContents | null;
+  emulation?: TabEmulationSummary | null;
 }
 
 export interface TelemetryServiceOptions {
@@ -704,6 +706,7 @@ export class TelemetryService {
       consoleErrorCount,
       failedNetworkCount,
       paused: this.paused,
+      emulation: target?.emulation ?? null,
     };
 
     this.lastSnapshot = snapshot;

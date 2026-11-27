@@ -3,6 +3,48 @@ export type ViewMode = 'single' | 'dual';
 export type SessionMode = 'shared' | 'isolated';
 export type ThemeMode = 'dark' | 'light';
 
+export type NetworkConditionPreset = 'none' | 'fast-4g' | 'slow-4g' | '3g' | 'offline';
+export type EmulationProfileId = 'none' | 'sunmi-v2-pro' | 'low-end-android' | 'custom';
+
+export interface NetworkEmulationConfig {
+  preset: NetworkConditionPreset | 'custom';
+  offline: boolean;
+  latencyMs: number;
+  downloadBytesPerSec: number;
+  uploadBytesPerSec: number;
+}
+
+export interface CalibrationResult {
+  hostScore: number;
+  targetScore: number;
+  chosenRate: number;
+  resultingScore: number;
+  measuredAtMs: number;
+}
+
+export interface ViewportEmulationState {
+  active: boolean;
+  profile: EmulationProfileId;
+  cpuRate: number;
+  network: NetworkEmulationConfig;
+  presetId: string | null;
+  userAgent: string | null;
+  hardwareConcurrency: number | null;
+  deviceMemory: number | null;
+  reducedMotion: boolean;
+  saveData: boolean;
+  targetScore: number | null;
+  lastCalibration: CalibrationResult | null;
+}
+
+export interface TabEmulationSummary {
+  active: boolean;
+  profile: EmulationProfileId;
+  label: string;
+  portrait: ViewportEmulationState;
+  landscape: ViewportEmulationState;
+}
+
 export interface DevicePreset {
   id: string;
   label: string;
@@ -104,6 +146,7 @@ export interface TabSnapshot {
   audioSource: ViewportRole | 'muted';
   dedupCount: number;
   viewportReport?: Partial<Record<ViewportRole, ViewportSizingSummary>>;
+  emulation?: TabEmulationSummary;
 }
 
 export interface HistoryEntry {
@@ -248,6 +291,7 @@ export interface TelemetrySnapshot {
   failedNetworkCount: number;
   paused: boolean;
   mirrorMiss?: MirrorMissInfo | null;
+  emulation?: TabEmulationSummary | null;
 }
 
 export interface IronShellApi {
@@ -266,6 +310,11 @@ export interface IronShellApi {
   toggleSessionMode(): Promise<ShellState>;
   setSessionMode(mode: SessionMode): Promise<ShellState>;
   setPreset(role: ViewportRole, presetId: string): Promise<ShellState>;
+  setEmulationProfile(
+    profile: 'none' | 'sunmi-v2-pro' | 'low-end-android',
+    viewport?: ViewportRole | 'both',
+    tabId?: string,
+  ): Promise<ShellState>;
   setRailCollapsed(collapsed: boolean): Promise<ShellState>;
   setDockOpen(open: boolean): Promise<ShellState>;
   setDockHeight(height: number): Promise<ShellState>;

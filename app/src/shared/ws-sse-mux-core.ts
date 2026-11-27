@@ -60,6 +60,7 @@ export type MuxToMainMessage =
       lastEventId: string;
     }
   | { type: 'upstream-sse-error'; clientSocketId: string; fatal: boolean; retryMs?: number }
+  | { type: 'upstream-sse-bypass'; clientSocketId: string }
   | { type: 'ss-hello'; clientSocketId: string }
   | {
       type: 'ss-mut';
@@ -1373,16 +1374,27 @@ function startOwnerEventSource(state) {
 
   var ctrl = typeof NativeAbortController === 'function' ? new NativeAbortController() : null;
   state.abortCtrl = ctrl;
+  var pageOrigin = '';
+  try {
+    var baseParsed = new NativeURL(getBaseHref());
+    pageOrigin = String((urlOriginGet ? urlOriginGet(baseParsed) : baseParsed.origin) || '');
+  } catch (_) {}
+  var isSameOriginSse = Boolean(pageOrigin && state.origin && pageOrigin === state.origin);
+
+  // IMPORTANT: Omit non-safelisted cache-control / cross-origin last-event-id request headers on JS fetch —
+  // only CORS-safelisted headers (like Accept) avoid triggering an OPTIONS preflight that standard SSE
+  // servers reject with net::ERR_FAILED. Using cache: 'no-store' keeps cross-origin GET a simple CORS
+  // request identical to NativeEventSource while still streaming custom event: frames to both viewports.
   var reqHeaders = {
-    'Accept': 'text/event-stream',
-    'Cache-Control': 'no-cache'
+    'Accept': 'text/event-stream'
   };
-  if (state.lastEventId) {
+  if (state.lastEventId && isSameOriginSse) {
     reqHeaders['Last-Event-ID'] = state.lastEventId;
   }
   var fetchOpts = {
     method: 'GET',
     headers: reqHeaders,
+    mode: 'cors',
     credentials: state.withCredentials ? 'include' : 'same-origin',
     cache: 'no-store'
   };
@@ -1390,8 +1402,20 @@ function startOwnerEventSource(state) {
     fetchOpts.signal = abortCtrlSignalGet ? abortCtrlSignalGet(ctrl) : ctrl.signal;
   }
 
+  function fallbackCrossOriginToBypass() {
+    if (state.closed || state.role !== 'owner' || state.sseGen !== myGen) return;
+    state.abortCtrl = null;
+    sendToMain({ type: 'upstream-sse-bypass', clientSocketId: state.id });
+    wireBypassEventSource(state);
+  }
+
   function scheduleOwnerReconnect() {
     if (state.closed || state.role !== 'owner' || state.sseGen !== myGen) return;
+    if (!isSameOriginSse && state.lastEventId) {
+      // Cross-origin reconnect with non-empty Last-Event-ID requires browser-native CORS-exempt header support.
+      fallbackCrossOriginToBypass();
+      return;
+    }
     state.readyState = 0;
     sendToMain({
       type: 'upstream-sse-error',
@@ -1438,6 +1462,7 @@ function startOwnerEventSource(state) {
         return;
       }
 
+      state.everOpened = true;
       state.readyState = 1;
       sendToMain({ type: 'upstream-sse-open', clientSocketId: state.id });
       dispatchTargetEvent(state.wrapper, state, makeEvent('open'));
@@ -1506,6 +1531,10 @@ function startOwnerEventSource(state) {
     },
     function () {
       if (!state.closed && state.role === 'owner' && state.sseGen === myGen) {
+        if (!isSameOriginSse && !state.everOpened) {
+          fallbackCrossOriginToBypass();
+          return;
+        }
         scheduleOwnerReconnect();
       }
     }
@@ -2360,6 +2389,7 @@ if (typeof NativeEventSource === 'function') {
       bypassed: false,
       nativeEs: null,
       bypassListeners: new NativeMap(),
+      everOpened: false,
       readyState: 0,
       closed: false,
       lastEventId: '',

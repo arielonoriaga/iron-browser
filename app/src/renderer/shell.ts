@@ -7,6 +7,7 @@ import type {
   MirrorMissInfo,
   Rect,
   ShellState,
+  TabEmulationSummary,
   TelemetrySnapshot,
 } from '../shared/types';
 
@@ -87,6 +88,8 @@ let mDomEl!: HTMLElement;
 let mDedupEl!: HTMLElement;
 let sparklineLineEl: SVGPolylineElement | null = null;
 
+let pillEmulationEl!: HTMLButtonElement;
+let emuPillLabelEl!: HTMLElement;
 let pillMirrorMissEl!: HTMLButtonElement;
 let mirrorMissLabelEl!: HTMLElement;
 let pillConsoleEl!: HTMLButtonElement;
@@ -156,6 +159,8 @@ function bindDomElements(doc: Document): void {
   mDedupEl = $<HTMLElement>(doc, 'm-dedup');
   sparklineLineEl = doc.getElementById('sparkline-line') as SVGPolylineElement | null;
 
+  pillEmulationEl = $<HTMLButtonElement>(doc, 'pill-emulation');
+  emuPillLabelEl = $<HTMLElement>(doc, 'emu-pill-label');
   pillMirrorMissEl = $<HTMLButtonElement>(doc, 'pill-mirror-miss');
   mirrorMissLabelEl = $<HTMLElement>(doc, 'mirror-miss-label');
   pillConsoleEl = $<HTMLButtonElement>(doc, 'pill-console');
@@ -179,6 +184,28 @@ function applyRect(el: HTMLElement, rect: Rect | null): void {
   el.style.height = `${rect.height}px`;
 }
 
+const EMU_MENU_OPTIONS: ReadonlyArray<{
+  value: string;
+  profile: 'sunmi-v2-pro' | 'low-end-android' | 'none';
+  label: string;
+}> = [
+  {
+    value: 'emu:sunmi-v2-pro',
+    profile: 'sunmi-v2-pro',
+    label: 'Throttle: Sunmi V2 Pro (6× · slow-4g)',
+  },
+  {
+    value: 'emu:low-end-android',
+    profile: 'low-end-android',
+    label: 'Throttle: Low-End Android (4× · fast-4g)',
+  },
+  {
+    value: 'emu:none',
+    profile: 'none',
+    label: 'Throttle: Off (Reset)',
+  },
+];
+
 function populatePresets(): void {
   const doc = docRef ?? document;
   selectPortraitEl.innerHTML = '';
@@ -193,6 +220,18 @@ function populatePresets(): void {
     optL.value = preset.id;
     optL.textContent = preset.label;
     selectLandscapeEl.appendChild(optL);
+  }
+
+  for (const selectEl of [selectPortraitEl, selectLandscapeEl]) {
+    const group = doc.createElement('optgroup');
+    group.setAttribute('label', 'Slow-Device Emulation');
+    for (const item of EMU_MENU_OPTIONS) {
+      const opt = doc.createElement('option');
+      opt.value = item.value;
+      opt.textContent = item.label;
+      group.appendChild(opt);
+    }
+    selectEl.appendChild(group);
   }
 }
 
@@ -217,6 +256,19 @@ function renderLayout(state: ShellState): void {
   applyRect(landscapeHeaderEl, layout.landscapeHeader);
   applyRect(telemetryBarEl, layout.telemetryBar);
   applyRect(devtoolsHeaderEl, layout.devtoolsHeader);
+}
+
+export function renderEmulationPill(emulation: TabEmulationSummary | null | undefined): void {
+  if (!emulation || !emulation.active) {
+    emuPillLabelEl.textContent = '';
+    pillEmulationEl.classList.add('hidden');
+    pillEmulationEl.disabled = true;
+    return;
+  }
+  const cleanLabel = sanitizeMirrorMissLabel(emulation.label || emulation.profile, 40);
+  emuPillLabelEl.textContent = cleanLabel || 'Active';
+  pillEmulationEl.classList.remove('hidden');
+  pillEmulationEl.disabled = false;
 }
 
 export function renderMirrorMiss(miss: MirrorMissInfo | null | undefined): void {
@@ -312,6 +364,7 @@ export function renderState(state: ShellState): void {
   lblAutoSleepEl.textContent = state.autoSleep ? 'Auto-Sleep On' : 'Auto-Sleep';
 
   btnDockToggleEl.classList.toggle('active', state.dockOpen);
+  renderEmulationPill(active?.emulation);
   renderMirrorMiss(state.mirrorMiss);
 
   // Render vertical tab list
@@ -496,6 +549,9 @@ export function renderTelemetry(snap: TelemetrySnapshot): void {
   errNetworkCountEl.textContent = String(snap.failedNetworkCount);
   pillNetworkEl.classList.toggle('has-errors', snap.failedNetworkCount > 0);
 
+  if (snap.emulation !== undefined) {
+    renderEmulationPill(snap.emulation);
+  }
   if (snap.mirrorMiss !== undefined) {
     renderMirrorMiss(snap.mirrorMiss);
   }
@@ -547,11 +603,35 @@ function wireEvents(): void {
   });
   btnNewTabEl.addEventListener('click', () => void getApi().newTab().then(renderState));
 
+  const handlePresetOrProfileSelect = (
+    role: 'portrait' | 'landscape',
+    selectEl: HTMLSelectElement,
+  ) => {
+    const val = selectEl.value;
+    if (val.startsWith('emu:')) {
+      const st = currentState;
+      const active = st?.tabs.find((t) => t.id === st.activeTabId) ?? st?.tabs[0];
+      if (active) {
+        selectEl.value = role === 'portrait' ? active.portraitPresetId : active.landscapePresetId;
+      }
+      const rawProfile = val.slice(4);
+      if (
+        rawProfile === 'sunmi-v2-pro' ||
+        rawProfile === 'low-end-android' ||
+        rawProfile === 'none'
+      ) {
+        void getApi().setEmulationProfile(rawProfile, 'both').then(renderState);
+      }
+      return;
+    }
+    void getApi().setPreset(role, val).then(renderState);
+  };
+
   selectPortraitEl.addEventListener('change', () => {
-    void getApi().setPreset('portrait', selectPortraitEl.value).then(renderState);
+    handlePresetOrProfileSelect('portrait', selectPortraitEl);
   });
   selectLandscapeEl.addEventListener('change', () => {
-    void getApi().setPreset('landscape', selectLandscapeEl.value).then(renderState);
+    handlePresetOrProfileSelect('landscape', selectLandscapeEl);
   });
   btnAudioPortraitEl.addEventListener('click', () => {
     void getApi().toggleAudio('portrait').then(renderState);
@@ -560,6 +640,9 @@ function wireEvents(): void {
     void getApi().toggleAudio('landscape').then(renderState);
   });
 
+  pillEmulationEl.addEventListener('click', () => {
+    void getApi().setEmulationProfile('none', 'both').then(renderState);
+  });
   pillMirrorMissEl.addEventListener('click', () => {
     void getApi().copyMirrorMissDebug();
   });

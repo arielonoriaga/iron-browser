@@ -11,6 +11,7 @@ import {
 } from 'electron';
 import path from 'node:path';
 import { pathToFileURL } from 'node:url';
+import type { StructuredLogger } from './diagnostics';
 import { clamp, computeFitScale, computeLayout } from '../shared/layout';
 import { truncateUtf8 } from '../shared/frame';
 import {
@@ -26,9 +27,11 @@ import {
   DEFAULT_LANDSCAPE_PRESET_ID,
   DEFAULT_PORTRAIT_PRESET_ID,
   DEVICE_PRESETS,
+  findPreset,
   getPresetOrDefault,
 } from '../shared/presets';
 import type {
+  CalibrationResult,
   ElementFingerprint,
   HistoryEntry,
   LayoutResult,
@@ -36,6 +39,7 @@ import type {
   ScreenshotStageError,
   SessionMode,
   ShellState,
+  TabEmulationSummary,
   TabSnapshot,
   TelemetrySnapshot,
   ThemeMode,
@@ -87,6 +91,7 @@ import {
   type PersistedTab,
   type PersistedWindowBounds,
 } from '../shared/session-store';
+import { CpuProfilerManager } from './cpu-profiler';
 import { DebuggerCoordinator } from './debugger-coordinator';
 import { MirrorRelay, type MirrorViewportLookup } from './mirror-relay';
 import { RequestDedupMiddleware, type DedupViewportContext } from './request-dedup';
@@ -98,6 +103,11 @@ import {
   type QueryBusFilter,
   type QueryBusResult,
 } from './tab-event-bus';
+import {
+  SlowDeviceEmulationManager,
+  type CustomNetworkInput,
+  type EmulateViewportInput,
+} from './slow-device-emulation';
 import { WsSseMux, type WsMuxViewportContext } from './ws-sse-mux';
 
 interface LaunchRedirectConvergence {
@@ -162,6 +172,22 @@ export interface TabManagerOptions {
   autoSleepAfterMs?: number;
   autoSleepCheckMs?: number;
   inspectTimeoutMs?: number;
+  logger?: StructuredLogger | null;
+}
+
+export interface ViewportRendererHealth {
+  tabId: string;
+  viewport: ViewportRole;
+  wcId: number;
+  osProcessId: number | null;
+  url: string;
+  isLoading: boolean;
+  crashed: boolean;
+  unresponsive: boolean;
+  lastGoneReason: string | null;
+  lastGoneExitCode: number | null;
+  lastUnresponsiveAtMs: number | null;
+  emulationActive: boolean;
 }
 
 const NAV_MIRROR_SUPPRESS_MS = 3500;
@@ -238,6 +264,7 @@ export class TabManager implements MirrorViewportLookup {
   >();
   private readonly pendingReloads = new Map<string, Promise<void>>();
   private readonly pendingInPageSyncTimers = new Map<string, ReturnType<typeof setTimeout>>();
+  private readonly routeReconcileCooldowns = new Map<string, number>();
   private readonly beforeReloadHooks = new Set<(tabId: string) => void>();
   private readonly observedViewports = new Map<
     number,
@@ -260,10 +287,23 @@ export class TabManager implements MirrorViewportLookup {
   private readonly autoSleepAfterMs: number;
   private readonly autoSleepCheckMs: number;
   private readonly inspectTimeoutMs: number;
+  private readonly logger: StructuredLogger | null;
+  private readonly rendererHealthByWcId = new Map<
+    number,
+    {
+      unresponsive: boolean;
+      crashed: boolean;
+      lastGoneReason: string | null;
+      lastGoneExitCode: number | null;
+      lastUnresponsiveAtMs: number | null;
+    }
+  >();
   private autoSleepTimer: ReturnType<typeof setInterval> | null = null;
 
   public readonly tabEventBus: TabEventBus;
   public readonly debuggerCoordinator: DebuggerCoordinator;
+  public readonly slowDeviceEmulation: SlowDeviceEmulationManager;
+  public readonly cpuProfiler: CpuProfilerManager;
   public readonly mirrorRelay: MirrorRelay;
   public readonly requestDedup: RequestDedupMiddleware<WebContents>;
   public readonly wsSseMux: WsSseMux;
@@ -279,9 +319,14 @@ export class TabManager implements MirrorViewportLookup {
     this.autoSleepAfterMs = opts.autoSleepAfterMs ?? DEFAULT_AUTO_SLEEP_AFTER_MS;
     this.autoSleepCheckMs = opts.autoSleepCheckMs ?? DEFAULT_AUTO_SLEEP_CHECK_MS;
     this.inspectTimeoutMs = opts.inspectTimeoutMs ?? DEFAULT_INSPECT_TIMEOUT_MS;
+    this.logger = opts.logger ?? null;
 
     this.tabEventBus = new TabEventBus();
     this.debuggerCoordinator = new DebuggerCoordinator();
+    this.slowDeviceEmulation = new SlowDeviceEmulationManager(this.debuggerCoordinator);
+    this.cpuProfiler = new CpuProfilerManager(this.debuggerCoordinator, () =>
+      this.getProfilesDir(),
+    );
     this.mirrorRelay = new MirrorRelay(this);
     this.requestDedup = new RequestDedupMiddleware(this.debuggerCoordinator, {
       resolveViewportContext: (wcId) => this.resolveDedupContext(wcId),
@@ -332,12 +377,14 @@ export class TabManager implements MirrorViewportLookup {
             active.landscapeView && !active.landscapeView.webContents.isDestroyed()
               ? active.landscapeView.webContents
               : null,
+          emulation: this.slowDeviceEmulation.getTabSummary(active.id),
         };
       },
       (wcId) => this.findWebContentsById(wcId) !== null,
       (snapshot) => {
         const active = this.getActiveTab();
         snapshot.mirrorMiss = active ? (this.mirrorMissByTab.get(active.id) ?? null) : null;
+        snapshot.emulation = active ? this.slowDeviceEmulation.getTabSummary(active.id) : null;
         this.latestTelemetry = snapshot;
         if (!this.win.isDestroyed()) {
           this.win.webContents.send('shell:telemetry', snapshot);
@@ -530,6 +577,14 @@ export class TabManager implements MirrorViewportLookup {
 
   private resetSpaSyncChain(tab: ManagedTab): void {
     tab.spaSyncChain = { count: 0, lastTs: 0 };
+  }
+
+  private clearTabReconcileCooldowns(tabId: string): void {
+    for (const k of Array.from(this.routeReconcileCooldowns.keys())) {
+      if (k.startsWith(`spa:${tabId}:`) || k.startsWith(`miss:${tabId}:`)) {
+        this.routeReconcileCooldowns.delete(k);
+      }
+    }
   }
 
   private ensureSessionDownloadHandler(sess: Session | undefined | null): void {
@@ -817,6 +872,81 @@ export class TabManager implements MirrorViewportLookup {
     wc.once('destroyed', () => {
       this.primedWcIds.delete(wc.id);
       this.pendingSurfacePrimes.delete(wc.id);
+      this.rendererHealthByWcId.delete(wc.id);
+    });
+
+    this.rendererHealthByWcId.set(wc.id, {
+      unresponsive: false,
+      crashed: false,
+      lastGoneReason: null,
+      lastGoneExitCode: null,
+      lastUnresponsiveAtMs: null,
+    });
+
+    wc.on('unresponsive', () => {
+      const h = this.rendererHealthByWcId.get(wc.id);
+      if (h) {
+        h.unresponsive = true;
+        h.lastUnresponsiveAtMs = Date.now();
+      }
+      const curUrl = !wc.isDestroyed() ? wc.getURL() : '';
+      this.logger?.warn('viewport.unresponsive', {
+        tabId,
+        viewport: role,
+        wcId: wc.id,
+        url: curUrl,
+      });
+      this.tabEventBus.publish({
+        tabId,
+        viewport: role,
+        domain: 'lifecycle',
+        kind: 'renderer_unresponsive',
+        summary: `${role} renderer unresponsive`,
+      });
+    });
+
+    wc.on('responsive', () => {
+      const h = this.rendererHealthByWcId.get(wc.id);
+      if (h) {
+        h.unresponsive = false;
+      }
+      this.logger?.info('viewport.responsive', {
+        tabId,
+        viewport: role,
+        wcId: wc.id,
+      });
+      this.tabEventBus.publish({
+        tabId,
+        viewport: role,
+        domain: 'lifecycle',
+        kind: 'renderer_responsive',
+        summary: `${role} renderer responsive`,
+      });
+    });
+
+    wc.on('render-process-gone', (_ev, details: { reason?: string; exitCode?: number }) => {
+      const h = this.rendererHealthByWcId.get(wc.id);
+      if (h) {
+        h.crashed = details?.reason !== 'clean-exit';
+        h.lastGoneReason = details?.reason ?? 'unknown';
+        h.lastGoneExitCode = typeof details?.exitCode === 'number' ? details.exitCode : null;
+      }
+      const curUrl = !wc.isDestroyed() ? wc.getURL() : '';
+      this.logger?.error('viewport.render_process_gone', {
+        tabId,
+        viewport: role,
+        wcId: wc.id,
+        reason: details?.reason ?? 'unknown',
+        exitCode: details?.exitCode ?? null,
+        url: curUrl,
+      });
+      this.tabEventBus.publish({
+        tabId,
+        viewport: role,
+        domain: 'lifecycle',
+        kind: 'render_process_gone',
+        summary: `${role} render-process-gone (${details?.reason ?? 'unknown'})`,
+      });
     });
 
     wc.on('did-stop-loading', () => {
@@ -858,6 +988,13 @@ export class TabManager implements MirrorViewportLookup {
               : undefined;
           this.history = recordHistoryEntry(this.history, navUrl, commitTitle);
         }
+      } else if (
+        role === 'portrait' &&
+        tab.mode === 'dual' &&
+        navUrl === tab.url
+      ) {
+        // Portrait converged onto the active landscape URL (e.g. after route reconciliation); clear stale miss.
+        this.clearTabMirrorMiss(tab.id);
       }
       this.emitState();
 
@@ -1002,6 +1139,9 @@ export class TabManager implements MirrorViewportLookup {
           targetOrigin === curOrigin &&
           typeof targetWc.executeJavaScript === 'function'
         ) {
+          const beforeTargetUrl = targetWc.getURL();
+          const ssAgeAtSyncMs =
+            nowTimer - this.tabEventBus.getLastSessionStorageWriteMs(freshTab.id);
           void (async () => {
             const guard = this.mirrorRelay.getGuard(freshTab.id);
             guard.beginReplaying(pairedRole);
@@ -1044,7 +1184,7 @@ export class TabManager implements MirrorViewportLookup {
                   true,
                 ),
               );
-              await new Promise<void>((r) => setImmediate(r));
+              await new Promise<void>((r) => setTimeout(r, 0));
             } catch {
               transitioned = false;
             } finally {
@@ -1062,6 +1202,52 @@ export class TabManager implements MirrorViewportLookup {
               !this.pendingInPageSyncTimers.has(tabId)
             ) {
               this.loadViewportUrl(targetWc, targetUrl);
+              return;
+            }
+
+            // Defense-in-depth for SPAs that cache `sessionStorage` auth tokens in memory only on boot
+            // (e.g. SolidJS/React module-level JWT signals on PIN unlock): ONLY when `sessionStorage` was
+            // written immediately alongside this route transition (<= 1500ms) AND after 400ms (allowing
+            // async delegated routers like SvelteKit/Next.js to settle without interference) the paired
+            // viewport is still bounced right back to `beforeTargetUrl`, reload it once to hydrate auth.
+            if (
+              transitioned &&
+              freshTab.session === 'shared' &&
+              ssAgeAtSyncMs >= 0 &&
+              ssAgeAtSyncMs <= 1500
+            ) {
+              await new Promise<void>((r) => setTimeout(r, 400));
+              if (
+                !this.disposed &&
+                !targetWc.isDestroyed() &&
+                !wc.isDestroyed() &&
+                freshTab.mode === 'dual' &&
+                freshTab.mirror &&
+                freshTab.session === 'shared' &&
+                !freshTab.sleeping &&
+                wc.getURL() === targetUrl &&
+                targetWc.getURL() === beforeTargetUrl &&
+                targetWc.getURL() !== targetUrl &&
+                !this.wcLoadStates.has(targetWc.id) &&
+                !this.pendingReloads.has(tabId) &&
+                !this.pendingInPageSyncTimers.has(tabId)
+              ) {
+                const nowReconcile = Date.now();
+                const reconcileKey = `spa:${freshTab.id}:${pairedRole}:${targetUrl}`;
+                if (nowReconcile - (this.routeReconcileCooldowns.get(reconcileKey) ?? 0) > 8_000) {
+                  this.routeReconcileCooldowns.set(reconcileKey, nowReconcile);
+                  freshTab.navSuppressUntil[pairedRole] = nowReconcile + NAV_MIRROR_SUPPRESS_MS;
+                  freshTab.navSuppressUrl[pairedRole] = targetUrl;
+                  this.tabEventBus.publish({
+                    tabId: freshTab.id,
+                    viewport: pairedRole,
+                    domain: 'navigation',
+                    kind: 'spa_auth_reconcile',
+                    summary: targetUrl,
+                  });
+                  this.loadViewportUrl(targetWc, targetUrl);
+                }
+              }
             }
           })();
           return;
@@ -1108,10 +1294,21 @@ export class TabManager implements MirrorViewportLookup {
         try {
           await Promise.race([
             (async () => {
+              const slowState = this.slowDeviceEmulation.getViewportState(tab.id, role);
+              const singlePreset =
+                !isPortrait && tab.mode === 'single' && slowState.presetId
+                  ? findPreset(slowState.presetId)
+                  : undefined;
+
+              const enableTouch = isPortrait
+                ? true
+                : singlePreset
+                  ? singlePreset.touch
+                  : false;
               await this.debuggerCoordinator.sendCommand(
                 wc,
                 'Emulation.setTouchEmulationEnabled',
-                isPortrait ? { enabled: true, maxTouchPoints: 5 } : { enabled: false },
+                enableTouch ? { enabled: true, maxTouchPoints: 5 } : { enabled: false },
               );
 
               if (isPortrait) {
@@ -1120,7 +1317,7 @@ export class TabManager implements MirrorViewportLookup {
                   size.dpr,
                   scale,
                   this.getHostScaleFactor(),
-                  this.ecoMode,
+                  this.ecoMode && !slowState.active,
                 );
                 wc.setZoomFactor(1);
                 await this.debuggerCoordinator.sendCommand(wc, 'Emulation.setDeviceMetricsOverride', {
@@ -1146,11 +1343,40 @@ export class TabManager implements MirrorViewportLookup {
                   screenWidth: size.width,
                   screenHeight: size.height,
                 });
+              } else if (singlePreset) {
+                const singleScale =
+                  bounds.width > 0 && bounds.height > 0
+                    ? computeFitScale(
+                        bounds.width,
+                        bounds.height,
+                        singlePreset.width,
+                        singlePreset.height,
+                      )
+                    : 1;
+                const effectiveSingleDpr = computeEffectiveDpr(
+                  singlePreset.dpr,
+                  singleScale,
+                  this.getHostScaleFactor(),
+                  this.ecoMode && !slowState.active,
+                );
+                tab.landscapeScale = singleScale;
+                wc.setZoomFactor(1);
+                await this.debuggerCoordinator.sendCommand(wc, 'Emulation.setDeviceMetricsOverride', {
+                  width: singlePreset.width,
+                  height: singlePreset.height,
+                  deviceScaleFactor: effectiveSingleDpr,
+                  mobile: singlePreset.category === 'portrait',
+                  scale: singleScale,
+                  screenWidth: singlePreset.width,
+                  screenHeight: singlePreset.height,
+                });
               } else {
                 tab.landscapeScale = 1;
                 wc.setZoomFactor(1);
                 await this.debuggerCoordinator.sendCommand(wc, 'Emulation.clearDeviceMetricsOverride');
               }
+
+              await this.slowDeviceEmulation.syncViewport(tab.id, role, wc);
             })(),
             new Promise<void>((resolve) => {
               emuTimer = setTimeout(resolve, 1200);
@@ -1344,7 +1570,7 @@ export class TabManager implements MirrorViewportLookup {
     this.tabEventBus.beginGesture(tabId, role, action);
   }
 
-  onMirrorMiss(tabId: string, info: MirrorMissInfo): void {
+  onMirrorMiss(tabId: string, info: MirrorMissInfo, sourceWcId?: number): void {
     const tab = this.getTab(tabId);
     if (!tab) return;
     this.mirrorMissByTab.set(tabId, info);
@@ -1362,12 +1588,68 @@ export class TabManager implements MirrorViewportLookup {
         this.win.webContents.send('shell:telemetry', this.latestTelemetry);
       }
     }
+
+    // Post-miss state & route reconciliation: if an interactive element is missing in the paired
+    // viewport AND the two viewports have diverged onto different same-origin routes (e.g. one
+    // viewport unlocked past `/login` onto `/pos/cart` while the other stayed on `/login`),
+    // converge the lagging viewport onto the source viewport's URL once per route pair.
+    if (sourceWcId !== undefined && info.reason.endsWith(':target-not-found')) {
+      const hit = this.findTabAndRoleByWcId(sourceWcId);
+      if (
+        hit &&
+        hit.tab.id === tabId &&
+        hit.tab.mode === 'dual' &&
+        hit.tab.mirror &&
+        hit.tab.session === 'shared' &&
+        !hit.tab.sleeping &&
+        hit.pairedWc &&
+        !hit.pairedWc.isDestroyed() &&
+        !hit.wc.isDestroyed() &&
+        !hit.wc.isLoading() &&
+        !hit.pairedWc.isLoading() &&
+        !this.wcLoadStates.has(hit.wc.id) &&
+        !this.wcLoadStates.has(hit.pairedWc.id) &&
+        !this.pendingReloads.has(tabId)
+      ) {
+        const sourceUrl = hit.wc.getURL();
+        const pairedUrl = hit.pairedWc.getURL();
+        const sourceOrigin = parseHttpOrigin(sourceUrl);
+        const pairedOrigin = parseHttpOrigin(pairedUrl);
+        if (sourceOrigin && sourceOrigin === pairedOrigin) {
+          try {
+            const sourceParsed = new URL(sourceUrl);
+            const pairedParsed = new URL(pairedUrl);
+            if (sourceParsed.pathname !== pairedParsed.pathname) {
+              const pairedRole: ViewportRole = hit.role === 'portrait' ? 'landscape' : 'portrait';
+              const now = Date.now();
+              const routeKey = `miss:${tabId}:${pairedRole}:${sourceParsed.pathname}->${pairedParsed.pathname}`;
+              if (now - (this.routeReconcileCooldowns.get(routeKey) ?? 0) > 60_000) {
+                this.routeReconcileCooldowns.set(routeKey, now);
+                hit.tab.navSuppressUntil[pairedRole] = now + NAV_MIRROR_SUPPRESS_MS;
+                hit.tab.navSuppressUrl[pairedRole] = sourceUrl;
+                this.tabEventBus.publish({
+                  tabId,
+                  viewport: pairedRole,
+                  domain: 'navigation',
+                  kind: 'miss_reconcile',
+                  summary: sourceUrl,
+                });
+                this.loadViewportUrl(hit.pairedWc, sourceUrl);
+              }
+            }
+          } catch {
+            // Ignore malformed URLs.
+          }
+        }
+      }
+    }
   }
 
   getTelemetrySnapshot(): TelemetrySnapshot | null {
     const base = this.latestTelemetry ?? this.telemetry.getLatestSnapshot();
     const active = this.getActiveTab();
     base.mirrorMiss = active ? (this.mirrorMissByTab.get(active.id) ?? null) : null;
+    base.emulation = active ? this.slowDeviceEmulation.getTabSummary(active.id) : null;
     return base;
   }
 
@@ -1562,6 +1844,9 @@ export class TabManager implements MirrorViewportLookup {
     const entryRef = this.wcLoadStates.get(wc.id);
     const hit = this.findTabAndRoleByWcId(wc.id);
     const active = hit ? this.isTabDedupActive(hit.tab) : false;
+    const emuActive = hit
+      ? this.slowDeviceEmulation.isViewportActive(hit.tab.id, hit.role)
+      : false;
     const needsRendererPrime = wc.getURL() === '';
 
     const markLaunchEpochStarted = () => {
@@ -1579,7 +1864,7 @@ export class TabManager implements MirrorViewportLookup {
       }
     };
 
-    if (!needsRendererPrime && !active && !this.muxOrDedupTouchedWcIds.has(wc.id)) {
+    if (!needsRendererPrime && !active && !emuActive && !this.muxOrDedupTouchedWcIds.has(wc.id)) {
       void this.wsSseMux.syncViewport(wc, false);
       void this.requestDedup.setViewportEnabled(wc, false);
       if (this.disposed || wc.isDestroyed() || entryRef?.superseded) {
@@ -1640,6 +1925,9 @@ export class TabManager implements MirrorViewportLookup {
             Promise.all([
               this.wsSseMux.syncViewport(wc, active),
               this.requestDedup.setViewportEnabled(wc, active),
+              ...(hit
+                ? [this.slowDeviceEmulation.syncViewport(hit.tab.id, hit.role, wc)]
+                : []),
             ]),
             new Promise<void>((resolve) => {
               syncTimer = setTimeout(resolve, 2500);
@@ -1925,8 +2213,10 @@ export class TabManager implements MirrorViewportLookup {
       if (nowMs - tab.lastActiveAt >= idleMs) {
         tab.sleeping = true;
         this.clearInPageSyncTimer(tab.id);
+        this.clearTabReconcileCooldowns(tab.id);
         this.destroyTabViews(tab);
         this.mirrorRelay.clearTab(tab.id);
+        this.cpuProfiler.clearTab(tab.id);
         this.requestDedup.clearTabSlots(tab.id);
         this.wsSseMux.clearTab(tab.id);
         this.tabEventBus.sessionStorageClearTab(tab.id);
@@ -2085,10 +2375,13 @@ export class TabManager implements MirrorViewportLookup {
         }
       }
       this.clearInPageSyncTimer(tab.id);
+      this.clearTabReconcileCooldowns(tab.id);
       this.destroyTabViews(tab);
       if (tab.session === 'isolated') {
         this.clearIsolatedPartition(tab.id);
       }
+      this.slowDeviceEmulation.clearTab(tab.id);
+      this.cpuProfiler.clearTab(tab.id);
       this.requestDedup.clearTab(tab.id);
       this.wsSseMux.clearTab(tab.id);
       this.activeTracesByTab.delete(tab.id);
@@ -2153,8 +2446,10 @@ export class TabManager implements MirrorViewportLookup {
     tab.sleeping = !tab.sleeping;
     if (tab.sleeping) {
       this.clearInPageSyncTimer(tab.id);
+      this.clearTabReconcileCooldowns(tab.id);
       this.destroyTabViews(tab);
       this.mirrorRelay.clearTab(tab.id);
+      this.cpuProfiler.clearTab(tab.id);
       this.requestDedup.clearTabSlots(tab.id);
       this.wsSseMux.clearTab(tab.id);
       this.tabEventBus.sessionStorageClearTab(tab.id);
@@ -2196,6 +2491,7 @@ export class TabManager implements MirrorViewportLookup {
 
     const now = Date.now();
     this.clearInPageSyncTimer(tab.id);
+    this.clearTabReconcileCooldowns(tab.id);
     this.resetSpaSyncChain(tab);
     const isHttpTarget = url.startsWith('http://') || url.startsWith('https://');
     this.tabEventBus.publish({
@@ -2242,6 +2538,7 @@ export class TabManager implements MirrorViewportLookup {
     const tab = this.getActiveTab();
     if (!tab) return;
     this.clearInPageSyncTimer(tab.id);
+    this.clearTabReconcileCooldowns(tab.id);
     this.resetSpaSyncChain(tab);
     tab.skipNextRestoreHistoryCommit = false;
     tab.launchConvergence = null;
@@ -2271,6 +2568,7 @@ export class TabManager implements MirrorViewportLookup {
     const tab = this.getActiveTab();
     if (!tab) return;
     this.clearInPageSyncTimer(tab.id);
+    this.clearTabReconcileCooldowns(tab.id);
     this.resetSpaSyncChain(tab);
     tab.skipNextRestoreHistoryCommit = false;
     tab.launchConvergence = null;
@@ -2301,6 +2599,7 @@ export class TabManager implements MirrorViewportLookup {
     const tab = this.getActiveTab();
     if (!tab) return;
     this.clearInPageSyncTimer(tab.id);
+    this.clearTabReconcileCooldowns(tab.id);
     this.resetSpaSyncChain(tab);
 
     const run = (async () => {
@@ -2387,10 +2686,12 @@ export class TabManager implements MirrorViewportLookup {
       await Promise.all([
         this.wsSseMux.syncViewport(lWc, active),
         this.requestDedup.setViewportEnabled(lWc, active),
+        this.slowDeviceEmulation.syncViewport(tab.id, 'landscape', lWc),
         ...(pWc
           ? [
               this.wsSseMux.syncViewport(pWc, active),
               this.requestDedup.setViewportEnabled(pWc, active),
+              this.slowDeviceEmulation.syncViewport(tab.id, 'portrait', pWc),
             ]
           : []),
       ]);
@@ -2437,6 +2738,27 @@ export class TabManager implements MirrorViewportLookup {
       if (tab.audioSource === 'portrait') {
         tab.audioSource = 'landscape';
       }
+      const slowPortrait = this.slowDeviceEmulation.getViewportState(tab.id, 'portrait');
+      const slowLandscape = this.slowDeviceEmulation.getViewportState(tab.id, 'landscape');
+      if (
+        slowPortrait.presetId &&
+        slowLandscape.active &&
+        slowLandscape.presetId === null &&
+        slowPortrait.profile === slowLandscape.profile &&
+        (slowPortrait.profile === 'sunmi-v2-pro' || slowPortrait.profile === 'low-end-android')
+      ) {
+        const found = findPreset(slowPortrait.presetId);
+        if (found) {
+          this.slowDeviceEmulation.rememberPresetBeforeOverride(
+            tab.id,
+            'landscape',
+            tab.landscapePresetId,
+          );
+          this.slowDeviceEmulation.setRolePresetOverride(tab.id, 'landscape', found.id);
+          tab.landscapePresetId = found.id;
+          tab.landscapeSize = { width: found.width, height: found.height, dpr: found.dpr };
+        }
+      }
       // Destroy portraitView cleanly on Dual -> Single to free RAM/CPU/audio and stop phantom telemetry.
       if (tab.portraitView) {
         this.destroyView(tab.portraitView);
@@ -2446,11 +2768,31 @@ export class TabManager implements MirrorViewportLookup {
       this.syncTabDedupAndMux(tab);
     } else {
       tab.mode = 'dual';
+      const slowLandscape = this.slowDeviceEmulation.getViewportState(tab.id, 'landscape');
+      const curSinglePreset = slowLandscape.presetId ? findPreset(slowLandscape.presetId) : undefined;
+      if (curSinglePreset && curSinglePreset.category === 'portrait') {
+        const savedLandscapeId = this.slowDeviceEmulation.consumeSavedPresetOnReset(
+          tab.id,
+          'landscape',
+        );
+        const restoredLandscape = getPresetOrDefault(
+          savedLandscapeId ?? DEFAULT_LANDSCAPE_PRESET_ID,
+          DEFAULT_LANDSCAPE_PRESET_ID,
+        );
+        this.slowDeviceEmulation.clearRolePresetOverride(tab.id, 'landscape');
+        tab.landscapePresetId = restoredLandscape.id;
+        tab.landscapeSize = {
+          width: restoredLandscape.width,
+          height: restoredLandscape.height,
+          dpr: restoredLandscape.dpr,
+        };
+      }
       this.syncTabDedupAndMux(tab);
       if (tab.landscapeView && !tab.landscapeView.webContents.isDestroyed() && !tab.portraitView) {
         tab.portraitView = this.createViewportView(tab.id, 'portrait', tab.session);
         tab.navSuppressUntil.portrait = Date.now() + NAV_MIRROR_SUPPRESS_MS;
         tab.navSuppressUrl.portrait = tab.url;
+        void this.applyViewportEmulation(tab, 'portrait');
         this.loadViewportUrl(tab.portraitView.webContents, tab.url);
       }
     }
@@ -2532,6 +2874,7 @@ export class TabManager implements MirrorViewportLookup {
       tab.landscapePresetId = preset.id;
       tab.landscapeSize = { width: preset.width, height: preset.height, dpr: preset.dpr };
     }
+    this.slowDeviceEmulation.handleManualPresetChange(tab.id, role, preset.id);
     void this.applyViewportEmulation(tab, role);
     return this.emitState();
   }
@@ -2602,6 +2945,8 @@ export class TabManager implements MirrorViewportLookup {
     if (this.attachedDevToolsWcId === wc.id) {
       this.destroyDevToolsView();
     }
+    this.slowDeviceEmulation.disposeWebContents(wc.id);
+    this.cpuProfiler.disposeWebContents(wc.id);
     this.wsSseMux.disposeWebContents(wc.id);
     this.requestDedup.disposeWebContents(wc.id);
     this.debuggerCoordinator.detach(wc);
@@ -2854,7 +3199,25 @@ export class TabManager implements MirrorViewportLookup {
       return { css: null, dpr: null };
     }
 
-    // Single mode clears DeviceMetricsOverride so CSS viewport follows raw WebContentsView bounds.
+    const slowState = this.slowDeviceEmulation.getViewportState(tab.id, 'landscape');
+    const singlePreset = slowState.presetId ? findPreset(slowState.presetId) : undefined;
+    if (singlePreset) {
+      const singleScale =
+        bounds.width > 0 && bounds.height > 0
+          ? computeFitScale(bounds.width, bounds.height, singlePreset.width, singlePreset.height)
+          : 1;
+      return {
+        css: { width: singlePreset.width, height: singlePreset.height },
+        dpr: computeEffectiveDpr(
+          singlePreset.dpr,
+          singleScale,
+          this.getHostScaleFactor(),
+          this.ecoMode && !slowState.active,
+        ),
+      };
+    }
+
+    // Single mode without preset override clears DeviceMetricsOverride so CSS viewport follows raw WebContentsView bounds.
     if (bounds.width > 0 && bounds.height > 0) {
       return {
         css: { width: bounds.width, height: bounds.height },
@@ -3461,6 +3824,7 @@ export class TabManager implements MirrorViewportLookup {
     y?: number;
     ratioY?: number;
     mirror?: boolean;
+    simulateHuman?: boolean;
   }): Promise<Record<string, unknown>> {
     const tab = params.tabId ? this.getTab(params.tabId) : this.getActiveTab();
     if (!tab) throw new Error('no active tab');
@@ -3476,8 +3840,12 @@ export class TabManager implements MirrorViewportLookup {
 
     const primaryRole: ViewportRole =
       params.viewport ?? (tab.mode === 'dual' ? 'portrait' : 'landscape');
-    const shouldMirror =
-      params.mirror !== undefined ? params.mirror : tab.mode === 'dual' && tab.mirror;
+    const simulateHuman = params.simulateHuman === true;
+    const shouldMirror = simulateHuman
+      ? false
+      : params.mirror !== undefined
+        ? params.mirror
+        : tab.mode === 'dual' && tab.mirror;
     const targets: ViewportRole[] =
       shouldMirror && tab.mode === 'dual'
         ? [primaryRole, primaryRole === 'portrait' ? 'landscape' : 'portrait']
@@ -3492,9 +3860,22 @@ export class TabManager implements MirrorViewportLookup {
     );
 
     const guard = this.mirrorRelay.getGuard(tab.id);
+    const withReplayGuard = async <T>(role: ViewportRole, fn: () => Promise<T>): Promise<T> => {
+      if (simulateHuman) {
+        return await fn();
+      }
+      guard.beginReplaying(role);
+      try {
+        return await fn();
+      } finally {
+        guard.endReplaying(role);
+      }
+    };
     const outcomes: Record<string, unknown> = {};
-    this.resetSpaSyncChain(tab);
-    this.tabEventBus.beginGesture(tab.id, primaryRole, params.action);
+    if (!simulateHuman) {
+      this.resetSpaSyncChain(tab);
+      this.tabEventBus.beginGesture(tab.id, primaryRole, params.action);
+    }
 
     await Promise.all(
       targets.map(async (role) => {
@@ -3503,26 +3884,20 @@ export class TabManager implements MirrorViewportLookup {
         if (!wc || wc.isDestroyed()) return;
 
         if (params.action === 'scroll') {
-          guard.beginReplaying(role);
-          try {
-            const res = await this.mirrorRelay.queryDom(wc, 'applyScroll', {
+          const res = await withReplayGuard(role, () =>
+            this.mirrorRelay.queryDom(wc, 'applyScroll', {
               ratioX: 0,
               ratioY: params.ratioY ?? 0.5,
-            });
-            outcomes[role] = res;
-          } finally {
-            guard.endReplaying(role);
-          }
+            }),
+          );
+          outcomes[role] = res;
           return;
         }
 
         if (params.action === 'key') {
-          guard.beginReplaying(role);
-          try {
-            await this.mirrorRelay.dispatchTrustedKey(wc, params.key ?? 'Enter');
-          } finally {
-            guard.endReplaying(role);
-          }
+          await withReplayGuard(role, () =>
+            this.mirrorRelay.dispatchTrustedKey(wc, params.key ?? 'Enter'),
+          );
           outcomes[role] = { ok: true, key: params.key ?? 'Enter' };
           return;
         }
@@ -3562,36 +3937,29 @@ export class TabManager implements MirrorViewportLookup {
             return;
           }
           // Scale CSS coords by inputScale to widget DIP coords for CDP Input.dispatchMouseEvent and sendInputEvent.
-          guard.beginReplaying(role);
-          try {
-            await this.mirrorRelay.dispatchTrustedClick(wc, x, y, 'left', 1, [], inputScale);
-          } finally {
-            guard.endReplaying(role);
-          }
+          await withReplayGuard(role, () =>
+            this.mirrorRelay.dispatchTrustedClick(wc, x, y, 'left', 1, [], inputScale),
+          );
           outcomes[role] = { ok: true, tier: resolvedTier, x: Math.round(x), y: Math.round(y) };
         } else if (params.action === 'hover') {
           if (x === undefined || y === undefined) {
             outcomes[role] = { ok: false, error: 'target not found' };
             return;
           }
-          guard.beginReplaying(role);
-          try {
-            await this.mirrorRelay.dispatchTrustedHover(wc, x, y, inputScale);
-          } finally {
-            guard.endReplaying(role);
-          }
+          await withReplayGuard(role, () =>
+            this.mirrorRelay.dispatchTrustedHover(wc, x, y, inputScale),
+          );
           outcomes[role] = { ok: true, tier: resolvedTier, x: Math.round(x), y: Math.round(y) };
         } else if (params.action === 'type') {
-          guard.beginReplaying(role);
-          try {
+          await withReplayGuard(role, async () => {
             if (x !== undefined && y !== undefined) {
               await this.mirrorRelay.dispatchTrustedClick(wc, x, y, 'left', 1, [], inputScale);
-              guard.markReplaying(role);
+              if (!simulateHuman) {
+                guard.markReplaying(role);
+              }
             }
             await this.mirrorRelay.dispatchTrustedText(wc, params.text ?? '');
-          } finally {
-            guard.endReplaying(role);
-          }
+          });
           outcomes[role] = { ok: true, typedLength: (params.text ?? '').length };
         }
       }),
@@ -3601,6 +3969,7 @@ export class TabManager implements MirrorViewportLookup {
       tabId: tab.id,
       action: params.action,
       mirrored: targets.length > 1,
+      ...(simulateHuman ? { simulatedHuman: true } : {}),
       outcomes,
     };
   }
@@ -3818,6 +4187,129 @@ export class TabManager implements MirrorViewportLookup {
 
   getRecipesDir(): string {
     return path.join(app.getPath('userData'), 'recipes');
+  }
+
+  getProfilesDir(): string {
+    return path.join(app.getPath('userData'), 'profiles');
+  }
+
+  async profileCpu(params: {
+    tabId?: string;
+    viewport?: ViewportRole;
+    action: 'start' | 'stop';
+    top?: number;
+    intervalUs?: number;
+  }): Promise<Record<string, unknown>> {
+    const tab = params.tabId ? this.getTab(params.tabId) : this.getActiveTab();
+    if (!tab) throw new Error('no active tab');
+    if (tab.sleeping) throw new Error(`tab '${tab.id}' is sleeping`);
+
+    if (params.viewport === 'portrait' && tab.mode !== 'dual') {
+      throw new Error(`viewport 'portrait' is not active in single-mode tab '${tab.id}'`);
+    }
+    const role: ViewportRole =
+      params.viewport ?? (tab.mode === 'dual' ? 'portrait' : 'landscape');
+    const emulation = this.slowDeviceEmulation.getTabSummary(tab.id);
+
+    if (params.action === 'start') {
+      const ready = await this.ensureTabMaterializedAndLoaded(tab);
+      if (!ready) {
+        throw new Error(
+          !this.tabs.includes(tab)
+            ? `tab '${tab.id}' was closed`
+            : `tab '${tab.id}' failed to finish loading`,
+        );
+      }
+      const wc =
+        role === 'portrait' ? tab.portraitView?.webContents : tab.landscapeView?.webContents;
+      if (!wc || wc.isDestroyed()) {
+        throw new Error(`viewport '${role}' is not active in tab '${tab.id}'`);
+      }
+      const started = await this.cpuProfiler.start(
+        tab.id,
+        role,
+        wc,
+        emulation,
+        params.intervalUs,
+      );
+      this.tabEventBus.publish({
+        tabId: tab.id,
+        viewport: role,
+        domain: 'trace',
+        kind: 'cpu_profile_start',
+        summary: `CPU profile started (${role})`,
+      });
+      return started;
+    }
+
+    if (params.action === 'stop') {
+      const stopped = await this.cpuProfiler.stop(tab.id, role, {
+        top: params.top,
+        emulation,
+      });
+      this.tabEventBus.publish({
+        tabId: tab.id,
+        viewport: role,
+        domain: 'trace',
+        kind: 'cpu_profile_stop',
+        summary: `CPU profile stopped (${role})`,
+      });
+      return stopped;
+    }
+
+    throw new Error("browser_profile action must be 'start' or 'stop'");
+  }
+
+  getViewportHealthSnapshot(): ViewportRendererHealth[] {
+    const out: ViewportRendererHealth[] = [];
+    for (const tab of this.tabs) {
+      if (tab.sleeping) continue;
+      const entries: Array<[ViewportRole, WebContentsView | null]> =
+        tab.mode === 'dual'
+          ? [
+              ['portrait', tab.portraitView],
+              ['landscape', tab.landscapeView],
+            ]
+          : [['landscape', tab.landscapeView]];
+
+      for (const [role, view] of entries) {
+        if (!view || view.webContents.isDestroyed()) continue;
+        const wc = view.webContents;
+        const tracked = this.rendererHealthByWcId.get(wc.id);
+        let osPid: number | null = null;
+        try {
+          if (typeof wc.getOSProcessId === 'function') {
+            osPid = wc.getOSProcessId();
+          }
+        } catch {
+          osPid = null;
+        }
+        let nativeCrashed = false;
+        try {
+          if (typeof wc.isCrashed === 'function') {
+            nativeCrashed = wc.isCrashed();
+          }
+        } catch {
+          nativeCrashed = false;
+        }
+        const rawUrl = wc.getURL() || tab.url;
+        out.push({
+          tabId: tab.id,
+          viewport: role,
+          wcId: wc.id,
+          osProcessId: osPid,
+          url: redactMirrorUrl(rawUrl) ?? rawUrl,
+          isLoading: wc.isLoading() || this.wcLoadStates.has(wc.id),
+          crashed: Boolean(tracked?.crashed || nativeCrashed),
+          unresponsive: Boolean(tracked?.unresponsive),
+          lastGoneReason: tracked?.lastGoneReason ?? null,
+          lastGoneExitCode: tracked?.lastGoneExitCode ?? null,
+          lastUnresponsiveAtMs: tracked?.lastUnresponsiveAtMs ?? null,
+          emulationActive: this.slowDeviceEmulation.isViewportActive(tab.id, role),
+        });
+      }
+    }
+    return out;
   }
 
   saveReproRecipe(raw: Record<string, unknown>): ReproRecipe {
@@ -4170,6 +4662,186 @@ export class TabManager implements MirrorViewportLookup {
     };
   }
 
+  async emulate(params: {
+    tabId?: string;
+    viewport?: ViewportRole | 'both';
+    profile?: 'none' | 'sunmi-v2-pro' | 'low-end-android';
+    cpuRate?: number;
+    network?: 'none' | 'fast-4g' | 'slow-4g' | '3g' | 'offline' | CustomNetworkInput;
+    preset?: string;
+    userAgent?: string | null;
+    hardwareConcurrency?: number | null;
+    deviceMemory?: number | null;
+    reducedMotion?: boolean;
+    saveData?: boolean;
+    targetScore?: number;
+    calibrate?: boolean;
+    reset?: boolean;
+  }): Promise<Record<string, unknown>> {
+    const tab = params.tabId ? this.getTab(params.tabId) : this.getActiveTab();
+    if (!tab) throw new Error('no active tab');
+    if (tab.sleeping) throw new Error(`tab '${tab.id}' is sleeping`);
+
+    const ready = await this.ensureTabMaterializedAndLoaded(tab);
+    if (!ready) {
+      throw new Error(
+        !this.tabs.includes(tab)
+          ? `tab '${tab.id}' was closed`
+          : `tab '${tab.id}' failed to finish loading`,
+      );
+    }
+
+    if (params.viewport === 'portrait' && tab.mode !== 'dual') {
+      throw new Error(`viewport 'portrait' is not active in single-mode tab '${tab.id}'`);
+    }
+
+    const configRoles: ViewportRole[] =
+      params.viewport === 'portrait'
+        ? ['portrait']
+        : params.viewport === 'landscape'
+          ? ['landscape']
+          : ['portrait', 'landscape'];
+    const liveRoles: ViewportRole[] = configRoles.filter(
+      (role) => tab.mode === 'dual' || role === 'landscape',
+    );
+
+    const input: EmulateViewportInput = {
+      profile: params.profile,
+      cpuRate: params.cpuRate,
+      network: params.network,
+      preset: params.preset,
+      userAgent: params.userAgent,
+      hardwareConcurrency: params.hardwareConcurrency,
+      deviceMemory: params.deviceMemory,
+      reducedMotion: params.reducedMotion,
+      saveData: params.saveData,
+      targetScore: params.targetScore,
+      calibrate: params.calibrate,
+      reset: params.reset,
+    };
+
+    const isReset = params.reset === true || params.profile === 'none';
+
+    for (const role of configRoles) {
+      const applyProfilePreset =
+        role === 'portrait' || (tab.mode === 'single' && role === 'landscape');
+      if (!isReset && (params.preset !== undefined || (params.profile && applyProfilePreset))) {
+        this.slowDeviceEmulation.rememberPresetBeforeOverride(
+          tab.id,
+          role,
+          role === 'portrait' ? tab.portraitPresetId : tab.landscapePresetId,
+        );
+      }
+      const nextState = this.slowDeviceEmulation.updateViewportConfig(
+        tab.id,
+        role,
+        input,
+        applyProfilePreset,
+      );
+
+      if (isReset) {
+        const restoredPresetId = this.slowDeviceEmulation.consumeSavedPresetOnReset(tab.id, role);
+        if (restoredPresetId) {
+          const restored = getPresetOrDefault(
+            restoredPresetId,
+            role === 'portrait' ? DEFAULT_PORTRAIT_PRESET_ID : DEFAULT_LANDSCAPE_PRESET_ID,
+          );
+          if (role === 'portrait') {
+            tab.portraitPresetId = restored.id;
+            tab.portraitSize = { width: restored.width, height: restored.height, dpr: restored.dpr };
+          } else {
+            tab.landscapePresetId = restored.id;
+            tab.landscapeSize = { width: restored.width, height: restored.height, dpr: restored.dpr };
+          }
+        }
+      } else if (nextState.presetId) {
+        const found = findPreset(nextState.presetId);
+        if (found) {
+          if (role === 'portrait') {
+            tab.portraitPresetId = found.id;
+            tab.portraitSize = { width: found.width, height: found.height, dpr: found.dpr };
+          } else {
+            tab.landscapePresetId = found.id;
+            tab.landscapeSize = { width: found.width, height: found.height, dpr: found.dpr };
+          }
+        }
+      }
+    }
+
+    await Promise.all(liveRoles.map((role) => this.applyViewportEmulation(tab, role)));
+
+    let calibration: CalibrationResult | null = null;
+    if (params.calibrate === true && !isReset) {
+      const primaryRole: ViewportRole = liveRoles[0]!;
+      const primaryWc =
+        primaryRole === 'portrait'
+          ? tab.portraitView?.webContents
+          : tab.landscapeView?.webContents;
+      if (!primaryWc || primaryWc.isDestroyed()) {
+        throw new Error(`viewport '${primaryRole}' unavailable for calibration`);
+      }
+      calibration = await this.slowDeviceEmulation.calibrateViewport(
+        tab.id,
+        primaryRole,
+        primaryWc,
+        params.targetScore,
+      );
+      for (const otherRole of configRoles) {
+        if (otherRole === primaryRole) continue;
+        this.slowDeviceEmulation.updateViewportConfig(
+          tab.id,
+          otherRole,
+          { cpuRate: calibration.chosenRate, targetScore: calibration.targetScore },
+          false,
+        );
+        if (liveRoles.includes(otherRole)) {
+          const otherWc =
+            otherRole === 'portrait'
+              ? tab.portraitView?.webContents
+              : tab.landscapeView?.webContents;
+          await this.slowDeviceEmulation.syncViewport(tab.id, otherRole, otherWc);
+        }
+      }
+    }
+
+    const summary: TabEmulationSummary = this.slowDeviceEmulation.getTabSummary(tab.id);
+    this.tabEventBus.publish({
+      tabId: tab.id,
+      viewport: params.viewport ?? 'both',
+      domain: 'lifecycle',
+      kind: 'emulation_updated',
+      summary: summary.label,
+    });
+    this.emitState(false);
+    if (this.latestTelemetry && this.getActiveTab()?.id === tab.id) {
+      this.latestTelemetry = { ...this.latestTelemetry, emulation: summary };
+      if (!this.win.isDestroyed()) {
+        this.win.webContents.send('shell:telemetry', this.latestTelemetry);
+      }
+    }
+
+    return {
+      ok: true,
+      tabId: tab.id,
+      emulation: summary,
+      ...(calibration ? { calibration } : {}),
+    };
+  }
+
+  async setEmulationProfile(
+    profile: 'none' | 'sunmi-v2-pro' | 'low-end-android',
+    viewport: ViewportRole | 'both' = 'both',
+    tabId?: string,
+  ): Promise<ShellState> {
+    await this.emulate({
+      tabId,
+      viewport,
+      profile,
+      reset: profile === 'none',
+    });
+    return this.getShellState();
+  }
+
   async startPerfTrace(params: {
     tabId?: string;
     maxDurationMs?: number;
@@ -4225,6 +4897,7 @@ export class TabManager implements MirrorViewportLookup {
       startedAtMs,
       maxDurationMs,
       maxFrames,
+      emulation: this.slowDeviceEmulation.getTabSummary(tab.id),
       viewports: startedViewports,
     };
   }
@@ -4288,6 +4961,7 @@ export class TabManager implements MirrorViewportLookup {
       traceId: activeMeta.traceId,
       tabId: tab.id,
       durationMs: totalDurationMs,
+      emulation: this.slowDeviceEmulation.getTabSummary(tab.id),
       gpu,
       viewports,
     };
@@ -4326,6 +5000,7 @@ export class TabManager implements MirrorViewportLookup {
         audioSource: tab.audioSource,
         dedupCount: tab.dedupCount,
         viewportReport: this.buildTabViewportReport(tab),
+        emulation: this.slowDeviceEmulation.getTabSummary(tab.id),
       };
     });
 
@@ -4381,6 +5056,7 @@ export class TabManager implements MirrorViewportLookup {
       clearTimeout(t);
     }
     this.pendingInPageSyncTimers.clear();
+    this.routeReconcileCooldowns.clear();
     this.pendingEmulations.clear();
     this.observedViewports.clear();
     this.activeTracesByTab.clear();
@@ -4403,6 +5079,8 @@ export class TabManager implements MirrorViewportLookup {
     }
     this.destroyDevToolsView();
     this.telemetry.dispose();
+    this.slowDeviceEmulation.dispose();
+    this.cpuProfiler.dispose();
     this.requestDedup.dispose();
     this.wsSseMux.dispose();
     this.mirrorRelay.dispose();

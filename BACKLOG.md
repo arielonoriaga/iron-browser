@@ -1,13 +1,13 @@
 # IronBrowser Debugging & MCP Backlog
 
-Field feedback captured from the Origami Rush review (`/tmp/biome-travel/iron/workflow-feedback.md`) — prioritized for the next sprint immediately after the active CPU/RAM + Request Dedup + WS/SSE Mux + UI Replication + Session Restore sprint completes.
+Field feedback captured from dual-viewport WebGL game & responsive SPA testing — implemented and verified across P1–P5.
 
 ---
 
 ## Fixed Immediately
 
 - **PATH launcher symlink resolution (`bin/iron-browser`)**:
-  - **Bug:** Invoking `~/.local/bin/iron-browser` (symlink -> `/home/ariel/Projects/iron-browser/bin/iron-browser`) resolved `ROOT_DIR` to `~/.local` and searched for Electron under `~/.local/app`.
+  - **Bug:** Invoking `~/.local/bin/iron-browser` (symlink -> `<repo>/bin/iron-browser`) resolved `ROOT_DIR` to `~/.local` and searched for Electron under `~/.local/app`.
   - **Fix:** Resolved `BASH_SOURCE[0]` with `readlink -f` before computing `ROOT_DIR`.
   - **Follow-up test:** Add a symlink-launch smoke test to the test suite.
 

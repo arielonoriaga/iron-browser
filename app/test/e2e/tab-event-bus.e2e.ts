@@ -72,7 +72,7 @@ async function runTabEventBusE2E(): Promise<void> {
         window.__ssEvents.push({ key: ev.key, newValue: ev.newValue });
       }
     });
-    // Delegated SPA anchor router (like SvelteKit / Next.js on stake.com)
+    // Delegated SPA anchor router (like SvelteKit / Next.js async client navigation)
     document.addEventListener('click', (ev) => {
       const a = ev.target && ev.target.closest ? ev.target.closest('a') : null;
       if (!a || a.hasAttribute('download')) return;

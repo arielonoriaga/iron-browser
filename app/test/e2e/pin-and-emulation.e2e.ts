@@ -323,7 +323,7 @@ async function runPinAndEmulationE2E(): Promise<void> {
   const baseUrl = `http://127.0.0.1:${addr.port}`;
 
   // Second HTTP server on a distinct origin (different port) simulating
-  // https://api.ez-stock.huggian.com/api/v1/events?... accessed from https://app.ez-commerce.huggian.com:
+  // https://api.pos-terminal.example.com/api/v1/events?... accessed from https://app.pos-terminal.example.com:
   // Strictly rejects OPTIONS preflights (405) and rejects non-CORS-safelisted Cache-Control request headers!
   const sseServer = http.createServer((req, res) => {
     const reqUrl = new URL(req.url ?? '/', 'http://127.0.0.1');

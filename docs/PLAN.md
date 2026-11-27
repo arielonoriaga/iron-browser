@@ -1,8 +1,6 @@
 # IronBrowser — Architectural & Implementation Plan
 
-> **Goal:** A **site-agnostic**, Zen-inspired Chromium developer browser aligned with **The Iron Stack** (`iron-suite`, `iron-term`) that launches any URL you want with simultaneous **Portrait + Landscape viewports**, **mirrored interaction**, **live CPU/GPU/FPS/Memory telemetry + real docked Chrome DevTools**, and a **native MCP server** for Claude Code, Codex, and Antigravity.
-
-![Target Layout Sketch](/home/ariel/.gemini/antigravity-cli/brain/adfcefec-13f9-4ae1-ac55-62bc5ba842dd/.user_uploaded/uploaded_media_1795709842891.png)
+> **Goal:** A **site-agnostic**, Zen-inspired Chromium developer browser aligned with **The Iron Stack** (`iron-suite`, `iron-term`) that launches any URL you want with simultaneous **Portrait + Landscape viewports**, **mirrored interaction**, **live CPU/GPU/FPS/Memory telemetry + real docked Chrome DevTools**, and a **native MCP server** for Claude Code, Codex, OpenCode, and Antigravity.
 
 ---
 
@@ -47,7 +45,7 @@
   - Collapsible vertical tab rail (`⌘\`), pinned "Essentials" strip, workspace groups, compact `⌘L` floating/inline URL bar.
   - Every tab supports **1-click Dual Mode (`⌘⇧D`)**: browse normally in Single View, or split *any* URL instantly into **Portrait + Landscape** side-by-side.
   - Device preset pickers per viewport (`375×667`, `390×844`, `430×932`, `768×1024`, `1280×720`, `1440×900`, custom `W×H`, DPR `1x/2x/3x`).
-  - Celestial Dark/Light tokens inherited from [iron-suite](file:///home/ariel/Projects/iron-suite/src/ui/index.html) and [iron-term](file:///home/ariel/Projects/iron-term/docs/DESIGN.md).
+  - Celestial Dark/Light tokens inherited from [iron-suite](https://github.com/arielonoriaga/iron-suite) and `iron-term`.
 
 ---
 

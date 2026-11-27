@@ -387,9 +387,9 @@ describe('PIN Keypad Mirroring & TabEventBus Path Resolution', () => {
         expect(bus.getLastSessionStorageWriteMs('tab-1')).toBe(0);
         const res = bus.sessionStorageSet(
           'tab-1',
-          'https://app.ez-stock.huggian.com',
+          'https://app.pos-terminal.example.com',
           'landscape',
-          'ez-stock:employee-jwt',
+          'pos:employee-jwt',
           'jwt-token',
           42_500,
         );

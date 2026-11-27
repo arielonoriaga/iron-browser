@@ -24,7 +24,7 @@ describe('session-store short history', () => {
   test('only accepts http and https URLs', () => {
     expect(isPersistableHttpUrl('http://127.0.0.1:18382/?room=aviador')).toBe(true);
     expect(isPersistableHttpUrl('https://example.com/path')).toBe(true);
-    expect(isPersistableHttpUrl('file:///home/ariel/welcome.html')).toBe(false);
+    expect(isPersistableHttpUrl('file:///home/dev/welcome.html')).toBe(false);
     expect(isPersistableHttpUrl('about:blank')).toBe(false);
     expect(isPersistableHttpUrl('javascript:alert(1)')).toBe(false);
     expect(isPersistableHttpUrl('data:text/html,hi')).toBe(false);

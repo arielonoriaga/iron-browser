@@ -5,3 +5,6 @@ target/
 .DS_Store
 .desktop-prompt.txt
 .teamwork-handoff/
+DESKTOP_COMPLETION_REPORT.md
+DESKTOP_HANDOFF.md
+LAPTOP_HANDOFF.md

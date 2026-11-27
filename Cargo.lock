@@ -48,6 +48,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "iron-browser-bus"
+version = "0.1.0"
+dependencies = [
+ "libc",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "iron-browser-mcp"
 version = "0.1.0"
 dependencies = [

@@ -79,6 +79,7 @@ export interface MirrorViewportLookup {
     pairedScale: number;
   } | null;
   onMirrorMiss?: (tabId: string, info: MirrorMissInfo) => void;
+  onGesture?: (tabId: string, role: ViewportRole, action: string) => void;
   getOrigin?: (wc: WebContents) => string | null;
   isMainFrame?: (wc: WebContents, frame: unknown) => boolean;
   beforeMouseDispatch?: (wc: WebContents) => Promise<void>;
@@ -258,6 +259,7 @@ export class MirrorRelay {
             return Promise.resolve();
           }
 
+          this.lookup.onGesture?.(fresh.tabId, fresh.role, capture.kind);
           const targetRole = pairedViewport(fresh.role);
           return this.replayEvent(
             fresh.tabId,

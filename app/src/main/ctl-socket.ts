@@ -538,6 +538,47 @@ export class ControlSocketServer {
         });
       }
 
+      case 'browser_events': {
+        const rawTabId = typeof params.tab_id === 'string' ? params.tab_id.trim() : '';
+        const tabId =
+          rawTabId === 'all'
+            ? undefined
+            : rawTabId.length > 0
+              ? rawTabId
+              : this.tabManager.getActiveTab()?.id;
+        const viewport =
+          params.viewport === 'portrait' ||
+          params.viewport === 'landscape' ||
+          params.viewport === 'both'
+            ? params.viewport
+            : 'both';
+        const domain = typeof params.domain === 'string' ? params.domain : undefined;
+        const sinceSeq =
+          typeof params.since_seq === 'number' && Number.isFinite(params.since_seq)
+            ? Math.max(0, Math.floor(params.since_seq))
+            : undefined;
+        const gestureSeq =
+          typeof params.gesture_seq === 'number' && Number.isFinite(params.gesture_seq)
+            ? Math.max(0, Math.floor(params.gesture_seq))
+            : undefined;
+        const limit =
+          typeof params.limit === 'number' && Number.isFinite(params.limit)
+            ? Math.min(Math.max(Math.floor(params.limit), 1), 500)
+            : 50;
+        const res = this.tabManager.queryTabEvents({
+          tabId,
+          domain,
+          viewport,
+          sinceSeq,
+          gestureSeq,
+          limit,
+        });
+        return {
+          tabId: tabId ?? null,
+          ...res,
+        };
+      }
+
       default:
         throw new Error(`unknown RPC method: ${method}`);
     }

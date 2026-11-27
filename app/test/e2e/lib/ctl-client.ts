@@ -393,6 +393,42 @@ export class ControlSocketClient implements ControlSocketClientApi {
     return this.request<EvalResultDto>('browser_eval', params);
   }
 
+  events(opts?: {
+    tabId?: string;
+    domain?: string;
+    viewport?: ViewportRole | 'both';
+    sinceSeq?: number;
+    gestureSeq?: number;
+    limit?: number;
+  }): Promise<{
+    tabId: string | null;
+    backend: 'rust-napi' | 'ts-fallback';
+    latestSeq: number;
+    totalPublished: number;
+    totalSuppressed: number;
+    count: number;
+    events: Array<{
+      seq: number;
+      tsMs: number;
+      tabId: string;
+      viewport: string;
+      domain: string;
+      kind: string;
+      summary: string;
+      gestureSeq?: number;
+      detail?: string;
+    }>;
+  }> {
+    const params: Record<string, unknown> = {};
+    if (opts?.tabId !== undefined) params.tab_id = opts.tabId;
+    if (opts?.domain !== undefined) params.domain = opts.domain;
+    if (opts?.viewport !== undefined) params.viewport = opts.viewport;
+    if (opts?.sinceSeq !== undefined) params.since_seq = opts.sinceSeq;
+    if (opts?.gestureSeq !== undefined) params.gesture_seq = opts.gestureSeq;
+    if (opts?.limit !== undefined) params.limit = opts.limit;
+    return this.request('browser_events', params);
+  }
+
   async waitForTabReady(
     tabId?: string,
     opts?: WaitForTabReadyOptions,

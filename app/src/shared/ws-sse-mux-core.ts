@@ -59,7 +59,15 @@ export type MuxToMainMessage =
       data: string;
       lastEventId: string;
     }
-  | { type: 'upstream-sse-error'; clientSocketId: string; fatal: boolean; retryMs?: number };
+  | { type: 'upstream-sse-error'; clientSocketId: string; fatal: boolean; retryMs?: number }
+  | { type: 'ss-hello'; clientSocketId: string }
+  | {
+      type: 'ss-mut';
+      clientSocketId: string;
+      op: 'set' | 'remove' | 'clear';
+      key?: string;
+      value?: string;
+    };
 
 export type MainToMuxMessage =
   | {
@@ -115,6 +123,14 @@ export type MainToMuxMessage =
       fatal: boolean;
       ownerTeardown?: boolean;
       retryMs?: number;
+    }
+  | {
+      type: 'mux-ss-sync';
+      clientSocketId: string;
+      op: 'hydrate' | 'set' | 'remove' | 'clear';
+      entries?: Record<string, string>;
+      key?: string;
+      value?: string;
     };
 
 /**
@@ -535,6 +551,7 @@ var nativeCall = Function.prototype.call;
 var nativeBind = Function.prototype.bind;
 var uncurry = nativeBind.bind(nativeCall);
 var callFn = uncurry(nativeCall);
+var applyFn = uncurry(Function.prototype.apply);
 var bindFn = uncurry(nativeBind);
 var hasOwn = typeof NativeObject.hasOwn === 'function'
   ? NativeObject.hasOwn
@@ -596,6 +613,7 @@ var mapIterNext = mapIterProto && typeof mapIterProto.next === 'function' ? uncu
 
 var NativeSet = Set;
 var setAdd = uncurry(NativeSet.prototype.add);
+var setHas = uncurry(NativeSet.prototype.has);
 var setDelete = uncurry(NativeSet.prototype.delete);
 var setValues = uncurry(NativeSet.prototype.values);
 var setClear = uncurry(NativeSet.prototype.clear);
@@ -644,6 +662,35 @@ var NativeDOMException = globalObj.DOMException;
 var NativeTypeError = TypeError;
 var NativeError = Error;
 var NativeMessagePort = globalObj.MessagePort;
+var NativeStorageEvent = typeof globalObj.StorageEvent === 'function' ? globalObj.StorageEvent : null;
+var nativeSessionStorage = null;
+var storageProtoRef = null;
+var rawStorageSetItem = null;
+var rawStorageRemoveItem = null;
+var rawStorageClear = null;
+var rawStorageGetItem = null;
+var applyingRemoteSs = false;
+var localDirtySsKeys = new NativeSet();
+var localClearedSs = false;
+try {
+  var candSs = globalObj.sessionStorage;
+  var candStorageProto = candSs ? NativeGetPrototypeOf(candSs) : null;
+  if (
+    candSs &&
+    candStorageProto &&
+    typeof candStorageProto.setItem === 'function' &&
+    typeof candStorageProto.removeItem === 'function' &&
+    typeof candStorageProto.clear === 'function' &&
+    typeof candStorageProto.getItem === 'function'
+  ) {
+    nativeSessionStorage = candSs;
+    storageProtoRef = candStorageProto;
+    rawStorageSetItem = candStorageProto.setItem;
+    rawStorageRemoveItem = candStorageProto.removeItem;
+    rawStorageClear = candStorageProto.clear;
+    rawStorageGetItem = candStorageProto.getItem;
+  }
+} catch (_) {}
 var portPostMessage = NativeMessagePort && NativeMessagePort.prototype ? uncurry(NativeMessagePort.prototype.postMessage) : null;
 var portStart = NativeMessagePort && NativeMessagePort.prototype && typeof NativeMessagePort.prototype.start === 'function' ? uncurry(NativeMessagePort.prototype.start) : null;
 var portClose = NativeMessagePort && NativeMessagePort.prototype && typeof NativeMessagePort.prototype.close === 'function' ? uncurry(NativeMessagePort.prototype.close) : null;
@@ -1471,6 +1518,71 @@ function handlePortMessage(ev) {
   var clientId = msg.clientSocketId;
   if (typeof clientId !== 'string') return;
 
+  if (msg.type === 'mux-ss-sync' && clientId === '__ss__' && nativeSessionStorage) {
+    applyingRemoteSs = true;
+    try {
+      var locHref = globalObj.location ? String(globalObj.location.href || '') : '';
+      if (msg.op === 'hydrate' && msg.entries && typeof msg.entries === 'object' && !localClearedSs) {
+        var hKeys = NativeObject.keys(msg.entries);
+        for (var hi = 0; hi < hKeys.length; hi += 1) {
+          var hk = hKeys[hi];
+          if (!setHas(localDirtySsKeys, hk) && typeof msg.entries[hk] === 'string') {
+            callFn(rawStorageSetItem, nativeSessionStorage, hk, msg.entries[hk]);
+          }
+        }
+      } else if (msg.op === 'set' && typeof msg.key === 'string' && typeof msg.value === 'string') {
+        var prevVal = callFn(rawStorageGetItem, nativeSessionStorage, msg.key);
+        if (prevVal !== msg.value) {
+          callFn(rawStorageSetItem, nativeSessionStorage, msg.key, msg.value);
+          if (NativeStorageEvent) {
+            try {
+              globalObj.dispatchEvent(new NativeStorageEvent('storage', {
+                key: msg.key,
+                oldValue: prevVal,
+                newValue: msg.value,
+                url: locHref,
+                storageArea: nativeSessionStorage
+              }));
+            } catch (_) {}
+          }
+        }
+      } else if (msg.op === 'remove' && typeof msg.key === 'string') {
+        var prevRem = callFn(rawStorageGetItem, nativeSessionStorage, msg.key);
+        if (prevRem !== null) {
+          callFn(rawStorageRemoveItem, nativeSessionStorage, msg.key);
+          if (NativeStorageEvent) {
+            try {
+              globalObj.dispatchEvent(new NativeStorageEvent('storage', {
+                key: msg.key,
+                oldValue: prevRem,
+                newValue: null,
+                url: locHref,
+                storageArea: nativeSessionStorage
+              }));
+            } catch (_) {}
+          }
+        }
+      } else if (msg.op === 'clear') {
+        callFn(rawStorageClear, nativeSessionStorage);
+        if (NativeStorageEvent) {
+          try {
+            globalObj.dispatchEvent(new NativeStorageEvent('storage', {
+              key: null,
+              oldValue: null,
+              newValue: null,
+              url: locHref,
+              storageArea: nativeSessionStorage
+            }));
+          } catch (_) {}
+        }
+      }
+    } catch (_) {
+    } finally {
+      applyingRemoteSs = false;
+    }
+    return;
+  }
+
   var wsState = mapGet(socketsById, clientId);
   if (wsState) {
     if (msg.type === 'mux-grant') {
@@ -1789,6 +1901,13 @@ function onWindowMessage(ev) {
     readyTimer = null;
   }
   handshakeState = 'connected';
+  if (nativeSessionStorage) {
+    if (portPostMessage) {
+      portPostMessage(activePort, { type: 'ss-hello', clientSocketId: '__ss__' });
+    } else {
+      activePort.postMessage({ type: 'ss-hello', clientSocketId: '__ss__' });
+    }
+  }
 
   if (pendingMessages.length > 0) {
     var queued = pendingMessages;
@@ -2416,6 +2535,73 @@ if (typeof NativeEventSource === 'function') {
     enumerable: false,
     configurable: true
   });
+}
+
+if (nativeSessionStorage && storageProtoRef) {
+  try {
+    NativeDefineProperty(storageProtoRef, 'setItem', {
+      configurable: true,
+      enumerable: true,
+      writable: true,
+      value: function setItem(key, value) {
+        var ret = applyFn(rawStorageSetItem, this, arguments);
+        if (this === nativeSessionStorage && !applyingRemoteSs && handshakeState !== 'failed-open') {
+          var kStr = String(key);
+          var vStr = String(value);
+          if (kStr.length + vStr.length <= 524288) {
+            setAdd(localDirtySsKeys, kStr);
+            sendToMain({
+              type: 'ss-mut',
+              clientSocketId: '__ss__',
+              op: 'set',
+              key: kStr,
+              value: vStr
+            });
+          }
+        }
+        return ret;
+      }
+    });
+    NativeDefineProperty(storageProtoRef, 'removeItem', {
+      configurable: true,
+      enumerable: true,
+      writable: true,
+      value: function removeItem(key) {
+        var ret = applyFn(rawStorageRemoveItem, this, arguments);
+        if (this === nativeSessionStorage && !applyingRemoteSs && handshakeState !== 'failed-open') {
+          var kStr = String(key);
+          if (kStr.length <= 524288) {
+            setAdd(localDirtySsKeys, kStr);
+            sendToMain({
+              type: 'ss-mut',
+              clientSocketId: '__ss__',
+              op: 'remove',
+              key: kStr
+            });
+          }
+        }
+        return ret;
+      }
+    });
+    NativeDefineProperty(storageProtoRef, 'clear', {
+      configurable: true,
+      enumerable: true,
+      writable: true,
+      value: function clear() {
+        var ret = applyFn(rawStorageClear, this, arguments);
+        if (this === nativeSessionStorage && !applyingRemoteSs && handshakeState !== 'failed-open') {
+          localClearedSs = true;
+          setClear(localDirtySsKeys);
+          sendToMain({
+            type: 'ss-mut',
+            clientSocketId: '__ss__',
+            op: 'clear'
+          });
+        }
+        return ret;
+      }
+    });
+  } catch (_) {}
 }
 })();`;
 }

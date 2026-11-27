@@ -91,6 +91,13 @@ import { DebuggerCoordinator } from './debugger-coordinator';
 import { MirrorRelay, type MirrorViewportLookup } from './mirror-relay';
 import { RequestDedupMiddleware, type DedupViewportContext } from './request-dedup';
 import { TelemetryService } from './telemetry';
+import {
+  cleanupEmptyReservedDownload,
+  reserveSafeDownloadPath,
+  TabEventBus,
+  type QueryBusFilter,
+  type QueryBusResult,
+} from './tab-event-bus';
 import { WsSseMux, type WsMuxViewportContext } from './ws-sse-mux';
 
 interface LaunchRedirectConvergence {
@@ -188,6 +195,8 @@ export function getDefaultWelcomeUrl(): string {
   return pathToFileURL(path.join(app.getAppPath(), 'dist', 'renderer', 'welcome.html')).toString();
 }
 
+export { reserveSafeDownloadPath };
+
 export class TabManager implements MirrorViewportLookup {
   private readonly tabs: ManagedTab[] = [];
   private activeTabId: string | null = null;
@@ -239,9 +248,9 @@ export class TabManager implements MirrorViewportLookup {
     string,
     { traceId: string; startedAtMs: number; roles: ViewportRole[] }
   >();
-  private readonly recentWindowOpenByTab = new Map<
-    string,
-    { url: string; ts: number; sourceRole: ViewportRole }
+  private readonly downloadHookedSessions = new Map<
+    Session,
+    (event: Electron.Event, item: Electron.DownloadItem, webContents: WebContents) => void
   >();
   private nextLaunchConvergenceEpoch = 1;
   private readonly autoSleepAfterMs: number;
@@ -249,6 +258,7 @@ export class TabManager implements MirrorViewportLookup {
   private readonly inspectTimeoutMs: number;
   private autoSleepTimer: ReturnType<typeof setInterval> | null = null;
 
+  public readonly tabEventBus: TabEventBus;
   public readonly debuggerCoordinator: DebuggerCoordinator;
   public readonly mirrorRelay: MirrorRelay;
   public readonly requestDedup: RequestDedupMiddleware<WebContents>;
@@ -266,6 +276,7 @@ export class TabManager implements MirrorViewportLookup {
     this.autoSleepCheckMs = opts.autoSleepCheckMs ?? DEFAULT_AUTO_SLEEP_CHECK_MS;
     this.inspectTimeoutMs = opts.inspectTimeoutMs ?? DEFAULT_INSPECT_TIMEOUT_MS;
 
+    this.tabEventBus = new TabEventBus();
     this.debuggerCoordinator = new DebuggerCoordinator();
     this.mirrorRelay = new MirrorRelay(this);
     this.requestDedup = new RequestDedupMiddleware(this.debuggerCoordinator, {
@@ -274,6 +285,13 @@ export class TabManager implements MirrorViewportLookup {
         const hit = this.findTabAndRoleByWcId(wcId);
         if (!hit) return;
         hit.tab.dedupCount += countDelta;
+        this.tabEventBus.publish({
+          tabId: hit.tab.id,
+          viewport: hit.role,
+          domain: 'http_dedup',
+          kind: 'replayed',
+          summary: `HTTP idempotent request replayed (+${countDelta})`,
+        });
         // Dedup counter increments are live-only and must never trigger session-state.json writes.
         this.emitState(false);
       },
@@ -282,6 +300,7 @@ export class TabManager implements MirrorViewportLookup {
       this.debuggerCoordinator,
       (wcId) => this.resolveWsMuxContext(wcId),
       {
+        eventBus: this.tabEventBus,
         onDedupIncrement: (wcId, countDelta) => {
           const hit = this.findTabAndRoleByWcId(wcId);
           if (!hit) return;
@@ -321,6 +340,18 @@ export class TabManager implements MirrorViewportLookup {
         }
       },
       this.debuggerCoordinator,
+      {
+        onBusEvent: (ev) => {
+          this.tabEventBus.publish({
+            tabId: ev.tabId,
+            viewport: ev.viewport,
+            domain: ev.domain,
+            kind: ev.kind,
+            summary: ev.summary,
+            tsMs: ev.tsMs,
+          });
+        },
+      },
     );
 
     this.win.on('resize', () => this.applyLayout());
@@ -480,6 +511,88 @@ export class TabManager implements MirrorViewportLookup {
     }
   }
 
+  private ensureSessionDownloadHandler(sess: Session | undefined | null): void {
+    if (!sess || typeof sess.on !== 'function' || this.downloadHookedSessions.has(sess)) {
+      return;
+    }
+    const listener = (
+      event: Electron.Event,
+      item: Electron.DownloadItem,
+      webContents: WebContents,
+    ) => {
+      if (this.disposed || !webContents || webContents.isDestroyed()) return;
+      const hit = this.findTabAndRoleByWcId(webContents.id);
+      if (!hit) return;
+
+      const rawUrl = typeof item.getURL === 'function' ? item.getURL() : '';
+      const filename = typeof item.getFilename === 'function' ? item.getFilename() : 'download';
+
+      if (this.isTabDedupActive(hit.tab)) {
+        const claim = this.tabEventBus.claimEffect(
+          hit.tab.id,
+          hit.role,
+          'download',
+          `${rawUrl}|${filename}`,
+          NAV_MIRROR_SUPPRESS_MS,
+        );
+        if (!claim.allowed) {
+          event.preventDefault();
+          hit.tab.dedupCount += 1;
+          this.emitState(false);
+          return;
+        }
+      } else {
+        this.tabEventBus.publish({
+          tabId: hit.tab.id,
+          viewport: hit.role,
+          domain: 'download',
+          kind: 'started',
+          summary: `download started (${filename})`,
+        });
+      }
+
+      let reservedPath: string | null = null;
+      if (typeof item.setSavePath === 'function') {
+        try {
+          const envDir = process.env.IRON_BROWSER_DOWNLOAD_DIR?.trim();
+          const isWinVisible =
+            typeof this.win.isVisible === 'function' ? this.win.isVisible() : true;
+          const targetDir =
+            envDir ||
+            (!isWinVisible
+              ? path.join(app.getPath('userData'), 'downloads')
+              : app.getPath('downloads'));
+          if (targetDir) {
+            const safePath = reserveSafeDownloadPath(targetDir, filename);
+            if (safePath) {
+              reservedPath = safePath;
+              item.setSavePath(safePath);
+            }
+          }
+        } catch {
+          // Ignore path lookup errors in mocked unit test environments.
+        }
+      }
+
+      if (typeof item.once === 'function') {
+        item.once('done', (_doneEv, state) => {
+          if (state !== 'completed') {
+            cleanupEmptyReservedDownload(reservedPath);
+          }
+          this.tabEventBus.publish({
+            tabId: hit.tab.id,
+            viewport: hit.role,
+            domain: 'download',
+            kind: state === 'completed' ? 'completed' : 'failed',
+            summary: `download ${state} (${filename})`,
+          });
+        });
+      }
+    };
+    sess.on('will-download', listener);
+    this.downloadHookedSessions.set(sess, listener);
+  }
+
   private createViewportView(
     tabId: string,
     role: ViewportRole,
@@ -502,6 +615,7 @@ export class TabManager implements MirrorViewportLookup {
     });
 
     const wc = view.webContents;
+    this.ensureSessionDownloadHandler((wc as { session?: Session }).session);
     view.setVisible(false);
     this.win.contentView.addChildView(view);
 
@@ -511,23 +625,27 @@ export class TabManager implements MirrorViewportLookup {
         const safeUrl = normalizeUrl(url);
         if (safeUrl.startsWith('http://') || safeUrl.startsWith('https://')) {
           const parentTab = this.getTab(tabId);
-          const now = Date.now();
-          if (parentTab && parentTab.mode === 'dual' && parentTab.mirror) {
-            const recent = this.recentWindowOpenByTab.get(tabId);
-            if (
-              recent &&
-              recent.url === safeUrl &&
-              recent.sourceRole !== role &&
-              now - recent.ts <= NAV_MIRROR_SUPPRESS_MS
-            ) {
-              this.recentWindowOpenByTab.delete(tabId);
-              if (parentTab.dedup && parentTab.session === 'shared') {
-                parentTab.dedupCount += 1;
-                this.emitState(false);
-              }
+          if (parentTab && this.isTabDedupActive(parentTab)) {
+            const claim = this.tabEventBus.claimEffect(
+              tabId,
+              role,
+              'popup',
+              safeUrl,
+              NAV_MIRROR_SUPPRESS_MS,
+            );
+            if (!claim.allowed) {
+              parentTab.dedupCount += 1;
+              this.emitState(false);
               return { action: 'deny' };
             }
-            this.recentWindowOpenByTab.set(tabId, { url: safeUrl, ts: now, sourceRole: role });
+          } else {
+            this.tabEventBus.publish({
+              tabId,
+              viewport: role,
+              domain: 'popup',
+              kind: 'opened',
+              summary: safeUrl,
+            });
           }
           this.createTab({ url: safeUrl, mode: 'dual' });
         }
@@ -738,6 +856,13 @@ export class TabManager implements MirrorViewportLookup {
               const pView = tab.portraitView;
               if (pView && !pView.webContents.isDestroyed() && pView.webContents.getURL() !== navUrl) {
                 tab.navSuppressUntil.portrait = now + NAV_MIRROR_SUPPRESS_MS;
+                this.tabEventBus.publish({
+                  tabId: tab.id,
+                  viewport: 'portrait',
+                  domain: 'navigation',
+                  kind: 'redirect_converged',
+                  summary: navUrl,
+                });
                 this.loadViewportUrl(pView.webContents, navUrl);
               }
             }
@@ -749,6 +874,13 @@ export class TabManager implements MirrorViewportLookup {
           ) {
             lc.converged = true;
             tab.navSuppressUntil.portrait = now + NAV_MIRROR_SUPPRESS_MS;
+            this.tabEventBus.publish({
+              tabId: tab.id,
+              viewport: 'portrait',
+              domain: 'navigation',
+              kind: 'redirect_converged',
+              summary: lc.landscapeFinalUrl,
+            });
             this.loadViewportUrl(wc, lc.landscapeFinalUrl);
           }
         }
@@ -930,6 +1062,9 @@ export class TabManager implements MirrorViewportLookup {
 
   private syncTabDedupAndMux(tab: ManagedTab): void {
     const active = this.isTabDedupActive(tab);
+    if (!active) {
+      this.tabEventBus.sessionStorageClearTab(tab.id);
+    }
     const lWc =
       tab.landscapeView && !tab.landscapeView.webContents.isDestroyed()
         ? tab.landscapeView.webContents
@@ -1024,10 +1159,21 @@ export class TabManager implements MirrorViewportLookup {
     }
   }
 
+  onGesture(tabId: string, role: ViewportRole, action: string): void {
+    this.tabEventBus.beginGesture(tabId, role, action);
+  }
+
   onMirrorMiss(tabId: string, info: MirrorMissInfo): void {
     const tab = this.getTab(tabId);
     if (!tab) return;
     this.mirrorMissByTab.set(tabId, info);
+    this.tabEventBus.publish({
+      tabId,
+      viewport: 'both',
+      domain: 'mirror',
+      kind: 'miss',
+      summary: `${info.reason}: ${sanitizeMirrorMissLabel(info.targetLabel, 48)}`,
+    });
     this.emitState(false);
     if (this.latestTelemetry && this.getActiveTab()?.id === tabId) {
       this.latestTelemetry = { ...this.latestTelemetry, mirrorMiss: info };
@@ -1595,6 +1741,7 @@ export class TabManager implements MirrorViewportLookup {
         this.mirrorRelay.clearTab(tab.id);
         this.requestDedup.clearTabSlots(tab.id);
         this.wsSseMux.clearTab(tab.id);
+        this.tabEventBus.sessionStorageClearTab(tab.id);
         this.activeTracesByTab.delete(tab.id);
         sleptIds.push(tab.id);
       }
@@ -1703,6 +1850,13 @@ export class TabManager implements MirrorViewportLookup {
     if (opts.activate !== false || this.activeTabId === null) {
       this.activeTabId = id;
     }
+    this.tabEventBus.publish({
+      tabId: id,
+      viewport: 'both',
+      domain: 'lifecycle',
+      kind: 'tab_created',
+      summary: `${mode}/${sessionMode}: ${url}`,
+    });
 
     if (shouldSpawnViews) {
       this.materializeTabViews(tab, url);
@@ -1743,10 +1897,10 @@ export class TabManager implements MirrorViewportLookup {
       this.requestDedup.clearTab(tab.id);
       this.wsSseMux.clearTab(tab.id);
       this.activeTracesByTab.delete(tab.id);
-      this.recentWindowOpenByTab.delete(tab.id);
       this.clearTabMirrorMiss(tab.id);
       this.mirrorRelay.clearTab(tab.id);
       this.telemetry.clearTabEntries(tab.id);
+      this.tabEventBus.clearTab(tab.id);
     }
 
     if (this.tabs.length === 0) {
@@ -1807,6 +1961,7 @@ export class TabManager implements MirrorViewportLookup {
       this.mirrorRelay.clearTab(tab.id);
       this.requestDedup.clearTabSlots(tab.id);
       this.wsSseMux.clearTab(tab.id);
+      this.tabEventBus.sessionStorageClearTab(tab.id);
       this.activeTracesByTab.delete(tab.id);
       if (tab.id === this.activeTabId) {
         const awakeOther = this.tabs.find((t) => t.id !== tab.id && !t.sleeping);
@@ -1845,6 +2000,14 @@ export class TabManager implements MirrorViewportLookup {
 
     const now = Date.now();
     const isHttpTarget = url.startsWith('http://') || url.startsWith('https://');
+    this.tabEventBus.publish({
+      tabId: tab.id,
+      viewport: 'both',
+      domain: 'navigation',
+      kind: 'navigate',
+      summary: url,
+      tsMs: now,
+    });
     tab.navSuppressUntil.landscape = now + NAV_MIRROR_SUPPRESS_MS;
     tab.navSuppressUntil.portrait = now + NAV_MIRROR_SUPPRESS_MS;
 
@@ -2104,6 +2267,7 @@ export class TabManager implements MirrorViewportLookup {
     tab.launchConvergence = null;
     const prevMode = tab.session;
     tab.session = mode;
+    this.tabEventBus.sessionStorageClearTab(tab.id);
 
     if (tab.portraitView) {
       const wasInspectingPortrait = tab.devtoolsTarget === 'portrait';
@@ -3098,8 +3262,17 @@ export class TabManager implements MirrorViewportLookup {
         ? [primaryRole, primaryRole === 'portrait' ? 'landscape' : 'portrait']
         : [primaryRole];
 
+    await Promise.all(
+      targets.map((role) => {
+        const wc =
+          role === 'portrait' ? tab.portraitView?.webContents : tab.landscapeView?.webContents;
+        return wc && !wc.isDestroyed() ? this.beforeMouseDispatch(wc) : Promise.resolve();
+      }),
+    );
+
     const guard = this.mirrorRelay.getGuard(tab.id);
     const outcomes: Record<string, unknown> = {};
+    this.tabEventBus.beginGesture(tab.id, primaryRole, params.action);
 
     await Promise.all(
       targets.map(async (role) => {
@@ -3814,6 +3987,14 @@ export class TabManager implements MirrorViewportLookup {
 
     const startedAtMs = Date.now();
     this.activeTracesByTab.set(tab.id, { traceId, startedAtMs, roles });
+    this.tabEventBus.publish({
+      tabId: tab.id,
+      viewport: 'both',
+      domain: 'trace',
+      kind: 'start',
+      summary: `trace ${traceId} started`,
+      tsMs: startedAtMs,
+    });
 
     return {
       ok: true,
@@ -3872,6 +4053,13 @@ export class TabManager implements MirrorViewportLookup {
     const snap = await this.telemetry.sampleOnce();
     const gpu = buildGpuTelemetrySeparation(snap.gpuCpuPercent, snap.gpuMemoryMb, null);
     const totalDurationMs = Math.max(0, Date.now() - activeMeta.startedAtMs);
+    this.tabEventBus.publish({
+      tabId: tab.id,
+      viewport: 'both',
+      domain: 'trace',
+      kind: 'stop',
+      summary: `trace ${activeMeta.traceId} stopped (${totalDurationMs}ms)`,
+    });
 
     return {
       ok: true,
@@ -3954,6 +4142,10 @@ export class TabManager implements MirrorViewportLookup {
     return path.resolve(this.mirrorPreloadPath);
   }
 
+  queryTabEvents(filter: QueryBusFilter = {}): QueryBusResult {
+    return this.tabEventBus.query(filter);
+  }
+
   dispose(): void {
     if (this.disposed) return;
     this.disposed = true;
@@ -3965,8 +4157,19 @@ export class TabManager implements MirrorViewportLookup {
     this.pendingEmulations.clear();
     this.observedViewports.clear();
     this.activeTracesByTab.clear();
-    this.recentWindowOpenByTab.clear();
     this.mirrorMissByTab.clear();
+    for (const [sess, listener] of Array.from(this.downloadHookedSessions.entries())) {
+      try {
+        if (typeof sess.off === 'function') {
+          sess.off('will-download', listener);
+        } else if (typeof sess.removeListener === 'function') {
+          sess.removeListener('will-download', listener);
+        }
+      } catch {
+        // Ignore session listener cleanup errors during shutdown.
+      }
+    }
+    this.downloadHookedSessions.clear();
     if (this.autoSleepTimer) {
       clearInterval(this.autoSleepTimer);
       this.autoSleepTimer = null;
@@ -3976,6 +4179,7 @@ export class TabManager implements MirrorViewportLookup {
     this.requestDedup.dispose();
     this.wsSseMux.dispose();
     this.mirrorRelay.dispose();
+    this.tabEventBus.dispose();
     for (const tab of [...this.tabs]) {
       this.destroyTabViews(tab);
       if (tab.session === 'isolated') {

@@ -35,7 +35,7 @@ if [[ ! -x "$ELECTRON_BIN" ]]; then
   exit 1
 fi
 
-if [[ ! -f "$APP_DIR/dist/main/index.js" ]]; then
+if [[ ! -f "$APP_DIR/dist/main/index.js" || ! -f "$APP_DIR/dist/native/iron_browser_bus.node" ]]; then
   (cd "$APP_DIR" && bun run build)
 fi
 

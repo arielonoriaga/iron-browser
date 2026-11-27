@@ -337,11 +337,32 @@ pub fn definitions(hard_max_bytes: usize) -> Value {
                     "tab_id": tab_id
                 }
             }
+        },
+        {
+            "name": "browser_events",
+            "description": "Query the native Rust TabEventBus causal stream (gestures, HTTP/WS/SFS2X dedup, sessionStorage sync, popup & download dedup claims, navigation, console/network errors, mirror misses, and perf traces) filtered by tab, domain, viewport, since_seq, or causal gesture_seq.",
+            "annotations": {"readOnlyHint": true, "destructiveHint": false, "idempotentHint": true, "openWorldHint": false},
+            "inputSchema": {
+                "type": "object",
+                "additionalProperties": false,
+                "properties": {
+                    "tab_id": tab_id,
+                    "domain": {
+                        "type": "string",
+                        "enum": ["all", "gesture", "navigation", "http_dedup", "ws_mux", "storage", "download", "popup", "callback", "console", "network", "trace", "mirror", "lifecycle"],
+                        "default": "all"
+                    },
+                    "viewport": viewport_or_both,
+                    "since_seq": {"type": "integer", "minimum": 0},
+                    "gesture_seq": {"type": "integer", "minimum": 1},
+                    "limit": limit
+                }
+            }
         }
     ]})
 }
 
-const TOOL_NAMES: [&str; 14] = [
+const TOOL_NAMES: [&str; 15] = [
     "browser_tabs",
     "browser_open",
     "browser_navigate",
@@ -356,6 +377,7 @@ const TOOL_NAMES: [&str; 14] = [
     "browser_filmstrip",
     "browser_trace_start",
     "browser_trace_stop",
+    "browser_events",
 ];
 
 pub struct Session {
@@ -653,7 +675,7 @@ mod tests {
     fn all_tools_declare_four_boolean_annotations() {
         let defs = definitions(DEFAULT_MAX_BYTES);
         let tools = defs["tools"].as_array().expect("tools array");
-        assert_eq!(tools.len(), 14);
+        assert_eq!(tools.len(), 15);
         assert_eq!(tools.len(), TOOL_NAMES.len());
         for tool in tools {
             let ann = tool["annotations"].as_object().expect("annotations object");

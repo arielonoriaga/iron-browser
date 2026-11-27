@@ -25,6 +25,7 @@ import {
 } from '../shared/ws-sse-mux-core';
 import type { DebuggerParticipantHooks, DebuggerTarget } from './debugger-coordinator';
 import { buildClusterSiblingChannelKey, parseSfsBinaryPacket } from './sfs-binary-codec';
+import type { TabEventBus } from './tab-event-bus';
 
 export interface MuxWebContents extends DebuggerTarget {
   mainFrame?: { origin?: string | null } | null;
@@ -78,6 +79,7 @@ export interface WsSseMuxOptions {
   maxTotalBufferBytes?: number;
   ipc?: IpcLike;
   onDedupIncrement?: (wcId: number, countDelta: number) => void;
+  eventBus?: TabEventBus;
 }
 
 export interface WsSseMuxStats {
@@ -202,6 +204,7 @@ export class WsSseMux {
   private readonly maxTotalBufferBytes: number;
   private readonly ipc: IpcLike;
   private readonly onDedupIncrement?: (wcId: number, countDelta: number) => void;
+  private readonly eventBus?: TabEventBus;
   private readonly shimScript: string;
 
   private readonly wcStates = new Map<number, ViewportScriptState>();
@@ -233,6 +236,7 @@ export class WsSseMux {
     this.maxTotalBufferBytes = opts.maxTotalBufferBytes ?? WS_MAX_TOTAL_BUFFER_BYTES;
     this.ipc = opts.ipc ?? ipcMain;
     this.onDedupIncrement = opts.onDedupIncrement;
+    this.eventBus = opts.eventBus;
     this.shimScript = buildWsSseMuxShimScript();
 
     this.ipcListener = (ev, raw) => {
@@ -919,9 +923,102 @@ export class WsSseMux {
       case 'upstream-sse-error':
         this.handleUpstreamSseError(ctx, initiatorOrigin, msg.clientSocketId, msg.fatal, msg.retryMs);
         break;
+      case 'ss-hello':
+        this.handleSessionStorageHello(ctx, initiatorOrigin);
+        break;
+      case 'ss-mut':
+        this.handleSessionStorageMut(ctx, initiatorOrigin, msg.op, msg.key, msg.value);
+        break;
       default:
         break;
     }
+  }
+
+  private handleSessionStorageHello(ctx: WsMuxViewportContext, initiatorOrigin: string): void {
+    if (!ctx.active || !this.eventBus) return;
+    const ctxOrigin = ctx.getOrigin(ctx.wc);
+    if (ctxOrigin !== null && ctxOrigin !== initiatorOrigin) return;
+    const entries = this.eventBus.sessionStorageSnapshot(ctx.tabId, initiatorOrigin);
+    if (Object.keys(entries).length === 0) return;
+    this.safeSendToRenderer(ctx.wc, {
+      type: 'mux-ss-sync',
+      clientSocketId: '__ss__',
+      op: 'hydrate',
+      entries,
+    });
+  }
+
+  private handleSessionStorageMut(
+    ctx: WsMuxViewportContext,
+    initiatorOrigin: string,
+    op: unknown,
+    rawKey: unknown,
+    rawValue: unknown,
+  ): void {
+    if (!ctx.active || !this.eventBus) return;
+    const ctxOrigin = ctx.getOrigin(ctx.wc);
+    if (ctxOrigin !== null && ctxOrigin !== initiatorOrigin) return;
+
+    const now = this.now();
+    let changed = false;
+    let forwardMsg: MainToMuxMessage | null = null;
+
+    if (op === 'set' && typeof rawKey === 'string' && typeof rawValue === 'string') {
+      const res = this.eventBus.sessionStorageSet(
+        ctx.tabId,
+        initiatorOrigin,
+        ctx.role,
+        rawKey,
+        rawValue,
+        now,
+      );
+      if (res.ok && res.changed) {
+        changed = true;
+        forwardMsg = {
+          type: 'mux-ss-sync',
+          clientSocketId: '__ss__',
+          op: 'set',
+          key: rawKey,
+          value: rawValue,
+        };
+      }
+    } else if (op === 'remove' && typeof rawKey === 'string') {
+      const res = this.eventBus.sessionStorageRemove(
+        ctx.tabId,
+        initiatorOrigin,
+        ctx.role,
+        rawKey,
+        now,
+      );
+      if (res.ok && res.changed) {
+        changed = true;
+        forwardMsg = {
+          type: 'mux-ss-sync',
+          clientSocketId: '__ss__',
+          op: 'remove',
+          key: rawKey,
+        };
+      }
+    } else if (op === 'clear') {
+      const res = this.eventBus.sessionStorageClear(ctx.tabId, initiatorOrigin, ctx.role, now);
+      if (res.ok && res.changed) {
+        changed = true;
+        forwardMsg = {
+          type: 'mux-ss-sync',
+          clientSocketId: '__ss__',
+          op: 'clear',
+        };
+      }
+    }
+
+    if (!changed || !forwardMsg || !ctx.pairedWc || ctx.pairedWc.isDestroyed()) {
+      return;
+    }
+    const pairedCtx = this.resolveViewportContext(ctx.pairedWc.id);
+    if (!pairedCtx || !pairedCtx.active || pairedCtx.tabId !== ctx.tabId) return;
+    const pairedOrigin = this.resolveAuthoritativeOrigin(pairedCtx);
+    if (!pairedOrigin || pairedOrigin !== initiatorOrigin) return;
+    this.safeSendToRenderer(ctx.pairedWc, forwardMsg);
   }
 
   private handleOpen(
@@ -1051,6 +1148,14 @@ export class WsSseMux {
       });
       this.trackWcChannel(ctx.wc.id, existing.channelId);
       this.onDedupIncrement?.(ctx.wc.id, 1);
+      this.eventBus?.publish({
+        tabId: ctx.tabId,
+        viewport: ctx.role,
+        domain: 'ws_mux',
+        kind: 'follower_attached',
+        summary: `attached ${kind} follower (${existing.normalizedUrl})`,
+        tsMs: now,
+      });
 
       if (existing.state === 'open') {
         this.safeSendToRenderer(ctx.wc, {
@@ -1218,6 +1323,14 @@ export class WsSseMux {
           });
           this.trackWcChannel(promotedOwner.wcId, channel.channelId);
           this.onDedupIncrement?.(promotedOwner.wcId, 1);
+          this.eventBus?.publish({
+            tabId: channel.tabId,
+            viewport: pCtx.role,
+            domain: 'ws_mux',
+            kind: 'cluster_promoted',
+            summary: `promoted sibling cluster shard to follower (${channel.normalizedUrl})`,
+            tsMs: now,
+          });
           this.safeSendToRenderer(pCtx.wc, {
             type: 'mux-promote-to-follower',
             clientSocketId: promotedOwner.clientSocketId,
@@ -1343,6 +1456,14 @@ export class WsSseMux {
       if (parsedSfs.controller === 0 && parsedSfs.action === 0) {
         if (lookup.role === 'follower') {
           this.onDedupIncrement?.(ctx.wc.id, 1);
+          this.eventBus?.publish({
+            tabId: ctx.tabId,
+            viewport: ctx.role,
+            domain: 'ws_mux',
+            kind: 'sfs_handshake_dedup',
+            summary: `deduplicated SFS2X handshake (${channel.normalizedUrl})`,
+            tsMs: now,
+          });
           const fRef = channel.followers.get(sockKey);
           if (fRef) {
             fRef.sfsFollowerState = 'wait_login_req';
@@ -1360,6 +1481,14 @@ export class WsSseMux {
       } else if (parsedSfs.controller === 0 && parsedSfs.action === 1) {
         if (lookup.role === 'follower') {
           this.onDedupIncrement?.(ctx.wc.id, 1);
+          this.eventBus?.publish({
+            tabId: ctx.tabId,
+            viewport: ctx.role,
+            domain: 'ws_mux',
+            kind: 'sfs_login_dedup',
+            summary: `deduplicated SFS2X login (${channel.normalizedUrl})`,
+            tsMs: now,
+          });
           const fRef = channel.followers.get(sockKey);
           if (fRef) {
             fRef.sfsFollowerState = 'ready';
@@ -1415,6 +1544,14 @@ export class WsSseMux {
         this.totalBufferedBytes = Math.max(0, this.totalBufferedBytes - entry.byteLength);
         this.outboundDedup.splice(i, 1);
         this.onDedupIncrement?.(ctx.wc.id, 1);
+        this.eventBus?.publish({
+          tabId: ctx.tabId,
+          viewport: ctx.role,
+          domain: 'ws_mux',
+          kind: 'outbound_dedup',
+          summary: `deduplicated outbound WS frame (${channel.normalizedUrl}, ${byteLength}B)`,
+          tsMs: now,
+        });
         return;
       }
     }

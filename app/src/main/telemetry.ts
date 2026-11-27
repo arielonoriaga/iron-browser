@@ -27,6 +27,14 @@ export interface TelemetryServiceOptions {
   rafTtlMs?: number;
   activePollMs?: number;
   blurPollMs?: number;
+  onBusEvent?: (ev: {
+    tabId: string;
+    viewport: ViewportRole;
+    domain: 'console' | 'network';
+    kind: string;
+    summary: string;
+    tsMs: number;
+  }) => void;
 }
 
 const MAX_CONSOLE_ENTRIES = 400;
@@ -89,6 +97,7 @@ export class TelemetryService {
   private readonly rafTtlMs: number;
   private readonly activePollMs: number;
   private readonly blurPollMs: number;
+  private readonly onBusEvent?: TelemetryServiceOptions['onBusEvent'];
   private readonly rafListener: (ev: IpcMainEvent, rawStats: unknown) => void;
   private nextConsoleId = 1;
   private timer: ReturnType<typeof setTimeout> | null = null;
@@ -109,6 +118,7 @@ export class TelemetryService {
     this.rafTtlMs = opts.rafTtlMs ?? RAF_STATS_TTL_MS;
     this.activePollMs = opts.activePollMs ?? ACTIVE_POLL_INTERVAL_MS;
     this.blurPollMs = opts.blurPollMs ?? BLUR_POLL_INTERVAL_MS;
+    this.onBusEvent = opts.onBusEvent;
     const initGpu = buildGpuTelemetrySeparation(0, 0, null);
     this.lastSnapshot = {
       timestampMs: this.now(),
@@ -351,6 +361,16 @@ export class TelemetryService {
         existing.status = status;
         existing.failed = status !== null && status >= 400;
         existing.durationMs = Math.max(0, this.now() - existing.timestampMs);
+        if (existing.failed) {
+          this.onBusEvent?.({
+            tabId,
+            viewport: role,
+            domain: 'network',
+            kind: status !== null && status >= 500 ? 'http_5xx' : 'http_4xx',
+            summary: `${existing.method} ${existing.url} -> ${status}`,
+            tsMs: this.now(),
+          });
+        }
       }
     } else if (method === 'Network.loadingFinished') {
       const requestId = `${wcId}:${String(params.requestId ?? '')}`;
@@ -367,6 +387,14 @@ export class TelemetryService {
         existing.failed = true;
         existing.errorText = typeof params.errorText === 'string' ? params.errorText : 'failed';
         existing.durationMs = Math.max(0, this.now() - existing.timestampMs);
+        this.onBusEvent?.({
+          tabId,
+          viewport: role,
+          domain: 'network',
+          kind: 'loading_failed',
+          summary: `${existing.method} ${existing.url} (${existing.errorText})`,
+          tsMs: this.now(),
+        });
       }
     }
   }
@@ -412,6 +440,16 @@ export class TelemetryService {
     this.consoleEntries.push(safeEntry);
     if (this.consoleEntries.length > MAX_CONSOLE_ENTRIES) {
       this.consoleEntries.splice(0, this.consoleEntries.length - MAX_CONSOLE_ENTRIES);
+    }
+    if (safeEntry.level === 'error' || safeEntry.level === 'warn') {
+      this.onBusEvent?.({
+        tabId: safeEntry.tabId,
+        viewport: safeEntry.viewport,
+        domain: 'console',
+        kind: safeEntry.level,
+        summary: safeEntry.text.slice(0, 512),
+        tsMs: safeEntry.timestampMs,
+      });
     }
   }
 

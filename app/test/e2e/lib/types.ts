@@ -299,6 +299,32 @@ export interface ControlSocketClientApi {
     tabId?: string,
     maxBytes?: number,
   ): Promise<EvalResultDto>;
+  events(opts?: {
+    tabId?: string;
+    domain?: string;
+    viewport?: ViewportRole | 'both';
+    sinceSeq?: number;
+    gestureSeq?: number;
+    limit?: number;
+  }): Promise<{
+    tabId: string | null;
+    backend: 'rust-napi' | 'ts-fallback';
+    latestSeq: number;
+    totalPublished: number;
+    totalSuppressed: number;
+    count: number;
+    events: Array<{
+      seq: number;
+      tsMs: number;
+      tabId: string;
+      viewport: string;
+      domain: string;
+      kind: string;
+      summary: string;
+      gestureSeq?: number;
+      detail?: string;
+    }>;
+  }>;
   waitForTabReady(
     tabId?: string,
     opts?: WaitForTabReadyOptions,

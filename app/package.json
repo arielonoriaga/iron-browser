@@ -6,10 +6,11 @@
   "description": "IronBrowser — Ultra-lean multi-viewport Zen Chromium developer browser",
   "main": "dist/main/index.js",
   "scripts": {
+    "build:native": "bash scripts/build-native.sh",
     "build:main": "bun build src/main/index.ts --outdir dist/main --target node --format cjs --external electron",
     "build:preload": "bun build src/preload/shell-preload.ts src/preload/mirror-preload.ts --outdir dist/preload --target node --format cjs --external electron",
     "build:renderer": "bun build src/renderer/shell.ts --outdir dist/renderer --target browser --format iife && cp src/renderer/index.html src/renderer/styles.css src/renderer/welcome.html dist/renderer/",
-    "build": "bun run build:main && bun run build:preload && bun run build:renderer",
+    "build": "bun run build:native && bun run build:main && bun run build:preload && bun run build:renderer",
     "typecheck": "tsc --noEmit",
     "test": "bun test",
     "start": "bun run build && electron . --ozone-platform-hint=auto"

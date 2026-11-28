@@ -568,9 +568,9 @@ export const tests: E2ETestCase[] = [
     id: 'T2-F3-01',
     tier: 2,
     features: ['F3'],
-    title: 'Console & network ring buffers wrap cleanly at 400 entries',
+    title: 'Console (400) & network (1000) ring buffers wrap cleanly',
     description:
-      'Emits 425 console logs and 425 fetch requests in live Electron and verifies oldest 0..24 entries evict cleanly while entry 25/30..424 remain in the 400-entry ring buffer.',
+      'Emits 425 console logs and 1025 fetch requests in live Electron and verifies oldest 0..24 entries evict cleanly while entry 25/30..last remain in the 400-entry console and 1000-entry network ring buffers.',
     timeoutMs: 60_000,
     run: async (ctx) => {
       const session = await ctx.launchElectron({ smoke: true });
@@ -585,9 +585,9 @@ export const tests: E2ETestCase[] = [
 
         await session.ctl.evalJs(
           `(async () => {
-            for (let base = 0; base < 425; base += 25) {
+            for (let base = 0; base < 1025; base += 25) {
               const batch = [];
-              for (let j = base; j < Math.min(425, base + 25); j += 1) {
+              for (let j = base; j < Math.min(1025, base + 25); j += 1) {
                 const path =
                   j < 25
                     ? '/status/404?ring=' + j
@@ -638,7 +638,7 @@ export const tests: E2ETestCase[] = [
         const net = await waitUntil(
           async () => {
             const n = await session.ctl.network(tab.id, 400);
-            return n.entries.some((e) => e.url.endsWith('ring=424')) ? n : null;
+            return n.entries.some((e) => e.url.endsWith('ring=1024')) ? n : null;
           },
           5_000,
           'wrapped network ring buffer',
@@ -646,9 +646,9 @@ export const tests: E2ETestCase[] = [
         // TelemetryService.getNetworkEntries caps query limit at 200
         assert.equal(net.count, 200);
         assert.equal(net.entries.some((e) => e.url.endsWith('ring=0')), false);
-        assert.equal(net.entries.some((e) => e.url.endsWith('ring=424')), true);
+        assert.equal(net.entries.some((e) => e.url.endsWith('ring=1024')), true);
 
-        // Filtered 4xx/5xx queries prove 400-entry network ring buffer wrap eviction
+        // Filtered 4xx/5xx queries prove 1000-entry network ring buffer wrap eviction
         const net4xx = await session.ctl.network({ tabId: tab.id, filter: '4xx', limit: 200 });
         assert.equal(net4xx.entries.some((e) => e.url.endsWith('ring=0')), false);
         assert.equal(net4xx.entries.some((e) => e.url.endsWith('ring=24')), false);

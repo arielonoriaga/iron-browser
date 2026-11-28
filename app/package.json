@@ -13,7 +13,7 @@
     "build": "bun run build:native && bun run build:main && bun run build:preload && bun run build:renderer",
     "typecheck": "tsc --noEmit",
     "test": "bun test",
-    "start": "bun run build && electron . --ozone-platform-hint=auto"
+    "start": "bun run build && sh -c 'if [ \"${1:-}\" = \"--\" ]; then shift; fi; has_ozone=0; for arg in \"$@\"; do case \"$arg\" in --ozone-platform*) has_ozone=1; break ;; esac; done; if [ \"$has_ozone\" -eq 1 ]; then exec electron . \"$@\"; elif [ -n \"${DISPLAY:-}\" ] || [ -n \"${WAYLAND_DISPLAY:-}\" ]; then exec electron . --ozone-platform-hint=auto \"$@\"; else exec electron . --ozone-platform=headless --ozone-override-screen-size=1480,920 \"$@\"; fi' _"
   },
   "trustedDependencies": [
     "electron"

@@ -1,11 +1,16 @@
-use std::io::{self, BufRead, Read, Write};
+use std::{
+    io::{self, BufRead, Read, Write},
+    time::Duration,
+};
 
 use anyhow::Result;
 use serde_json::{Value, json};
 
 use crate::{
     frame::truncate_utf8,
-    socket::{DEFAULT_SOCKET_IO_TIMEOUT, LONG_SOCKET_IO_TIMEOUT, SocketClient},
+    socket::{
+        DEFAULT_SOCKET_IO_TIMEOUT, HEAP_SOCKET_IO_TIMEOUT, LONG_SOCKET_IO_TIMEOUT, SocketClient,
+    },
 };
 
 const MAX_REQUEST: usize = 512 * 1024;
@@ -75,6 +80,26 @@ pub fn bound_text_envelope(serialized: &str, max_bytes: usize) -> String {
     }
 
     best
+}
+
+pub fn socket_timeout_for_tool(name: &str, arguments: &Value) -> Duration {
+    if name == "browser_heap" {
+        HEAP_SOCKET_IO_TIMEOUT
+    } else if name == "browser_profile"
+        || name == "browser_filmstrip"
+        || (name == "browser_emulate" && arguments.get("calibrate") == Some(&json!(true)))
+    {
+        LONG_SOCKET_IO_TIMEOUT
+    } else if name == "browser_wait_for" {
+        let wait_ms = arguments
+            .get("timeout_ms")
+            .and_then(Value::as_u64)
+            .unwrap_or(10_000)
+            .clamp(50, 30_000);
+        Duration::from_millis(wait_ms.saturating_add(5_000)).max(DEFAULT_SOCKET_IO_TIMEOUT)
+    } else {
+        DEFAULT_SOCKET_IO_TIMEOUT
+    }
 }
 
 pub fn definitions(hard_max_bytes: usize) -> Value {
@@ -240,7 +265,7 @@ pub fn definitions(hard_max_bytes: usize) -> Value {
         }),
         json!({
             "name": "browser_open",
-            "description": "Open a new IronBrowser tab in single or dual (Portrait + Landscape) mode with optional shared/isolated session partition and viewport dimensions, immediately reporting effective viewport sizing and sizeMismatch.",
+            "description": "Open a new IronBrowser tab in single or dual (Portrait + Landscape) mode with optional shared/isolated session partition, viewport dimensions, and optional background creation (without stealing active tab focus), immediately reporting effective viewport sizing and sizeMismatch.",
             "annotations": {"readOnlyHint": false, "destructiveHint": false, "idempotentHint": false, "openWorldHint": true},
             "inputSchema": {
                 "type": "object",
@@ -253,7 +278,8 @@ pub fn definitions(hard_max_bytes: usize) -> Value {
                     "portrait_preset": {"type": "string", "maxLength": 64},
                     "landscape_preset": {"type": "string", "maxLength": 64},
                     "portrait_size": dims,
-                    "landscape_size": dims
+                    "landscape_size": dims,
+                    "background": {"type": "boolean", "default": false}
                 }
             }
         }),
@@ -290,9 +316,15 @@ pub fn definitions(hard_max_bytes: usize) -> Value {
         }),
         json!({
             "name": "browser_metrics",
-            "description": "Return live structured telemetry: gpuProcessCpuPercent (host GPU-process CPU%, labeled separately from gpuExecutionTimeMs), Portrait/Landscape OS CPU% & RAM MB, rAF FPS & p95 frame ms, CDP JS heap & DOM nodes, console error count, failed network count, and active slow-device emulation state.",
+            "description": "Return live structured telemetry (for the active tab or specified tab_id): gpuProcessCpuPercent (host GPU-process CPU%, labeled separately from gpuExecutionTimeMs), Portrait/Landscape OS CPU% & RAM MB, rAF FPS & p95 frame ms, CDP JS heap & DOM nodes, console error count, failed network count, and active slow-device emulation state.",
             "annotations": {"readOnlyHint": true, "destructiveHint": false, "idempotentHint": true, "openWorldHint": false},
-            "inputSchema": {"type": "object", "additionalProperties": false, "properties": {}}
+            "inputSchema": {
+                "type": "object",
+                "additionalProperties": false,
+                "properties": {
+                    "tab_id": tab_id
+                }
+            }
         }),
         json!({
             "name": "browser_interact",
@@ -489,11 +521,103 @@ pub fn definitions(hard_max_bytes: usize) -> Value {
         heap_tool,
         health_tool,
         webgl_tool,
+        json!({
+            "name": "browser_close_tab",
+            "description": "Close an open IronBrowser tab by tab_id (defaults to active tab), or bulk-close tabs matching session ('isolated' or 'shared') or all open tabs when all=true, keeping a fallback tab open if closing the last tab.",
+            "annotations": {"readOnlyHint": false, "destructiveHint": true, "idempotentHint": false, "openWorldHint": false},
+            "inputSchema": {
+                "type": "object",
+                "additionalProperties": false,
+                "properties": {
+                    "tab_id": tab_id,
+                    "session": {"type": "string", "enum": ["isolated", "shared"]},
+                    "all": {"type": "boolean", "default": false}
+                }
+            }
+        }),
+        json!({
+            "name": "browser_select_tab",
+            "description": "Switch the active IronBrowser tab by tab_id, waking it if sleeping and syncing Dual/Single viewports.",
+            "annotations": {"readOnlyHint": false, "destructiveHint": false, "idempotentHint": true, "openWorldHint": false},
+            "inputSchema": {
+                "type": "object",
+                "additionalProperties": false,
+                "required": ["tab_id"],
+                "properties": {
+                    "tab_id": tab_id
+                }
+            }
+        }),
+        json!({
+            "name": "browser_reload",
+            "description": "Reload a tab across its active viewports, optionally bypassing cache (ignore_cache defaults to true).",
+            "annotations": {"readOnlyHint": false, "destructiveHint": false, "idempotentHint": true, "openWorldHint": true},
+            "inputSchema": {
+                "type": "object",
+                "additionalProperties": false,
+                "properties": {
+                    "tab_id": tab_id,
+                    "ignore_cache": {"type": "boolean", "default": true}
+                }
+            }
+        }),
+        json!({
+            "name": "browser_navigate_history",
+            "description": "Navigate backward or forward in a tab's session history across active viewports.",
+            "annotations": {"readOnlyHint": false, "destructiveHint": false, "idempotentHint": false, "openWorldHint": true},
+            "inputSchema": {
+                "type": "object",
+                "additionalProperties": false,
+                "required": ["direction"],
+                "properties": {
+                    "tab_id": tab_id,
+                    "direction": {"type": "string", "enum": ["back", "forward"]}
+                }
+            }
+        }),
+        json!({
+            "name": "browser_wait_for",
+            "description": "Wait with a bounded timeout for a CSS selector, visible text, URL substring, and/or HTTP network idle state (ignoring long-lived WebSocket/EventSource streams) in portrait or landscape.",
+            "annotations": {"readOnlyHint": true, "destructiveHint": false, "idempotentHint": true, "openWorldHint": false},
+            "inputSchema": {
+                "type": "object",
+                "additionalProperties": false,
+                "properties": {
+                    "tab_id": tab_id,
+                    "viewport": viewport,
+                    "selector": {"type": "string", "minLength": 1, "maxLength": 512},
+                    "text": {"type": "string", "minLength": 1, "maxLength": 1024},
+                    "url_includes": {"type": "string", "minLength": 1, "maxLength": 1024},
+                    "network_idle_ms": {"type": "integer", "minimum": 50, "maximum": 10000},
+                    "timeout_ms": {"type": "integer", "minimum": 50, "maximum": 30000, "default": 10000}
+                }
+            }
+        }),
+        json!({
+            "name": "browser_storage",
+            "description": "Inspect, set, remove, or clear cookies, localStorage, and sessionStorage for a tab viewport while preserving Shared vs Isolated partition isolation.",
+            "annotations": {"readOnlyHint": false, "destructiveHint": true, "idempotentHint": false, "openWorldHint": false},
+            "inputSchema": {
+                "type": "object",
+                "additionalProperties": false,
+                "required": ["action"],
+                "properties": {
+                    "tab_id": tab_id,
+                    "viewport": viewport,
+                    "action": {"type": "string", "enum": ["get", "set", "remove", "clear"]},
+                    "scope": {"type": "string", "enum": ["cookies", "localStorage", "sessionStorage", "all"], "default": "all"},
+                    "key": {"type": "string", "minLength": 1, "maxLength": 1024},
+                    "name": {"type": "string", "minLength": 1, "maxLength": 1024},
+                    "value": {"type": "string", "maxLength": 16384},
+                    "url": {"type": "string", "minLength": 1, "maxLength": 4096}
+                }
+            }
+        }),
     ];
     json!({"tools": tools})
 }
 
-const TOOL_NAMES: [&str; 20] = [
+const TOOL_NAMES: [&str; 26] = [
     "browser_tabs",
     "browser_open",
     "browser_navigate",
@@ -514,7 +638,94 @@ const TOOL_NAMES: [&str; 20] = [
     "browser_heap",
     "browser_health",
     "browser_webgl",
+    "browser_close_tab",
+    "browser_select_tab",
+    "browser_reload",
+    "browser_navigate_history",
+    "browser_wait_for",
+    "browser_storage",
 ];
+
+fn schema_accepts_object(schema: &Value) -> bool {
+    if let Some(ty) = schema.get("type") {
+        if ty.as_str() == Some("object") {
+            return true;
+        }
+        if ty
+            .as_array()
+            .is_some_and(|arr| arr.iter().any(|v| v.as_str() == Some("object")))
+        {
+            return true;
+        }
+    }
+    schema.get("properties").is_some() || schema.get("additionalProperties").is_some()
+}
+
+fn validate_additional_properties(
+    value: &Value,
+    schema: &Value,
+    path: &str,
+) -> std::result::Result<(), String> {
+    if let Some(alternatives) = schema
+        .get("oneOf")
+        .or_else(|| schema.get("anyOf"))
+        .and_then(Value::as_array)
+        && value.is_object()
+    {
+        let object_schemas: Vec<&Value> = alternatives
+            .iter()
+            .filter(|sub| schema_accepts_object(sub))
+            .collect();
+        if !object_schemas.is_empty() {
+            let mut first_err = None;
+            for sub in object_schemas {
+                match validate_additional_properties(value, sub, path) {
+                    Ok(()) => return Ok(()),
+                    Err(e) => {
+                        if first_err.is_none() {
+                            first_err = Some(e);
+                        }
+                    }
+                }
+            }
+            if let Some(err) = first_err {
+                return Err(err);
+            }
+        }
+    }
+
+    if let Some(all_of) = schema.get("allOf").and_then(Value::as_array) {
+        for sub in all_of {
+            validate_additional_properties(value, sub, path)?;
+        }
+    }
+
+    if let Some(obj) = value.as_object()
+        && schema_accepts_object(schema)
+    {
+        let disallow_extra = schema
+            .get("additionalProperties")
+            .and_then(Value::as_bool)
+            == Some(false);
+        let props = schema.get("properties").and_then(Value::as_object);
+        for (key, prop_val) in obj {
+            if disallow_extra && props.is_none_or(|p| !p.contains_key(key)) {
+                return Err(format!("unknown property '{key}' for {path}"));
+            }
+            if let Some(prop_schema) = props.and_then(|p| p.get(key)) {
+                validate_additional_properties(prop_val, prop_schema, &format!("{path}.{key}"))?;
+            }
+        }
+    } else if let Some(arr) = value.as_array()
+        && let Some(item_schema) = schema.get("items")
+    {
+        for (idx, item) in arr.iter().enumerate() {
+            validate_additional_properties(item, item_schema, &format!("{path}[{idx}]"))?;
+        }
+    }
+
+    Ok(())
+}
 
 pub struct Session {
     initialized: bool,
@@ -636,6 +847,24 @@ impl Session {
             return Err((-32602, "arguments must be an object".to_string()));
         }
 
+        if let Some(schema) = definitions(self.hard_max_bytes)
+            .get("tools")
+            .and_then(Value::as_array)
+            .and_then(|tools| {
+                tools
+                    .iter()
+                    .find(|t| t.get("name").and_then(Value::as_str) == Some(name))
+            })
+            .and_then(|tool| tool.get("inputSchema"))
+            && let Err(msg) = validate_additional_properties(&arguments, schema, name)
+        {
+            let (bounded, _) = truncate_utf8(&msg, 1024);
+            return Ok(json!({
+                "content": [{"type": "text", "text": bounded}],
+                "isError": true
+            }));
+        }
+
         // Enforce hard UTF-8 byte cap for browser_eval and all text tool outputs.
         let requested_cap = arguments
             .get("max_bytes")
@@ -670,14 +899,7 @@ impl Session {
             return Ok(self.format_tool_result(name, health, effective_cap));
         }
 
-        let timeout = if name == "browser_profile"
-            || name == "browser_filmstrip"
-            || (name == "browser_emulate" && arguments.get("calibrate") == Some(&json!(true)))
-        {
-            LONG_SOCKET_IO_TIMEOUT
-        } else {
-            DEFAULT_SOCKET_IO_TIMEOUT
-        };
+        let timeout = socket_timeout_for_tool(name, &arguments);
 
         match client.call_with_timeout(name, arguments, timeout) {
             Ok(value) => Ok(self.format_tool_result(name, value, effective_cap)),
@@ -831,7 +1053,7 @@ mod tests {
     fn all_tools_declare_four_boolean_annotations() {
         let defs = definitions(DEFAULT_MAX_BYTES);
         let tools = defs["tools"].as_array().expect("tools array");
-        assert_eq!(tools.len(), 20);
+        assert_eq!(tools.len(), 26);
         assert_eq!(tools.len(), TOOL_NAMES.len());
         for tool in tools {
             let ann = tool["annotations"].as_object().expect("annotations object");
@@ -888,5 +1110,156 @@ mod tests {
             4096,
         );
         assert_eq!(zero_captures["isError"], true);
+    }
+
+    #[test]
+    fn browser_heap_receives_extended_socket_timeout() {
+        assert_eq!(
+            socket_timeout_for_tool("browser_heap", &json!({"action": "snapshot"})),
+            HEAP_SOCKET_IO_TIMEOUT
+        );
+        assert!(HEAP_SOCKET_IO_TIMEOUT > LONG_SOCKET_IO_TIMEOUT);
+        assert_eq!(
+            socket_timeout_for_tool("browser_profile", &json!({"action": "stop"})),
+            LONG_SOCKET_IO_TIMEOUT
+        );
+        assert_eq!(
+            socket_timeout_for_tool("browser_emulate", &json!({"calibrate": true})),
+            LONG_SOCKET_IO_TIMEOUT
+        );
+        assert_eq!(
+            socket_timeout_for_tool("browser_tabs", &json!({})),
+            DEFAULT_SOCKET_IO_TIMEOUT
+        );
+    }
+
+    #[test]
+    fn browser_wait_for_extends_socket_timeout_above_default() {
+        assert_eq!(
+            socket_timeout_for_tool("browser_wait_for", &json!({"timeout_ms": 25_000})),
+            Duration::from_millis(30_000)
+        );
+        assert_eq!(
+            socket_timeout_for_tool("browser_wait_for", &json!({"timeout_ms": 30_000})),
+            Duration::from_millis(35_000)
+        );
+        assert_eq!(
+            socket_timeout_for_tool("browser_wait_for", &json!({"timeout_ms": 500})),
+            DEFAULT_SOCKET_IO_TIMEOUT
+        );
+    }
+
+    fn assert_all_objects_disallow_additional_properties(schema: &Value, path: &str) {
+        if let Some(obj) = schema.as_object() {
+            if obj.get("type").and_then(Value::as_str) == Some("object") {
+                assert_eq!(
+                    obj.get("additionalProperties"),
+                    Some(&json!(false)),
+                    "object schema at {path} must set additionalProperties: false"
+                );
+            }
+            for (key, val) in obj {
+                assert_all_objects_disallow_additional_properties(val, &format!("{path}.{key}"));
+            }
+        } else if let Some(arr) = schema.as_array() {
+            for (idx, item) in arr.iter().enumerate() {
+                assert_all_objects_disallow_additional_properties(item, &format!("{path}[{idx}]"));
+            }
+        }
+    }
+
+    #[test]
+    fn f12_tools_preserve_schema_strictness_and_expose_new_parameters() {
+        let defs = definitions(DEFAULT_MAX_BYTES);
+        let tools = defs["tools"].as_array().expect("tools array");
+        assert_eq!(tools.len(), 26);
+
+        for tool in tools {
+            let name = tool["name"].as_str().expect("tool name");
+            assert_all_objects_disallow_additional_properties(&tool["inputSchema"], name);
+        }
+
+        let close_tab = tools
+            .iter()
+            .find(|t| t["name"] == "browser_close_tab")
+            .expect("browser_close_tab");
+        assert_eq!(
+            close_tab["inputSchema"]["properties"]["tab_id"],
+            json!({"type": "string", "minLength": 1, "maxLength": 64})
+        );
+        assert_eq!(
+            close_tab["inputSchema"]["properties"]["session"],
+            json!({"type": "string", "enum": ["isolated", "shared"]})
+        );
+        assert_eq!(
+            close_tab["inputSchema"]["properties"]["all"],
+            json!({"type": "boolean", "default": false})
+        );
+        assert!(close_tab["inputSchema"].get("required").is_none());
+
+        let open_tab = tools
+            .iter()
+            .find(|t| t["name"] == "browser_open")
+            .expect("browser_open");
+        assert_eq!(
+            open_tab["inputSchema"]["properties"]["background"],
+            json!({"type": "boolean", "default": false})
+        );
+        assert!(
+            open_tab["inputSchema"]["properties"].get("offscreen").is_none(),
+            "browser_open must not expose offscreen"
+        );
+
+        let metrics = tools
+            .iter()
+            .find(|t| t["name"] == "browser_metrics")
+            .expect("browser_metrics");
+        assert_eq!(
+            metrics["inputSchema"]["properties"]["tab_id"],
+            json!({"type": "string", "minLength": 1, "maxLength": 64})
+        );
+        assert!(metrics["inputSchema"].get("required").is_none());
+    }
+
+    #[test]
+    fn call_tool_rejects_unknown_properties_before_socket_rpc() {
+        let session = Session::new(DEFAULT_MAX_BYTES);
+        let unused_client = SocketClient::new(std::path::PathBuf::from(
+            "/nonexistent/iron-browser-test-unused.sock",
+        ));
+
+        let cases = vec![
+            ("browser_close_tab", json!({"foo": 1}), "foo"),
+            ("browser_close_tab", json!({"tabId": "tab-2"}), "tabId"),
+            (
+                "browser_open",
+                json!({"url": "https://example.com", "extra": true}),
+                "extra",
+            ),
+            (
+                "browser_open",
+                json!({"url": "https://example.com", "portrait_size": {"width": 390, "height": 844, "extra": 1}}),
+                "extra",
+            ),
+            ("browser_metrics", json!({"extra": true}), "extra"),
+            ("browser_tabs", json!({"extra": 1}), "extra"),
+            (
+                "browser_emulate",
+                json!({"network": {"latency_ms": 200, "bogus": 1}}),
+                "bogus",
+            ),
+        ];
+
+        for (tool, args, expected_key) in cases {
+            let res = session
+                .call_tool(&unused_client, &json!({"name": tool, "arguments": args}))
+                .expect("tool validation returns MCP tool error result");
+            assert_eq!(res["isError"], true, "expected isError=true for {tool}");
+            let msg = res["content"][0]["text"].as_str().unwrap_or("");
+            assert!(
+                msg.contains("unknown property") && msg.contains(expected_key),
+                "expected unknown property '{expected_key}' error for {tool}, got: {msg}"
+            );
+        }
     }
 }

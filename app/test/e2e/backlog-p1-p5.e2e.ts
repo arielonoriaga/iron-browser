@@ -247,7 +247,11 @@ async function main(): Promise<void> {
           const ud = path.join(smokeTmp, 'ud');
           const sock = path.join(smokeTmp, 'ctl.sock');
           const args = [`--user-data-dir=${ud}`, '--smoke', '--smoke-exit-ms=250'];
-          if (process.env.DISPLAY) args.push('--ozone-platform=x11');
+          if (process.env.DISPLAY) {
+            args.push('--ozone-platform=x11');
+          } else if (process.env.WAYLAND_DISPLAY) {
+            args.push('--ozone-platform=wayland');
+          }
 
           const res = spawnSync(symlinkBin, args, {
             cwd: symlinkDir,
@@ -418,7 +422,7 @@ async function main(): Promise<void> {
           const listResp = mcpResponses.find((r) => r.id === 2) as {
             result: { tools: Array<{ name: string }> };
           };
-          assert.equal(listResp.result.tools.length, 14, 'expected all 14 MCP tools exposed');
+          assert.equal(listResp.result.tools.length, 26, 'expected all 26 MCP tools exposed');
 
           const stripResp = mcpResponses.find((r) => r.id === 3) as {
             result: {

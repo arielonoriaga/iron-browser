@@ -1545,6 +1545,174 @@ export const tests: E2ETestCase[] = [
       }
     },
   },
+
+  {
+    id: 'T4-S09',
+    tier: 4,
+    features: ['F12'],
+    title: 'Background browser_open, tab-scoped browser_metrics, and bulk session browser_close_tab',
+    description:
+      'Opens dual and single isolated background tabs without stealing owner activeTabId, exercises eval/metrics/console/network/screenshot on background tabs, and bulk-closes isolated tabs while keeping owner shared tab intact.',
+    timeoutMs: 90_000,
+    run: async (ctx: E2ETestContext): Promise<void> => {
+      const base = ctx.servers.httpBaseUrl;
+      const session = await ctx.launchElectron({
+        smoke: true,
+        seedSession: makeSeedSession([makeTabFixture(`${base}/echo?owner=1`)]),
+      });
+      try {
+        const initialTabs = await session.ctl.tabs();
+        const ownerId = initialTabs.activeTabId!;
+        assert.ok(ownerId, 'expected active owner tab');
+        await session.ctl.waitForTabReady(ownerId, { expectedUrlIncludes: '/echo?owner=1' });
+
+        // 1. Open dual & single isolated background tabs without stealing focus
+        const bgDual = await session.ctl.request<{
+          activeTabId: string;
+          tab: { id: string; mode: string; session: string } | null;
+          viewportReport: Record<string, { effectiveCssSize: { width: number; height: number } | null }>;
+        }>('browser_open', {
+          url: `${base}/page/interactions?bg=dual`,
+          mode: 'dual',
+          session: 'isolated',
+          background: true,
+        });
+        assert.equal(bgDual.activeTabId, ownerId, 'dual background open must not steal activeTabId');
+        assert.ok(bgDual.tab && bgDual.tab.id !== ownerId);
+        assert.equal(bgDual.tab.mode, 'dual');
+        assert.equal(bgDual.tab.session, 'isolated');
+
+        const bgSingle = await session.ctl.request<{
+          activeTabId: string;
+          tab: { id: string; mode: string; session: string } | null;
+          viewportReport: Record<string, { effectiveCssSize: { width: number; height: number } | null }>;
+        }>('browser_open', {
+          url: `${base}/page/interactions?bg=single`,
+          mode: 'single',
+          session: 'isolated',
+          background: true,
+        });
+        assert.equal(bgSingle.activeTabId, ownerId, 'single background open must not steal activeTabId');
+        assert.ok(bgSingle.tab && bgSingle.tab.id !== ownerId);
+        assert.equal(bgSingle.tab.mode, 'single');
+        assert.equal(bgSingle.tab.session, 'isolated');
+
+        const bgDualId = bgDual.tab.id;
+        const bgSingleId = bgSingle.tab.id;
+        await Promise.all([
+          session.ctl.waitForTabReady(bgDualId, { expectedUrlIncludes: 'bg=dual' }),
+          session.ctl.waitForTabReady(bgSingleId, { expectedUrlIncludes: 'bg=single' }),
+        ]);
+
+        // 2. Hidden single-mode tab keeps non-zero CSS viewport & captures screenshot cleanly
+        const singleDimsEval = await session.ctl.evalJs(
+          'JSON.stringify({ w: window.innerWidth, h: window.innerHeight })',
+          'landscape',
+          bgSingleId,
+        );
+        const singleDims = JSON.parse(singleDimsEval.value) as { w: number; h: number };
+        assert.ok(singleDims.w > 200 && singleDims.h > 200, `expected non-zero hidden single viewport, got ${singleDimsEval.value}`);
+
+        const singleShot = await session.ctl.screenshot(bgSingleId, 'landscape');
+        assert.ok((singleShot.captures.landscape?.bytes ?? 0) > 100, 'expected non-empty screenshot from background single tab');
+
+        // 3. Background dual tab supports eval, console, network, screenshot, and tab-scoped metrics
+        await session.ctl.evalJs(
+          `console.error('bg-dual-sentinel'); fetch(${JSON.stringify(`${base}/echo?from=bg-dual`)}); 'ok'`,
+          'portrait',
+          bgDualId,
+        );
+        await pollUntil(
+          async () => {
+            const c = await session.ctl.console({ tabId: bgDualId, level: 'error', limit: 20 });
+            const n = await session.ctl.network({ tabId: bgDualId, limit: 20 });
+            return c.entries.some((e) => e.text.includes('bg-dual-sentinel')) &&
+              n.entries.some((e) => e.url.includes('from=bg-dual'))
+              ? true
+              : null;
+          },
+          5_000,
+          100,
+          'background dual console & network entries',
+        );
+
+        const dualMetrics = await session.ctl.request<{
+          tabId?: string;
+          portrait: { domNodes: number } | null;
+          landscape: { domNodes: number } | null;
+          consoleErrorCount: number;
+        }>('browser_metrics', { tab_id: bgDualId });
+        assert.equal(dualMetrics.tabId, bgDualId);
+        assert.ok(dualMetrics.portrait !== null && dualMetrics.landscape !== null);
+        assert.ok(dualMetrics.landscape.domNodes > 0);
+        assert.ok(dualMetrics.consoleErrorCount >= 1);
+
+        const singleMetrics = await session.ctl.request<{
+          tabId?: string;
+          portrait: unknown;
+          landscape: { domNodes: number } | null;
+        }>('browser_metrics', { tab_id: bgSingleId });
+        assert.equal(singleMetrics.tabId, bgSingleId);
+        assert.equal(singleMetrics.portrait, null);
+        assert.ok(singleMetrics.landscape !== null);
+
+        // Active owner tab remains focused and unaffected
+        assert.equal((await session.ctl.tabs()).activeTabId, ownerId);
+
+        // 4. Reject session without all: true and reject unknown properties without closing active tab
+        await assert.rejects(
+          () => session.ctl.request('browser_close_tab', { session: 'isolated' }),
+          (err: unknown) => err instanceof Error && err.message.includes('requires all=true'),
+        );
+        await assert.rejects(
+          () => session.ctl.request('browser_close_tab', { foo: 1 }),
+          (err: unknown) => err instanceof Error && err.message.includes("unknown property 'foo'"),
+        );
+        await assert.rejects(
+          () => session.ctl.request('browser_close_tab', { tabId: bgDualId }),
+          (err: unknown) => err instanceof Error && err.message.includes("unknown property 'tabId'"),
+        );
+        const tabsAfterReject = await session.ctl.tabs();
+        assert.equal(tabsAfterReject.activeTabId, ownerId, 'unknown-key close rejection must preserve activeTabId');
+        assert.equal(tabsAfterReject.tabs.length, 3, 'unknown-key close rejection must leave all 3 tabs intact');
+
+        // 5. Bulk close all isolated tabs, leaving shared owner tab & activeTabId intact
+        const bulkClose = await session.ctl.request<{
+          ok: boolean;
+          closedTabId: string | null;
+          closedTabIds: string[];
+          closedCount: number;
+          activeTabId: string;
+          tabs: Array<{ id: string; session: string }>;
+        }>('browser_close_tab', { session: 'isolated', all: true });
+        assert.equal(bulkClose.ok, true);
+        assert.equal(bulkClose.closedTabId, null);
+        assert.equal(bulkClose.closedCount, 2);
+        assert.deepEqual(bulkClose.closedTabIds, [bgDualId, bgSingleId]);
+        assert.equal(bulkClose.activeTabId, ownerId);
+        assert.equal(bulkClose.tabs.length, 1);
+        assert.equal(bulkClose.tabs[0]?.id, ownerId);
+
+        // 6. Second bulk close of isolated tabs is an idempotent no-op
+        const noopClose = await session.ctl.request<{
+          ok: boolean;
+          closedTabId: string | null;
+          closedTabIds: string[];
+          closedCount: number;
+          activeTabId: string;
+          tabs: Array<{ id: string }>;
+        }>('browser_close_tab', { session: 'isolated', all: true });
+        assert.equal(noopClose.ok, true);
+        assert.equal(noopClose.closedTabId, null);
+        assert.deepEqual(noopClose.closedTabIds, []);
+        assert.equal(noopClose.closedCount, 0);
+        assert.equal(noopClose.activeTabId, ownerId);
+        assert.equal(noopClose.tabs.length, 1);
+      } finally {
+        await session.close();
+      }
+    },
+  },
 ];
 
 export default tests;

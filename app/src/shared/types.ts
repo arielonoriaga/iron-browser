@@ -4,6 +4,16 @@ export type SessionMode = 'shared' | 'isolated';
 export type ThemeMode = 'dark' | 'light';
 export type AgentDockMode = 'docked' | 'floating' | 'minimized';
 export type AgentCliPreset = 'agy' | 'claude' | 'codex' | 'opencode' | 'shell' | 'custom';
+export type AgentInstanceKind = 'tmux' | 'iron-term';
+
+export interface AgentCliOption {
+  id: string;
+  label: string;
+  preset: AgentCliPreset;
+  command?: string;
+  available: boolean;
+  source: 'builtin' | 'env' | 'shell';
+}
 
 export interface RunningAgentInstance {
   target: string;
@@ -12,11 +22,14 @@ export interface RunningAgentInstance {
   cwd: string;
   pid: number;
   isAgentLike: boolean;
+  kind?: AgentInstanceKind;
+  sessionId?: string;
+  state?: string;
 }
 
 export interface AgentSessionSnapshot {
   active: boolean;
-  kind: 'none' | 'pty' | 'tmux';
+  kind: 'none' | 'pty' | 'tmux' | 'iron-term';
   label: string;
   preset?: AgentCliPreset;
   targetPane?: string;
@@ -168,6 +181,8 @@ export interface LayoutInput {
   dockOpen: boolean;
   dockHeight: number;
   splitRatio: number;
+  findBarOpen?: boolean;
+  errorBannerOpen?: boolean;
   agentDockMode?: AgentDockMode;
   agentDockWidth?: number;
   agentFloatBounds?: Rect;
@@ -176,6 +191,8 @@ export interface LayoutInput {
 export interface LayoutResult {
   topBar: Rect;
   rail: Rect | null;
+  errorBanner?: Rect | null;
+  findBar?: Rect | null;
   portraitHeader: Rect | null;
   portraitView: Rect | null;
   divider: Rect | null;
@@ -223,6 +240,32 @@ export interface ViewportSizingSummary {
   mismatchReason?: string;
 }
 
+export interface TabLoadError {
+  viewport: ViewportRole;
+  errorCode: number;
+  errorDescription: string;
+  url: string;
+  timestampMs: number;
+}
+
+export interface FindInPageResult {
+  activeMatchOrdinal: number;
+  matches: number;
+  finalUpdate: boolean;
+  viewport: ViewportRole;
+}
+
+export interface DownloadProgressInfo {
+  id: string;
+  tabId: string;
+  viewport: ViewportRole;
+  filename: string;
+  receivedBytes: number;
+  totalBytes: number;
+  state: 'progressing' | 'completed' | 'cancelled' | 'interrupted';
+  savePath?: string | null;
+}
+
 export interface TabSnapshot {
   id: string;
   title: string;
@@ -242,6 +285,8 @@ export interface TabSnapshot {
   devtoolsTarget: ViewportRole;
   audioSource: ViewportRole | 'muted';
   dedupCount: number;
+  zoomFactor?: number;
+  loadError?: TabLoadError | null;
   viewportReport?: Partial<Record<ViewportRole, ViewportSizingSummary>>;
   emulation?: TabEmulationSummary;
 }
@@ -437,9 +482,26 @@ export interface IronShellApi {
   setAgentDockMode?(mode: AgentDockMode): Promise<ShellState>;
   setAgentDockWidth?(width: number): Promise<ShellState>;
   sendContextToAgent?(): Promise<boolean>;
+  findInPage?(
+    text: string,
+    opts?: { forward?: boolean; findNext?: boolean; matchCase?: boolean; viewport?: ViewportRole },
+  ): Promise<void>;
+  stopFindInPage?(
+    action?: 'clearSelection' | 'keepSelection' | 'activateSelection',
+  ): Promise<void>;
+  setFindOpen?(open: boolean): Promise<void>;
+  zoomIn?(): Promise<ShellState>;
+  zoomOut?(): Promise<ShellState>;
+  zoomReset?(): Promise<ShellState>;
+  retryLoad?(tabId?: string): Promise<ShellState>;
+  dismissLoadError?(tabId?: string): Promise<ShellState>;
   onStateUpdate(cb: (state: ShellState) => void): () => void;
   onTelemetry(cb: (snapshot: TelemetrySnapshot) => void): () => void;
   onFocusUrlBar(cb: () => void): () => void;
+  onOpenFind?(cb: () => void): () => void;
+  onCloseFind?(cb: () => void): () => void;
+  onFindResult?(cb: (res: FindInPageResult) => void): () => void;
+  onDownloadEvent?(cb: (ev: DownloadProgressInfo) => void): () => void;
 }
 
 export interface ConsoleEntry {

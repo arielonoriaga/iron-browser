@@ -1,7 +1,8 @@
-import { describe, expect, test } from 'bun:test';
+import { afterAll, describe, expect, test } from 'bun:test';
 import { EventEmitter } from 'node:events';
 import fs from 'node:fs';
 import { createRequire } from 'node:module';
+import os from 'node:os';
 import path from 'node:path';
 import vm from 'node:vm';
 import {
@@ -23,6 +24,13 @@ import type {
 
 const APP_ROOT = path.resolve(import.meta.dir, '..');
 const nodeRequire = createRequire(import.meta.url);
+const testTempUserDataDirs: string[] = [];
+
+afterAll(() => {
+  for (const dir of testTempUserDataDirs.splice(0)) {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
 
 // ---------------------------------------------------------------------------
 // Self-contained minimal DOM test harness (for src/renderer/shell.ts)
@@ -233,6 +241,20 @@ class FakeDocument {
       ['btn-dock-toggle', 'button'],
       ['dt-target-portrait', 'button'],
       ['dt-target-landscape', 'button'],
+      ['load-error-banner', 'div', ['hidden']],
+      ['load-error-text', 'span'],
+      ['btn-retry-load', 'button'],
+      ['btn-dismiss-error', 'button'],
+      ['find-bar', 'div', ['hidden']],
+      ['find-input', 'input'],
+      ['find-count', 'span'],
+      ['find-prev', 'button'],
+      ['find-next', 'button'],
+      ['find-close', 'button'],
+      ['btn-zoom-out', 'button'],
+      ['btn-zoom-reset', 'button'],
+      ['btn-zoom-in', 'button'],
+      ['download-toast', 'span', ['hidden']],
     ];
     for (const [id, tag, classes] of ids) {
       const el = new FakeElement(tag);
@@ -250,6 +272,23 @@ class FakeDocument {
 
   createElement(tag: string): FakeElement {
     return new FakeElement(tag);
+  }
+
+  private readonly docListeners = new Map<string, Array<(ev: unknown) => void>>();
+  addEventListener(type: string, fn: (ev: unknown) => void): void {
+    const arr = this.docListeners.get(type) ?? [];
+    arr.push(fn);
+    this.docListeners.set(type, arr);
+  }
+  dispatchEvent(ev: { type: string; [k: string]: unknown }): void {
+    const arr = this.docListeners.get(ev.type) ?? [];
+    for (const fn of [...arr]) {
+      fn({
+        preventDefault: () => {},
+        stopPropagation: () => {},
+        ...ev,
+      });
+    }
   }
 }
 
@@ -497,7 +536,7 @@ async function loadInIsolatedElectronVm(entryRelPath: string) {
     }
   }
 
-  class FakeSession {
+  class FakeSession extends EventEmitter {
     clearCacheCalls = 0;
     async clearCache(): Promise<void> {
       this.clearCacheCalls += 1;
@@ -644,10 +683,13 @@ async function loadInIsolatedElectronVm(entryRelPath: string) {
   }
   const fakeIpcMain = new FakeIpcMain();
 
+  const testUserDataDir = fs.mkdtempSync(path.join(os.tmpdir(), 'iron-shell-ui-'));
+  testTempUserDataDirs.push(testUserDataDir);
+
   const fakeElectron = {
     app: {
       getAppPath: () => APP_ROOT,
-      getPath: () => path.join(APP_ROOT, '.test-userdata'),
+      getPath: () => testUserDataDir,
       setPath: () => {},
       getAppMetrics: () => [],
       commandLine: { appendSwitch: () => {} },
@@ -1332,6 +1374,274 @@ describe('M4B Main IPCs (index.ts) & TabManager Wiring', () => {
       mgr.setDockOpen(true);
       mgr.dispose();
       mgr.dispose();
+    } finally {
+      mgr.dispose();
+    }
+  });
+
+  test('F4 Shell UI (find bar, error banner, zoom controls, download toast) & TabManager F4 behaviors', async () => {
+    // 1. Renderer shell.ts M2 controls
+    const doc = new FakeDocument();
+    const state0 = makeSampleState();
+    const calls: Array<{ method: string; args: unknown[] }> = [];
+    let findOpenCb: (() => void) | null = null;
+    let findResCb: ((res: { activeMatchOrdinal: number; matches: number; finalUpdate: boolean; viewport: 'portrait' | 'landscape' }) => void) | null = null;
+    let dlCb: ((ev: { id: string; tabId: string; viewport: 'portrait' | 'landscape'; filename: string; receivedBytes: number; totalBytes: number; state: 'progressing' | 'completed' | 'cancelled' | 'interrupted'; savePath?: string | null }) => void) | null = null;
+
+    const { api } = makeFakeShellApi(state0);
+    const m2Api: IronShellApi = {
+      ...api,
+      findInPage: async (text, opts) => {
+        calls.push({ method: 'findInPage', args: [text, opts] });
+      },
+      stopFindInPage: async (action) => {
+        calls.push({ method: 'stopFindInPage', args: [action] });
+      },
+      setFindOpen: async (open) => {
+        calls.push({ method: 'setFindOpen', args: [open] });
+      },
+      zoomIn: async () => {
+        calls.push({ method: 'zoomIn', args: [] });
+        return makeSampleState({
+          tabs: [{ ...state0.tabs[0]!, zoomFactor: 1.1 }],
+        });
+      },
+      zoomOut: async () => {
+        calls.push({ method: 'zoomOut', args: [] });
+        return makeSampleState({
+          tabs: [{ ...state0.tabs[0]!, zoomFactor: 0.9 }],
+        });
+      },
+      zoomReset: async () => {
+        calls.push({ method: 'zoomReset', args: [] });
+        return makeSampleState({
+          tabs: [{ ...state0.tabs[0]!, zoomFactor: 1 }],
+        });
+      },
+      retryLoad: async () => {
+        calls.push({ method: 'retryLoad', args: [] });
+        return makeSampleState({
+          tabs: [{ ...state0.tabs[0]!, loadError: null }],
+        });
+      },
+      dismissLoadError: async () => {
+        calls.push({ method: 'dismissLoadError', args: [] });
+        return makeSampleState({
+          tabs: [{ ...state0.tabs[0]!, loadError: null }],
+        });
+      },
+      onOpenFind: (cb) => {
+        findOpenCb = cb;
+        return () => {};
+      },
+      onCloseFind: () => () => {},
+      onFindResult: (cb) => {
+        findResCb = cb;
+        return () => {};
+      },
+      onDownloadEvent: (cb) => {
+        dlCb = cb;
+        return () => {};
+      },
+    };
+
+    await mountShell(doc as unknown as Document, m2Api);
+
+    // Open Find Bar -> type query (findNext: true) -> Next (findNext: false) -> Result -> Escape
+    findOpenCb!();
+    expect(doc.getElementById('find-bar')!.classList.contains('hidden')).toBe(false);
+    const findInput = doc.getElementById('find-input')!;
+    findInput.value = 'needle';
+    findInput.dispatchEvent({ type: 'input' });
+    doc.getElementById('find-next')!.click();
+    doc.getElementById('find-prev')!.click();
+    findResCb!({ activeMatchOrdinal: 2, matches: 5, finalUpdate: true, viewport: 'landscape' });
+    expect(doc.getElementById('find-count')!.textContent).toBe('2 / 5');
+    findResCb!({ activeMatchOrdinal: 0, matches: 0, finalUpdate: true, viewport: 'landscape' });
+    expect(doc.getElementById('find-count')!.textContent).toBe('0 / 0');
+
+    expect(calls.filter((c) => c.method === 'findInPage')).toEqual([
+      { method: 'findInPage', args: ['needle', { forward: true, findNext: true }] },
+      { method: 'findInPage', args: ['needle', { forward: true, findNext: false }] },
+      { method: 'findInPage', args: ['needle', { forward: false, findNext: false }] },
+    ]);
+
+    doc.dispatchEvent({ type: 'keydown', key: 'Escape', ctrlKey: false, metaKey: false, shiftKey: false, altKey: false });
+    expect(doc.getElementById('find-bar')!.classList.contains('hidden')).toBe(true);
+    expect(calls.some((c) => c.method === 'stopFindInPage' && c.args[0] === 'clearSelection')).toBe(true);
+
+    // Zoom controls update label
+    doc.getElementById('btn-zoom-in')!.click();
+    await new Promise((r) => setTimeout(r, 10));
+    expect(doc.getElementById('btn-zoom-reset')!.textContent).toBe('110%');
+
+    // Error banner & Retry
+    renderState(
+      makeSampleState({
+        tabs: [
+          {
+            ...state0.tabs[0]!,
+            loadError: {
+              viewport: 'landscape',
+              errorCode: -102,
+              errorDescription: 'ERR_CONNECTION_REFUSED',
+              url: 'http://127.0.0.1:9999/',
+              timestampMs: 123,
+            },
+          },
+        ],
+      }),
+    );
+    expect(doc.getElementById('load-error-banner')!.classList.contains('hidden')).toBe(false);
+    expect(doc.getElementById('load-error-text')!.textContent).toContain('ERR_CONNECTION_REFUSED');
+    doc.getElementById('btn-retry-load')!.click();
+    await new Promise((r) => setTimeout(r, 10));
+    expect(doc.getElementById('load-error-banner')!.classList.contains('hidden')).toBe(true);
+
+    // Download toast uses textContent only (XSS-safe)
+    const toast = doc.getElementById('download-toast')!;
+    dlCb!({
+      id: 'dl-1',
+      tabId: 'tab-1',
+      viewport: 'landscape',
+      filename: '<img src=x>.csv',
+      receivedBytes: 50,
+      totalBytes: 100,
+      state: 'progressing',
+    });
+    expect(toast.classList.contains('hidden')).toBe(false);
+    expect(toast.textContent).toBe('Downloading <img src=x>.csv (50%)');
+    expect(toast.innerHtmlWrites).toBe(0);
+    dlCb!({
+      id: 'dl-1',
+      tabId: 'tab-1',
+      viewport: 'landscape',
+      filename: 'report.csv',
+      receivedBytes: 100,
+      totalBytes: 100,
+      state: 'completed',
+    });
+    expect(toast.textContent).toBe('Saved report.csv');
+
+    // 2. TabManager VM tests for did-fail-load, zoom preservation, findInPage, context-menu, downloads
+    const vmEnv = await loadInIsolatedElectronVm('src/main/tab-manager.ts');
+    const TabManager = vmEnv.exports.TabManager as new (...args: unknown[]) => any;
+    const win = new vmEnv.FakeBrowserWindow();
+    const mgr = new TabManager(win as never, '/app/mirror-preload.js', () => false);
+    try {
+      const st = mgr.createTab({ url: 'http://127.0.0.1:9999/fail', mode: 'single' });
+      const tabId = st.activeTabId!;
+      const lWc = mgr.getViewportWebContents(tabId, 'landscape')!;
+
+      // Subframe & ERR_ABORTED (-3) & chrome-error:// must NOT trigger loadError
+      lWc.emit('did-fail-load', {}, -102, 'ERR_CONNECTION_REFUSED', 'http://127.0.0.1:9999/sub', false);
+      expect(mgr.getShellState().tabs[0]!.loadError).toBeNull();
+      lWc.emit('did-fail-load', {}, -3, 'ERR_ABORTED', 'http://127.0.0.1:9999/abort', true);
+      expect(mgr.getShellState().tabs[0]!.loadError).toBeNull();
+      lWc.emit('did-fail-load', {}, -102, 'ERR_CONNECTION_REFUSED', 'chrome-error://chromewebdata/', true);
+      expect(mgr.getShellState().tabs[0]!.loadError).toBeNull();
+
+      // Main-frame failure sets loadError; Electron 35 error-page did-finish-load (with wc.getURL() === failed URL) MUST NOT clear it
+      lWc.emit('did-start-loading');
+      lWc.currentUrl = 'http://127.0.0.1:9999/fail';
+      lWc.mainFrame = { origin: 'null' };
+      lWc.emit('did-fail-load', {}, -102, 'ERR_CONNECTION_REFUSED', 'http://127.0.0.1:9999/fail', true);
+      expect(mgr.getShellState().tabs[0]!.loadError?.errorDescription).toBe('ERR_CONNECTION_REFUSED');
+      lWc.emit('did-finish-load');
+      lWc.emit('did-stop-loading');
+      expect(mgr.getShellState().tabs[0]!.loadError).not.toBeNull();
+      expect(mgr.getShellState().tabs[0]!.loadError?.errorDescription).toBe('ERR_CONNECTION_REFUSED');
+
+      // Retry that fails again preserves loadError across the second error-page did-finish-load
+      mgr.retryLoad(tabId);
+      lWc.emit('did-start-loading');
+      lWc.currentUrl = 'http://127.0.0.1:9999/fail';
+      lWc.mainFrame = { origin: 'null' };
+      lWc.emit('did-fail-load', {}, -102, 'ERR_CONNECTION_REFUSED', 'http://127.0.0.1:9999/fail', true);
+      lWc.emit('did-finish-load');
+      lWc.emit('did-stop-loading');
+      expect(mgr.getShellState().tabs[0]!.loadError).not.toBeNull();
+
+      // chrome-error:// did-finish-load also does NOT clear loadError
+      lWc.currentUrl = 'chrome-error://chromewebdata/';
+      lWc.emit('did-finish-load');
+      expect(mgr.getShellState().tabs[0]!.loadError).not.toBeNull();
+
+      // Subsequent real navigation (did-start-loading -> did-finish-load on real URL) clears loadError
+      lWc.emit('did-start-loading');
+      lWc.currentUrl = 'http://127.0.0.1:9999/ok';
+      lWc.mainFrame = { origin: 'http://127.0.0.1:9999' };
+      lWc.emit('did-finish-load');
+      expect(mgr.getShellState().tabs[0]!.loadError).toBeNull();
+
+      // Zoom steps & clamping + preservation across applyViewportEmulation
+      mgr.zoomIn(tabId);
+      expect(mgr.getShellState().tabs[0]!.zoomFactor).toBe(1.1);
+      expect(lWc.zoomFactor).toBe(1.1);
+      lWc.emit('did-finish-load');
+      await new Promise((r) => setTimeout(r, 15));
+      expect(lWc.zoomFactor).toBe(1.1);
+      for (let i = 0; i < 20; i += 1) mgr.zoomIn(tabId);
+      expect(mgr.getShellState().tabs[0]!.zoomFactor).toBe(5.0);
+      for (let i = 0; i < 25; i += 1) mgr.zoomOut(tabId);
+      expect(mgr.getShellState().tabs[0]!.zoomFactor).toBe(0.25);
+      mgr.zoomReset(tabId);
+      expect(mgr.getShellState().tabs[0]!.zoomFactor).toBe(1.0);
+
+      // Context menu expanded items
+      lWc.emit('context-menu', {}, {
+        x: 12,
+        y: 18,
+        isEditable: true,
+        selectionText: 'abc',
+        linkURL: 'https://example.com/link',
+        mediaType: 'image',
+        srcURL: 'https://example.com/pic.png',
+        editFlags: { canCut: true, canCopy: true, canPaste: true, canSelectAll: true },
+      });
+      const labels = vmEnv
+        .getLastMenuTemplate()
+        .map((item: { label?: string }) => item.label)
+        .filter(Boolean);
+      for (const expected of [
+        'Back',
+        'Forward',
+        'Reload',
+        'Cut',
+        'Copy',
+        'Paste',
+        'Select All',
+        'Open Link in New Tab',
+        'Copy Link Address',
+        'Save Image',
+        'Copy Image',
+        'Copy Image Address',
+        'Inspect Element (landscape)',
+      ]) {
+        expect(labels).toContain(expected);
+      }
+
+      // Download progress & completion emits shell:download-event
+      const fakeItem = new EventEmitter() as EventEmitter & {
+        getURL: () => string;
+        getFilename: () => string;
+        getTotalBytes: () => number;
+        getReceivedBytes: () => number;
+        setSavePath: (p: string) => void;
+      };
+      fakeItem.getURL = () => 'http://127.0.0.1:8080/sample.csv';
+      fakeItem.getFilename = () => 'sample.csv';
+      fakeItem.getTotalBytes = () => 100;
+      fakeItem.getReceivedBytes = () => 100;
+      fakeItem.setSavePath = () => {};
+      win.sentMessages.length = 0;
+      vmEnv.defaultSession.emit('will-download', { preventDefault: () => {} }, fakeItem, lWc);
+      fakeItem.emit('done', {}, 'completed');
+      const dlEvents = win.sentMessages.filter(
+        (m: { channel: string; payload: unknown }) => m.channel === 'shell:download-event',
+      );
+      expect(dlEvents.length).toBeGreaterThanOrEqual(2);
+      expect((dlEvents[dlEvents.length - 1]!.payload as { state: string }).state).toBe('completed');
     } finally {
       mgr.dispose();
     }

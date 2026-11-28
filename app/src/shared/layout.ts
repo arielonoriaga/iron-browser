@@ -1,6 +1,8 @@
 import type { LayoutInput, LayoutResult, Rect } from './types';
 
 export const TOP_BAR_HEIGHT = 40;
+export const FIND_BAR_HEIGHT = 34;
+export const ERROR_BANNER_HEIGHT = 34;
 export const RAIL_WIDTH = 216;
 export const VIEWPORT_HEADER_HEIGHT = 28;
 export const DIVIDER_WIDTH = 6;
@@ -239,7 +241,36 @@ export function computeLayout(input: LayoutInput): LayoutResult {
   }
 
   const contentW = Math.max(MIN_VIEWPORT_WIDTH, availableAfterRail - rightReservedW);
-  const availableH = Math.max(MIN_VIEWPORT_HEIGHT + TELEMETRY_BAR_HEIGHT, winH - TOP_BAR_HEIGHT);
+
+  let bannerOffset = 0;
+  const errorBanner = input.errorBannerOpen
+    ? {
+        x: contentX,
+        y: TOP_BAR_HEIGHT + bannerOffset,
+        width: contentW,
+        height: ERROR_BANNER_HEIGHT,
+      }
+    : null;
+  if (errorBanner) {
+    bannerOffset += ERROR_BANNER_HEIGHT;
+  }
+
+  const findBar = input.findBarOpen
+    ? {
+        x: contentX,
+        y: TOP_BAR_HEIGHT + bannerOffset,
+        width: contentW,
+        height: FIND_BAR_HEIGHT,
+      }
+    : null;
+  if (findBar) {
+    bannerOffset += FIND_BAR_HEIGHT;
+  }
+
+  const availableH = Math.max(
+    MIN_VIEWPORT_HEIGHT + TELEMETRY_BAR_HEIGHT,
+    winH - TOP_BAR_HEIGHT - bannerOffset,
+  );
 
   const maxDockH = Math.max(
     MIN_DOCK_HEIGHT,
@@ -255,8 +286,9 @@ export function computeLayout(input: LayoutInput): LayoutResult {
 
   const dockTotalH = input.dockOpen ? clampedDockHeight : TELEMETRY_BAR_HEIGHT;
   const dockY = winH - dockTotalH;
-  const stageH = Math.max(VIEWPORT_HEADER_HEIGHT + 60, dockY - TOP_BAR_HEIGHT);
-  const viewY = TOP_BAR_HEIGHT + VIEWPORT_HEADER_HEIGHT;
+  const headerY = TOP_BAR_HEIGHT + bannerOffset;
+  const stageH = Math.max(VIEWPORT_HEADER_HEIGHT + 60, dockY - headerY);
+  const viewY = headerY + VIEWPORT_HEADER_HEIGHT;
   const viewH = Math.max(60, stageH - VIEWPORT_HEADER_HEIGHT);
 
   const telemetryBar = {
@@ -292,12 +324,14 @@ export function computeLayout(input: LayoutInput): LayoutResult {
     return {
       topBar,
       rail,
+      errorBanner,
+      findBar,
       portraitHeader: null,
       portraitView: null,
       divider: null,
       landscapeHeader: {
         x: contentX,
-        y: TOP_BAR_HEIGHT,
+        y: headerY,
         width: contentW,
         height: VIEWPORT_HEADER_HEIGHT,
       },
@@ -331,9 +365,11 @@ export function computeLayout(input: LayoutInput): LayoutResult {
   return {
     topBar,
     rail,
+    errorBanner,
+    findBar,
     portraitHeader: {
       x: contentX,
-      y: TOP_BAR_HEIGHT,
+      y: headerY,
       width: portraitW,
       height: VIEWPORT_HEADER_HEIGHT,
     },
@@ -345,13 +381,13 @@ export function computeLayout(input: LayoutInput): LayoutResult {
     },
     divider: {
       x: dividerX,
-      y: TOP_BAR_HEIGHT,
+      y: headerY,
       width: DIVIDER_WIDTH,
       height: stageH,
     },
     landscapeHeader: {
       x: landscapeX,
-      y: TOP_BAR_HEIGHT,
+      y: headerY,
       width: landscapeW,
       height: VIEWPORT_HEADER_HEIGHT,
     },

@@ -36,10 +36,18 @@ fn spawn_mock_browser_socket(
                     "activeTabId": "tab-1",
                     "tabs": [{"id": "tab-1", "url": "https://example.com", "mode": "dual", "mirror": true}]
                 }),
-                "browser_open" => json!({
-                    "activeTabId": "tab-2",
-                    "tab": {"id": "tab-2", "url": req.params["url"], "mode": req.params["mode"]}
-                }),
+                "browser_open" => {
+                    let is_bg = req.params.get("background") == Some(&json!(true));
+                    json!({
+                        "activeTabId": if is_bg { "tab-1" } else { "tab-2" },
+                        "tab": {
+                            "id": "tab-2",
+                            "url": req.params["url"],
+                            "mode": req.params["mode"],
+                            "session": req.params.get("session").cloned().unwrap_or_else(|| json!("shared"))
+                        }
+                    })
+                }
                 "browser_navigate" => json!({
                     "activeTabId": "tab-1",
                     "tab": {"id": "tab-1", "url": req.params["url"]}
@@ -68,6 +76,7 @@ fn spawn_mock_browser_socket(
                     }
                 }),
                 "browser_metrics" => json!({
+                    "tabId": req.params.get("tab_id").cloned().unwrap_or_else(|| json!("tab-1")),
                     "gpuCpuPercent": 11.2,
                     "gpuMemoryMb": 142.0,
                     "totalMemoryMb": 390.5,
@@ -242,6 +251,68 @@ fn spawn_mock_browser_socket(
                         }
                     }
                 }),
+                "browser_close_tab" => {
+                    if req.params.get("all") == Some(&json!(true)) {
+                        let closed_ids = if req.params.get("session") == Some(&json!("isolated")) {
+                            vec!["tab-2", "tab-3"]
+                        } else {
+                            vec!["tab-1", "tab-2", "tab-3"]
+                        };
+                        json!({
+                            "ok": true,
+                            "closedTabId": Value::Null,
+                            "closedTabIds": closed_ids,
+                            "closedCount": closed_ids.len(),
+                            "activeTabId": "tab-1",
+                            "tabs": [{"id": "tab-1", "url": "https://example.com", "session": "shared"}]
+                        })
+                    } else {
+                        let closed_id = req.params.get("tab_id").cloned().unwrap_or_else(|| json!("tab-2"));
+                        json!({
+                            "ok": true,
+                            "closedTabId": closed_id,
+                            "closedTabIds": [closed_id],
+                            "closedCount": 1,
+                            "activeTabId": "tab-1",
+                            "tabs": [{"id": "tab-1", "url": "https://example.com"}]
+                        })
+                    }
+                }
+                "browser_select_tab" => json!({
+                    "ok": true,
+                    "activeTabId": req.params["tab_id"],
+                    "tab": {"id": req.params["tab_id"], "url": "https://example.com"},
+                    "tabs": [{"id": req.params["tab_id"], "url": "https://example.com"}]
+                }),
+                "browser_reload" => json!({
+                    "ok": true,
+                    "tabId": req.params.get("tab_id").cloned().unwrap_or_else(|| json!("tab-1")),
+                    "tab": {"id": "tab-1", "url": "https://example.com"}
+                }),
+                "browser_navigate_history" => json!({
+                    "ok": true,
+                    "direction": req.params["direction"],
+                    "tabId": req.params.get("tab_id").cloned().unwrap_or_else(|| json!("tab-1")),
+                    "url": "https://example.com",
+                    "canGoBack": false,
+                    "canGoForward": true
+                }),
+                "browser_wait_for" => json!({
+                    "ok": true,
+                    "tabId": req.params.get("tab_id").cloned().unwrap_or_else(|| json!("tab-1")),
+                    "viewport": req.params.get("viewport").cloned().unwrap_or_else(|| json!("landscape")),
+                    "matched": true,
+                    "elapsedMs": 12
+                }),
+                "browser_storage" => json!({
+                    "ok": true,
+                    "tabId": req.params.get("tab_id").cloned().unwrap_or_else(|| json!("tab-1")),
+                    "viewport": req.params.get("viewport").cloned().unwrap_or_else(|| json!("landscape")),
+                    "scope": req.params.get("scope").cloned().unwrap_or_else(|| json!("localStorage")),
+                    "action": req.params["action"],
+                    "localStorage": {"k": "v"},
+                    "value": "v"
+                }),
                 other => {
                     let resp = CtlRpcResponse {
                         id: json!(req.id),
@@ -273,8 +344,8 @@ fn spawn_mock_browser_socket(
 }
 
 #[test]
-fn mcp_end_to_end_exercises_all_twenty_tools_over_framed_unix_socket() {
-    let (_dir, sock_path, server) = spawn_mock_browser_socket(20);
+fn mcp_end_to_end_exercises_all_twenty_six_tools_over_framed_unix_socket() {
+    let (_dir, sock_path, server) = spawn_mock_browser_socket(26);
     let client = SocketClient::new(sock_path);
 
     let requests = vec![
@@ -301,6 +372,12 @@ fn mcp_end_to_end_exercises_all_twenty_tools_over_framed_unix_socket() {
         json!({"jsonrpc":"2.0","id":20,"method":"tools/call","params":{"name":"browser_heap","arguments":{"tab":"tab-1","viewport":"portrait","action":"snapshot","top":30}}}),
         json!({"jsonrpc":"2.0","id":21,"method":"tools/call","params":{"name":"browser_health","arguments":{"lines":25}}}),
         json!({"jsonrpc":"2.0","id":22,"method":"tools/call","params":{"name":"browser_webgl","arguments":{"viewport":"portrait","action":"capture_frame","max_calls":64}}}),
+        json!({"jsonrpc":"2.0","id":23,"method":"tools/call","params":{"name":"browser_close_tab","arguments":{"tab_id":"tab-2"}}}),
+        json!({"jsonrpc":"2.0","id":24,"method":"tools/call","params":{"name":"browser_select_tab","arguments":{"tab_id":"tab-1"}}}),
+        json!({"jsonrpc":"2.0","id":25,"method":"tools/call","params":{"name":"browser_reload","arguments":{"tab_id":"tab-1","ignore_cache":true}}}),
+        json!({"jsonrpc":"2.0","id":26,"method":"tools/call","params":{"name":"browser_navigate_history","arguments":{"tab_id":"tab-1","direction":"back"}}}),
+        json!({"jsonrpc":"2.0","id":27,"method":"tools/call","params":{"name":"browser_wait_for","arguments":{"tab_id":"tab-1","viewport":"landscape","selector":"#ready","timeout_ms":1500}}}),
+        json!({"jsonrpc":"2.0","id":28,"method":"tools/call","params":{"name":"browser_storage","arguments":{"tab_id":"tab-1","viewport":"landscape","action":"get","scope":"localStorage","key":"k"}}}),
     ];
 
     let mut wire_in = String::new();
@@ -315,7 +392,7 @@ fn mcp_end_to_end_exercises_all_twenty_tools_over_framed_unix_socket() {
         .expect("serve_io succeeds");
 
     let received = server.join().expect("mock socket thread joined");
-    assert_eq!(received.len(), 20);
+    assert_eq!(received.len(), 26);
     // Verify browser_eval received clamped max_bytes = 512
     assert_eq!(received[8].method, "browser_eval");
     assert_eq!(received[8].params["max_bytes"], json!(512));
@@ -345,14 +422,14 @@ fn mcp_end_to_end_exercises_all_twenty_tools_over_framed_unix_socket() {
         .map(|l| serde_json::from_str::<Value>(l).expect("valid json line"))
         .collect();
 
-    // 23 input lines minus 1 notification = 22 responses
-    assert_eq!(lines.len(), 22);
+    // 29 input lines minus 1 notification = 28 responses
+    assert_eq!(lines.len(), 28);
 
     // Initialize negotiated 2025-06-18
     assert_eq!(lines[0]["result"]["protocolVersion"], "2025-06-18");
 
-    // tools/list returns all 20 tools
-    assert_eq!(lines[1]["result"]["tools"].as_array().unwrap().len(), 20);
+    // tools/list returns all 26 tools
+    assert_eq!(lines[1]["result"]["tools"].as_array().unwrap().len(), 26);
 
     // browser_emulate response includes active profile & calibration result
     let emu_text = lines[17]["result"]["content"][0]["text"].as_str().unwrap();
@@ -383,6 +460,17 @@ fn mcp_end_to_end_exercises_all_twenty_tools_over_framed_unix_socket() {
     let eval_json: Value = serde_json::from_str(eval_text).expect("truncated envelope json");
     assert_eq!(eval_json["truncated"], true);
     assert_eq!(eval_json["maxBytes"], 512);
+
+    // Verify all 6 new M2 tools were forwarded and returned non-error payloads
+    assert_eq!(received[20].method, "browser_close_tab");
+    assert_eq!(received[21].method, "browser_select_tab");
+    assert_eq!(received[22].method, "browser_reload");
+    assert_eq!(received[23].method, "browser_navigate_history");
+    assert_eq!(received[24].method, "browser_wait_for");
+    assert_eq!(received[25].method, "browser_storage");
+    for line in &lines[22..=27] {
+        assert_eq!(line["result"]["isError"], false);
+    }
 }
 
 #[test]
@@ -528,4 +616,118 @@ fn browser_health_returns_offline_logs_and_crash_dump_when_socket_unreachable() 
     let dump = iron_browser_mcp::socket::scan_latest_crash_dump(&dir.path().join("Crashpad"));
     assert_eq!(dump["path"], dmp_path.display().to_string());
     assert_eq!(dump["totalDumps"], 1);
+}
+
+#[test]
+fn f12_background_open_metrics_tab_id_and_bulk_close_over_socket() {
+    let (_dir, sock_path, server) = spawn_mock_browser_socket(3);
+    let client = SocketClient::new(sock_path);
+
+    let input = [
+        json!({"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18","capabilities":{},"clientInfo":{"name":"f12-test","version":"1"}}}),
+        json!({"jsonrpc":"2.0","method":"notifications/initialized"}),
+        json!({"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"browser_open","arguments":{"url":"http://127.0.0.1:4100/bg","mode":"single","session":"isolated","background":true}}}),
+        json!({"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"browser_metrics","arguments":{"tab_id":"tab-2"}}}),
+        json!({"jsonrpc":"2.0","id":4,"method":"tools/call","params":{"name":"browser_close_tab","arguments":{"session":"isolated","all":true}}}),
+    ]
+    .iter()
+    .map(|v| serde_json::to_string(v).unwrap())
+    .collect::<Vec<_>>()
+    .join("\n")
+        + "\n";
+
+    let mut out = Vec::new();
+    serve_io(&client, 16384, Cursor::new(input.as_bytes()), &mut out).expect("serve_io");
+
+    let received = server.join().expect("mock socket thread joined");
+    assert_eq!(received.len(), 3);
+    assert_eq!(received[0].method, "browser_open");
+    assert_eq!(received[0].params["background"], json!(true));
+    assert_eq!(received[0].params["session"], json!("isolated"));
+    assert_eq!(received[1].method, "browser_metrics");
+    assert_eq!(received[1].params["tab_id"], json!("tab-2"));
+    assert_eq!(received[2].method, "browser_close_tab");
+    assert_eq!(received[2].params["session"], json!("isolated"));
+    assert_eq!(received[2].params["all"], json!(true));
+
+    let responses: Vec<Value> = String::from_utf8(out)
+        .unwrap()
+        .lines()
+        .map(|l| serde_json::from_str(l).unwrap())
+        .collect();
+    assert_eq!(responses.len(), 4);
+
+    let open_payload: Value =
+        serde_json::from_str(responses[1]["result"]["content"][0]["text"].as_str().unwrap())
+            .unwrap();
+    assert_eq!(open_payload["activeTabId"], "tab-1");
+    assert_eq!(open_payload["tab"]["id"], "tab-2");
+
+    let metrics_payload: Value =
+        serde_json::from_str(responses[2]["result"]["content"][0]["text"].as_str().unwrap())
+            .unwrap();
+    assert_eq!(metrics_payload["tabId"], "tab-2");
+
+    let close_payload: Value =
+        serde_json::from_str(responses[3]["result"]["content"][0]["text"].as_str().unwrap())
+            .unwrap();
+    assert_eq!(close_payload["ok"], true);
+    assert_eq!(close_payload["closedCount"], 2);
+    assert_eq!(close_payload["closedTabIds"], json!(["tab-2", "tab-3"]));
+}
+
+#[test]
+fn additional_properties_false_rejects_unknown_keys_without_forwarding_socket_rpc() {
+    // Mock server expects ONLY 1 valid request at the end; all invalid calls must be blocked in mcp.rs.
+    let (_dir, sock_path, server) = spawn_mock_browser_socket(1);
+    let client = SocketClient::new(sock_path);
+
+    let input = [
+        json!({"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18","capabilities":{},"clientInfo":{"name":"strict-schema-test","version":"1"}}}),
+        json!({"jsonrpc":"2.0","method":"notifications/initialized"}),
+        json!({"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"browser_close_tab","arguments":{"foo":1}}}),
+        json!({"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"browser_close_tab","arguments":{"tabId":"tab-2"}}}),
+        json!({"jsonrpc":"2.0","id":4,"method":"tools/call","params":{"name":"browser_open","arguments":{"url":"https://example.com","extra":true}}}),
+        json!({"jsonrpc":"2.0","id":5,"method":"tools/call","params":{"name":"browser_open","arguments":{"url":"https://example.com","landscape_size":{"width":1280,"height":720,"bogus":1}}}}),
+        json!({"jsonrpc":"2.0","id":6,"method":"tools/call","params":{"name":"browser_metrics","arguments":{"extra":true}}}),
+        json!({"jsonrpc":"2.0","id":7,"method":"tools/call","params":{"name":"browser_tabs","arguments":{}}}),
+    ]
+    .iter()
+    .map(|v| serde_json::to_string(v).unwrap())
+    .collect::<Vec<_>>()
+    .join("\n")
+        + "\n";
+
+    let mut out = Vec::new();
+    serve_io(&client, 16384, Cursor::new(input.as_bytes()), &mut out).expect("serve_io");
+
+    let received = server.join().expect("mock socket thread joined");
+    assert_eq!(received.len(), 1, "invalid calls must never hit the socket");
+    assert_eq!(received[0].method, "browser_tabs");
+
+    let responses: Vec<Value> = String::from_utf8(out)
+        .unwrap()
+        .lines()
+        .map(|l| serde_json::from_str(l).unwrap())
+        .collect();
+    assert_eq!(responses.len(), 7);
+
+    for (idx, expected_key) in [
+        (1, "foo"),
+        (2, "tabId"),
+        (3, "extra"),
+        (4, "bogus"),
+        (5, "extra"),
+    ] {
+        assert_eq!(responses[idx]["result"]["isError"], true);
+        let text = responses[idx]["result"]["content"][0]["text"]
+            .as_str()
+            .unwrap();
+        assert!(
+            text.contains("unknown property") && text.contains(expected_key),
+            "expected unknown property '{expected_key}', got: {text}"
+        );
+    }
+
+    assert_eq!(responses[6]["result"]["isError"], false);
 }

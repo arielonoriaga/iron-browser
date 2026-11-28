@@ -37,7 +37,7 @@
       <div class="launcher-tabs">
         <button id="tab-running" class="ltab active" type="button">Running Instances</button>
         <button id="tab-start" class="ltab" type="button">Start CLI Agent</button>
-        <button id="btn-refresh-instances" class="mini-btn" type="button" title="Refresh live tmux instances">↻</button>
+        <button id="btn-refresh-instances" class="mini-btn" type="button" title="Refresh live agent / terminal instances">↻</button>
         <button id="btn-disconnect" class="mini-btn danger hidden" type="button" title="Disconnect / Stop session">Stop</button>
       </div>
 
@@ -46,22 +46,27 @@
       </div>
 
       <div id="pane-start" class="launcher-body hidden">
-        <div class="preset-chips">
-          <button class="chip-btn" data-preset="agy" type="button">agy</button>
-          <button class="chip-btn" data-preset="claude" type="button">claude</button>
-          <button class="chip-btn" data-preset="codex" type="button">codex</button>
-          <button class="chip-btn" data-preset="opencode" type="button">opencode</button>
+        <div id="preset-chips" class="preset-chips">
           <button class="chip-btn" data-preset="shell" type="button">shell</button>
         </div>
         <div class="custom-row">
           <input id="input-cwd" class="field-input" type="text" placeholder="Working dir (e.g. ~/Projects/...)" />
         </div>
         <form id="custom-cli-form" class="custom-row">
-          <input id="input-custom-cli" class="field-input" type="text" placeholder="Or any CLI command (e.g. agy --resume, aider, ...)" />
+          <input id="input-custom-cli" class="field-input" type="text" placeholder="Or any CLI command (e.g. claude, aider, sh -l, ...)" />
           <button class="run-btn" type="submit">Start</button>
         </form>
       </div>
     </section>
+
+    <div class="transcript-toolbar">
+      <span class="transcript-label">Transcript</span>
+      <div class="transcript-actions">
+        <button id="btn-copy-transcript" class="transcript-btn" type="button" title="Copy transcript to clipboard">Copy</button>
+        <button id="btn-export-transcript" class="transcript-btn" type="button" title="Export transcript to file">Export</button>
+        <button id="btn-clear-transcript" class="transcript-btn danger" type="button" title="Clear transcript">Clear</button>
+      </div>
+    </div>
 
     <main id="terminal-wrap" class="terminal-wrap" tabindex="0" aria-label="Agent terminal output (click to send direct keys)">
       <div id="terminal-screen" class="terminal-screen md-mode"></div>
@@ -76,6 +81,8 @@
       <button class="qkey" data-skey="Escape" type="button">Esc</button>
       <button class="qkey danger" data-skey="Interrupt" type="button">^C</button>
     </div>
+
+    <div id="composer-status" class="composer-status hidden" role="status" aria-live="polite"></div>
 
     <form id="chat-form" class="chat-composer">
       <textarea id="chat-input" class="chat-input" rows="2" placeholder="Chat with connected instance or CLI agent (Enter to send, Shift+Enter newline)..."></textarea>

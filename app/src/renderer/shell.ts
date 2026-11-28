@@ -2,6 +2,8 @@ import { computeLayout } from '../shared/layout';
 import { sanitizeMirrorMissLabel } from '../shared/mirror-core';
 import type {
   DevicePreset,
+  DownloadProgressInfo,
+  FindInPageResult,
   HistoryEntry,
   IronShellApi,
   MirrorMissInfo,
@@ -107,9 +109,26 @@ let btnDockToggleEl!: HTMLButtonElement;
 let dtTargetPortraitEl!: HTMLButtonElement;
 let dtTargetLandscapeEl!: HTMLButtonElement;
 
+let loadErrorBannerEl: HTMLElement | null = null;
+let loadErrorTextEl: HTMLElement | null = null;
+let btnRetryLoadEl: HTMLButtonElement | null = null;
+let btnDismissErrorEl: HTMLButtonElement | null = null;
+let findBarEl: HTMLElement | null = null;
+let findInputEl: HTMLInputElement | null = null;
+let findCountEl: HTMLElement | null = null;
+let findPrevEl: HTMLButtonElement | null = null;
+let findNextEl: HTMLButtonElement | null = null;
+let findCloseEl: HTMLButtonElement | null = null;
+let btnZoomOutEl: HTMLButtonElement | null = null;
+let btnZoomResetEl: HTMLButtonElement | null = null;
+let btnZoomInEl: HTMLButtonElement | null = null;
+let downloadToastEl: HTMLElement | null = null;
+
 let currentState: ShellState | null = null;
 let presets: readonly DevicePreset[] = [];
 let lastRenderedHistory: HistoryEntry[] | null = null;
+let findBarOpen = false;
+let downloadToastTimer: ReturnType<typeof setTimeout> | null = null;
 
 function bindDomElements(doc: Document): void {
   docRef = doc;
@@ -184,6 +203,21 @@ function bindDomElements(doc: Document): void {
   btnDockToggleEl = $<HTMLButtonElement>(doc, 'btn-dock-toggle');
   dtTargetPortraitEl = $<HTMLButtonElement>(doc, 'dt-target-portrait');
   dtTargetLandscapeEl = $<HTMLButtonElement>(doc, 'dt-target-landscape');
+
+  loadErrorBannerEl = doc.getElementById('load-error-banner');
+  loadErrorTextEl = doc.getElementById('load-error-text');
+  btnRetryLoadEl = doc.getElementById('btn-retry-load') as HTMLButtonElement | null;
+  btnDismissErrorEl = doc.getElementById('btn-dismiss-error') as HTMLButtonElement | null;
+  findBarEl = doc.getElementById('find-bar');
+  findInputEl = doc.getElementById('find-input') as HTMLInputElement | null;
+  findCountEl = doc.getElementById('find-count');
+  findPrevEl = doc.getElementById('find-prev') as HTMLButtonElement | null;
+  findNextEl = doc.getElementById('find-next') as HTMLButtonElement | null;
+  findCloseEl = doc.getElementById('find-close') as HTMLButtonElement | null;
+  btnZoomOutEl = doc.getElementById('btn-zoom-out') as HTMLButtonElement | null;
+  btnZoomResetEl = doc.getElementById('btn-zoom-reset') as HTMLButtonElement | null;
+  btnZoomInEl = doc.getElementById('btn-zoom-in') as HTMLButtonElement | null;
+  downloadToastEl = doc.getElementById('download-toast');
 }
 
 function applyRect(el: HTMLElement, rect: Rect | null): void {
@@ -253,6 +287,7 @@ function renderLayout(state: ShellState): void {
   const doc = docRef ?? document;
   const win = doc.defaultView ?? (typeof window !== 'undefined' ? window : null);
   const active = state.tabs.find((t) => t.id === state.activeTabId) ?? state.tabs[0];
+  const errorBannerOpen = Boolean(active?.loadError);
   const layout = computeLayout({
     windowWidth: win?.innerWidth ?? 1480,
     windowHeight: win?.innerHeight ?? 920,
@@ -261,6 +296,8 @@ function renderLayout(state: ShellState): void {
     dockOpen: state.dockOpen,
     dockHeight: state.dockHeight,
     splitRatio: state.splitRatio,
+    findBarOpen,
+    errorBannerOpen,
     agentDockMode: state.agentDock?.mode,
     agentDockWidth: state.agentDock?.width,
     agentFloatBounds: state.agentDock?.floatBounds,
@@ -268,6 +305,12 @@ function renderLayout(state: ShellState): void {
 
   applyRect(topBarEl, layout.topBar);
   applyRect(railEl, layout.rail);
+  if (loadErrorBannerEl) {
+    applyRect(loadErrorBannerEl, layout.errorBanner ?? null);
+  }
+  if (findBarEl) {
+    applyRect(findBarEl, layout.findBar ?? null);
+  }
   applyRect(portraitHeaderEl, layout.portraitHeader);
   applyRect(splitDividerEl, layout.divider);
   applyRect(landscapeHeaderEl, layout.landscapeHeader);
@@ -363,6 +406,15 @@ export function renderState(state: ShellState): void {
 
     selectPortraitEl.value = active.portraitPresetId;
     selectLandscapeEl.value = active.landscapePresetId;
+
+    if (btnZoomResetEl) {
+      btnZoomResetEl.textContent = `${Math.round((active.zoomFactor ?? 1) * 100)}%`;
+    }
+    if (loadErrorTextEl) {
+      loadErrorTextEl.textContent = active.loadError
+        ? `${active.loadError.errorDescription} (${active.loadError.url})`
+        : '';
+    }
 
     const pAudioOn = active.audioSource === 'portrait';
     const lAudioOn = active.audioSource === 'landscape';
@@ -614,6 +666,72 @@ export function renderTelemetry(snap: TelemetrySnapshot): void {
   }
 }
 
+function openFindBar(): void {
+  findBarOpen = true;
+  if (currentState) renderLayout(currentState);
+  void getApi().setFindOpen?.(true);
+  if (findInputEl) {
+    findInputEl.focus();
+    findInputEl.select();
+    if (findInputEl.value) {
+      void getApi().findInPage?.(findInputEl.value, { forward: true, findNext: true });
+    }
+  }
+}
+
+function closeFindBar(notifyBackend = true): void {
+  findBarOpen = false;
+  if (findCountEl) {
+    findCountEl.textContent = '0 / 0';
+  }
+  if (currentState) renderLayout(currentState);
+  if (notifyBackend) {
+    void getApi().stopFindInPage?.('clearSelection');
+    void getApi().setFindOpen?.(false);
+  }
+}
+
+function renderFindResult(res: FindInPageResult): void {
+  if (!findCountEl) return;
+  findCountEl.textContent =
+    res.matches > 0 ? `${res.activeMatchOrdinal} / ${res.matches}` : '0 / 0';
+}
+
+function renderDownloadToast(ev: DownloadProgressInfo): void {
+  if (!downloadToastEl) return;
+  if (downloadToastTimer) {
+    clearTimeout(downloadToastTimer);
+    downloadToastTimer = null;
+  }
+  let text: string;
+  if (ev.state === 'progressing') {
+    if (ev.totalBytes > 0) {
+      const pct = Math.min(100, Math.round((ev.receivedBytes / ev.totalBytes) * 100));
+      text = `Downloading ${ev.filename} (${pct}%)`;
+    } else {
+      text = `Downloading ${ev.filename}...`;
+    }
+  } else if (ev.state === 'completed') {
+    text = `Saved ${ev.filename}`;
+  } else if (ev.state === 'cancelled') {
+    text = `Cancelled ${ev.filename}`;
+  } else {
+    text = `Failed ${ev.filename}`;
+  }
+  downloadToastEl.textContent = text;
+  downloadToastEl.classList.remove('hidden');
+  downloadToastEl.classList.toggle(
+    'error',
+    ev.state === 'interrupted' || ev.state === 'cancelled',
+  );
+  if (ev.state !== 'progressing') {
+    downloadToastTimer = setTimeout(() => {
+      downloadToastTimer = null;
+      downloadToastEl?.classList.add('hidden');
+    }, 10_000);
+  }
+}
+
 function wireEvents(): void {
   const doc = docRef ?? document;
   const win = doc.defaultView ?? (typeof window !== 'undefined' ? window : null);
@@ -785,6 +903,119 @@ function wireEvents(): void {
   win?.addEventListener('resize', () => {
     if (currentState) renderLayout(currentState);
   });
+
+  btnRetryLoadEl?.addEventListener('click', () => {
+    void getApi().retryLoad?.().then((st) => {
+      if (st) renderState(st);
+    });
+  });
+
+  btnDismissErrorEl?.addEventListener('click', () => {
+    void getApi().dismissLoadError?.().then((st) => {
+      if (st) renderState(st);
+    });
+  });
+
+  btnZoomOutEl?.addEventListener('click', () => {
+    void getApi().zoomOut?.().then((st) => {
+      if (st) renderState(st);
+    });
+  });
+
+  btnZoomResetEl?.addEventListener('click', () => {
+    void getApi().zoomReset?.().then((st) => {
+      if (st) renderState(st);
+    });
+  });
+
+  btnZoomInEl?.addEventListener('click', () => {
+    void getApi().zoomIn?.().then((st) => {
+      if (st) renderState(st);
+    });
+  });
+
+  findInputEl?.addEventListener('input', () => {
+    const query = findInputEl?.value ?? '';
+    if (!query) {
+      if (findCountEl) findCountEl.textContent = '0 / 0';
+      void getApi().stopFindInPage?.('clearSelection');
+      return;
+    }
+    void getApi().findInPage?.(query, { forward: true, findNext: true });
+  });
+
+  findInputEl?.addEventListener('keydown', (ev) => {
+    if (ev.key === 'Enter') {
+      ev.preventDefault();
+      const query = findInputEl?.value ?? '';
+      if (query) {
+        void getApi().findInPage?.(query, { forward: !ev.shiftKey, findNext: false });
+      }
+    } else if (ev.key === 'Escape') {
+      ev.preventDefault();
+      closeFindBar(true);
+    }
+  });
+
+  findNextEl?.addEventListener('click', () => {
+    const query = findInputEl?.value ?? '';
+    if (query) {
+      void getApi().findInPage?.(query, { forward: true, findNext: false });
+    }
+  });
+
+  findPrevEl?.addEventListener('click', () => {
+    const query = findInputEl?.value ?? '';
+    if (query) {
+      void getApi().findInPage?.(query, { forward: false, findNext: false });
+    }
+  });
+
+  findCloseEl?.addEventListener('click', () => {
+    closeFindBar(true);
+  });
+
+  if (typeof doc.addEventListener === 'function') {
+    doc.addEventListener('keydown', (ev: KeyboardEvent) => {
+      const ctrl = ev.ctrlKey || ev.metaKey;
+      const key = (ev.key ?? '').toLowerCase();
+      if (ctrl && !ev.shiftKey && !ev.altKey && key === 'f') {
+        ev.preventDefault();
+        openFindBar();
+      } else if (!ctrl && !ev.shiftKey && !ev.altKey && ev.key === 'Escape' && findBarOpen) {
+        ev.preventDefault();
+        closeFindBar(true);
+      } else if (
+        ctrl &&
+        !ev.altKey &&
+        (ev.key === '=' || ev.key === '+' || ev.code === 'Equal' || ev.code === 'NumpadAdd')
+      ) {
+        ev.preventDefault();
+        void getApi().zoomIn?.().then((st) => {
+          if (st) renderState(st);
+        });
+      } else if (
+        ctrl &&
+        !ev.altKey &&
+        (ev.key === '-' || ev.key === '_' || ev.code === 'Minus' || ev.code === 'NumpadSubtract')
+      ) {
+        ev.preventDefault();
+        void getApi().zoomOut?.().then((st) => {
+          if (st) renderState(st);
+        });
+      } else if (
+        ctrl &&
+        !ev.shiftKey &&
+        !ev.altKey &&
+        (ev.key === '0' || ev.code === 'Digit0' || ev.code === 'Numpad0')
+      ) {
+        ev.preventDefault();
+        void getApi().zoomReset?.().then((st) => {
+          if (st) renderState(st);
+        });
+      }
+    });
+  }
 }
 
 export async function mountShell(
@@ -794,6 +1025,11 @@ export async function mountShell(
   apiRef = api;
   lastRenderedHistory = null;
   currentState = null;
+  findBarOpen = false;
+  if (downloadToastTimer) {
+    clearTimeout(downloadToastTimer);
+    downloadToastTimer = null;
+  }
   bindDomElements(doc);
   wireEvents();
   const initial = await api.getInitialState();
@@ -807,6 +1043,10 @@ export async function mountShell(
     urlInputEl.focus();
     urlInputEl.select();
   });
+  api.onOpenFind?.(() => openFindBar());
+  api.onCloseFind?.(() => closeFindBar(false));
+  api.onFindResult?.(renderFindResult);
+  api.onDownloadEvent?.(renderDownloadToast);
 }
 
 if (typeof document !== 'undefined' && document.getElementById('shell-root')) {

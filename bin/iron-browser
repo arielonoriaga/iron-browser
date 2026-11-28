@@ -57,4 +57,21 @@ if [[ "${IRON_BROWSER_CORE_DUMP:-0}" != "1" ]]; then
   ulimit -c 0 2>/dev/null || true
 fi
 
-exec "$ELECTRON_BIN" "$APP_DIR" --class=iron-browser --ozone-platform-hint=auto "$@"
+HAS_OZONE_ARG=0
+for arg in "$@"; do
+  if [[ "$arg" == --ozone-platform* ]]; then
+    HAS_OZONE_ARG=1
+    break
+  fi
+done
+
+OZONE_ARGS=()
+if [[ "$HAS_OZONE_ARG" -eq 0 ]]; then
+  if [[ -n "${DISPLAY:-}" || -n "${WAYLAND_DISPLAY:-}" ]]; then
+    OZONE_ARGS=(--ozone-platform-hint=auto)
+  else
+    OZONE_ARGS=(--ozone-platform=headless --ozone-override-screen-size=1480,920)
+  fi
+fi
+
+exec "$ELECTRON_BIN" "$APP_DIR" --class=iron-browser "${OZONE_ARGS[@]}" "$@"

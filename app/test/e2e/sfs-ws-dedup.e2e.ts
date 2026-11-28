@@ -1,72 +1,8 @@
 import assert from 'node:assert/strict';
-import http from 'node:http';
-import { createHash } from 'node:crypto';
-import type { Duplex } from 'node:stream';
 import { launchElectronSession } from './lib/electron-harness';
 
 function sleep(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
-}
-
-function encodeWsBinaryFrame(payload: Uint8Array): Buffer {
-  const len = payload.byteLength;
-  if (len < 126) {
-    const out = Buffer.allocUnsafe(2 + len);
-    out[0] = 0x82; // FIN + binary
-    out[1] = len;
-    Buffer.from(payload.buffer, payload.byteOffset, payload.byteLength).copy(out, 2);
-    return out;
-  }
-  const out = Buffer.allocUnsafe(4 + len);
-  out[0] = 0x82;
-  out[1] = 126;
-  out.writeUInt16BE(len, 2);
-  Buffer.from(payload.buffer, payload.byteOffset, payload.byteLength).copy(out, 4);
-  return out;
-}
-
-function encodeWsCloseFrame(code = 1000): Buffer {
-  const out = Buffer.allocUnsafe(4);
-  out[0] = 0x88;
-  out[1] = 2;
-  out.writeUInt16BE(code, 2);
-  return out;
-}
-
-function parseClientWsFrames(buf: Buffer): { frames: Array<{ opcode: number; data: Uint8Array }>; consumed: number } {
-  const frames: Array<{ opcode: number; data: Uint8Array }> = [];
-  let offset = 0;
-  while (offset + 2 <= buf.length) {
-    const b0 = buf[offset]!;
-    const b1 = buf[offset + 1]!;
-    const opcode = b0 & 0x0f;
-    const masked = (b1 & 0x80) !== 0;
-    let payloadLen = b1 & 0x7f;
-    let hdr = 2;
-    if (payloadLen === 126) {
-      if (offset + 4 > buf.length) break;
-      payloadLen = buf.readUInt16BE(offset + 2);
-      hdr = 4;
-    } else if (payloadLen === 127) {
-      if (offset + 10 > buf.length) break;
-      payloadLen = Number(buf.readBigUInt64BE(offset + 2));
-      hdr = 10;
-    }
-    const maskBytes = masked ? 4 : 0;
-    if (offset + hdr + maskBytes + payloadLen > buf.length) break;
-    const raw = Buffer.from(
-      buf.subarray(offset + hdr + maskBytes, offset + hdr + maskBytes + payloadLen),
-    );
-    if (masked) {
-      const mask = buf.subarray(offset + hdr, offset + hdr + 4);
-      for (let i = 0; i < raw.length; i += 1) {
-        raw[i] = raw[i]! ^ mask[i & 3]!;
-      }
-    }
-    frames.push({ opcode, data: new Uint8Array(raw) });
-    offset += hdr + maskBytes + payloadLen;
-  }
-  return { frames, consumed: offset };
 }
 
 function buildMinimalSfsPacket(controller: number, action: number, cmd?: string, extraKey?: string, extraVal?: string): Uint8Array {
@@ -252,115 +188,103 @@ async function runSfsWsDedupE2E(): Promise<void> {
 </body>
 </html>`;
 
-  const server = http.createServer((req, res) => {
-    const u = new URL(req.url ?? '/', 'http://127.0.0.1');
-    if (u.pathname === '/launch') {
-      const mintedUser = String(++launchCounter);
-      const mintedToken = `tok-${mintedUser}-${Math.random().toString(36).slice(2, 10)}`;
-      res.writeHead(302, {
-        Location: `/game?user=${mintedUser}&token=${mintedToken}`,
-      });
-      res.end();
-      return;
-    }
-    if (u.pathname === '/short-launch') {
-      res.writeHead(302, { Location: '/desktop-landing' });
-      res.end();
-      return;
-    }
-    if (u.pathname === '/desktop-landing') {
-      res.writeHead(200, { 'Content-Type': 'text/html' });
-      res.end(
-        `<!doctype html><html><head><meta name="viewport" content="width=device-width, initial-scale=1"></head><body><script>window.addEventListener('load', () => setTimeout(() => { if (innerWidth < 600) location.replace('/mobile-landing'); }, 20));</script><h1>Desktop</h1></body></html>`,
-      );
-      return;
-    }
-    if (u.pathname === '/mobile-landing') {
-      mobileRedirectHits += 1;
-      res.writeHead(200, { 'Content-Type': 'text/html' });
-      res.end('<h1>Mobile</h1>');
-      return;
-    }
-    if (u.pathname === '/rules') {
-      res.writeHead(200, { 'Content-Type': 'text/html' });
-      res.end('<h1>Rules</h1>');
-      return;
-    }
-    const addr = server.address();
-    const port = typeof addr === 'object' && addr ? addr.port : 0;
-    res.writeHead(200, { 'Content-Type': 'text/html' });
-    res.end(gameHtml(port));
-  });
+  interface SfsWsData {
+    loggedInOnSocket: boolean;
+  }
 
-  const openSockets = new Set<Duplex>();
-  server.on('upgrade', (req, socket) => {
-    if (!req.url?.startsWith('/BlueBox/websocket')) {
-      socket.destroy();
-      return;
-    }
-    const key = req.headers['sec-websocket-key'];
-    if (typeof key !== 'string') {
-      socket.destroy();
-      return;
-    }
-    totalWsConnections += 1;
-    openSockets.add(socket);
-    socket.on('close', () => openSockets.delete(socket));
+  const openSockets = new Set<Bun.ServerWebSocket<SfsWsData>>();
 
-    const accept = createHash('sha1')
-      .update(`${key}258EAFA5-E914-47DA-95CA-C5AB0DC85B11`)
-      .digest('base64');
-    socket.write(
-      [
-        'HTTP/1.1 101 Switching Protocols',
-        'Upgrade: websocket',
-        'Connection: Upgrade',
-        `Sec-WebSocket-Accept: ${accept}`,
-        '\r\n',
-      ].join('\r\n'),
-    );
-
-    let loggedInOnSocket = false;
-    let recvBuf = Buffer.alloc(0);
-
-    socket.on('data', (chunk: Buffer) => {
-      recvBuf = Buffer.concat([recvBuf, chunk]);
-      const { frames, consumed } = parseClientWsFrames(recvBuf);
-      if (consumed > 0) recvBuf = recvBuf.subarray(consumed);
-
-      for (const f of frames) {
-        if (f.opcode === 0x8) {
-          socket.end(encodeWsCloseFrame(1000));
-          return;
+  const server = Bun.serve<SfsWsData>({
+    hostname: '127.0.0.1',
+    port: 0,
+    idleTimeout: 0,
+    fetch: (req, srv) => {
+      const u = new URL(req.url);
+      if (u.pathname.startsWith('/BlueBox/websocket')) {
+        if (srv.upgrade(req, { data: { loggedInOnSocket: false } })) {
+          return undefined;
         }
-        if (f.opcode !== 0x2) continue;
-        const txt = new TextDecoder().decode(f.data);
+        return new Response('WebSocket upgrade failed', { status: 400 });
+      }
+      if (u.pathname === '/launch') {
+        const mintedUser = String(++launchCounter);
+        const mintedToken = `tok-${mintedUser}-${Math.random().toString(36).slice(2, 10)}`;
+        return new Response(null, {
+          status: 302,
+          headers: {
+            Location: `/game?user=${mintedUser}&token=${mintedToken}`,
+          },
+        });
+      }
+      if (u.pathname === '/short-launch') {
+        return new Response(null, {
+          status: 302,
+          headers: { Location: '/desktop-landing' },
+        });
+      }
+      if (u.pathname === '/desktop-landing') {
+        return new Response(
+          `<!doctype html><html><head><meta name="viewport" content="width=device-width, initial-scale=1"></head><body><script>window.addEventListener('load', () => setTimeout(() => { if (innerWidth < 600) location.replace('/mobile-landing'); }, 20));</script><h1>Desktop</h1></body></html>`,
+          {
+            status: 200,
+            headers: { 'Content-Type': 'text/html' },
+          },
+        );
+      }
+      if (u.pathname === '/mobile-landing') {
+        mobileRedirectHits += 1;
+        return new Response('<h1>Mobile</h1>', {
+          status: 200,
+          headers: { 'Content-Type': 'text/html' },
+        });
+      }
+      if (u.pathname === '/rules') {
+        return new Response('<h1>Rules</h1>', {
+          status: 200,
+          headers: { 'Content-Type': 'text/html' },
+        });
+      }
+      const port = srv.port ?? 0;
+      return new Response(gameHtml(port), {
+        status: 200,
+        headers: { 'Content-Type': 'text/html' },
+      });
+    },
+    websocket: {
+      open: (ws) => {
+        totalWsConnections += 1;
+        openSockets.add(ws);
+      },
+      message: (ws, message) => {
+        if (typeof message === 'string') return;
+        const txt = new TextDecoder().decode(message);
         if (txt.includes('JavaScript')) {
           totalHandshakes += 1;
-          socket.write(encodeWsBinaryFrame(buildMinimalSfsPacket(0, 0, undefined, 'tk', 'hs_ok')));
+          ws.send(buildMinimalSfsPacket(0, 0, undefined, 'tk', 'hs_ok'));
         } else if (txt.includes('&&demo')) {
           totalLogins += 1;
-          if (loggedInOnSocket) {
+          if (ws.data.loggedInOnSocket) {
             // Real SFS2X kicks duplicate LoginRequest on an already-logged-in session!
             duplicateLoginKicks += 1;
-            socket.end(encodeWsCloseFrame(1000));
+            ws.close(1000);
             return;
           }
-          loggedInOnSocket = true;
-          socket.write(encodeWsBinaryFrame(buildMinimalSfsPacket(0, 1, undefined, 'zn', 'login_ok')));
-          socket.write(encodeWsBinaryFrame(buildMinimalSfsPacket(1, 13, 'init', 'st', 'init_ready')));
+          ws.data.loggedInOnSocket = true;
+          ws.send(buildMinimalSfsPacket(0, 1, undefined, 'zn', 'login_ok'));
+          ws.send(buildMinimalSfsPacket(1, 13, 'init', 'st', 'init_ready'));
         } else if (txt.includes('betHandler')) {
           totalBets += 1;
-          socket.write(encodeWsBinaryFrame(buildMinimalSfsPacket(1, 13, 'bet', 'res', 'bet_accepted')));
+          ws.send(buildMinimalSfsPacket(1, 13, 'bet', 'res', 'bet_accepted'));
         }
-      }
-    });
+      },
+      close: (ws) => {
+        openSockets.delete(ws);
+      },
+    },
   });
 
-  await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', resolve));
-  const addr = server.address();
-  assert(addr && typeof addr === 'object');
-  const baseUrl = `http://127.0.0.1:${addr.port}`;
+  assert(typeof server.port === 'number' && server.port > 0);
+  const baseUrl = `http://127.0.0.1:${server.port}`;
 
   interface GameStateDto {
     user: string;
@@ -498,8 +422,29 @@ async function runSfsWsDedupE2E(): Promise<void> {
     );
   } finally {
     await session.close();
-    for (const s of openSockets) s.destroy();
-    await new Promise<void>((resolve) => server.close(() => resolve()));
+    for (const ws of [...openSockets]) {
+      try {
+        ws.close(1000, 'server-stop');
+      } catch {
+        // Ignore close races.
+      }
+      openSockets.delete(ws);
+    }
+    try {
+      server.unref();
+    } catch {
+      // Ignore if already stopped.
+    }
+    let stopTimer: ReturnType<typeof setTimeout> | null = null;
+    await Promise.race([
+      Promise.resolve(server.stop(true)).catch(() => {}),
+      new Promise<void>((resolve) => {
+        stopTimer = setTimeout(resolve, 200);
+      }),
+    ]);
+    if (stopTimer !== null) {
+      clearTimeout(stopTimer);
+    }
   }
 }
 

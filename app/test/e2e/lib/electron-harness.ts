@@ -1,5 +1,6 @@
 import { spawn, type ChildProcess } from 'node:child_process';
 import fs from 'node:fs';
+import { createRequire } from 'node:module';
 import os from 'node:os';
 import path from 'node:path';
 import { ControlSocketClient } from './ctl-client';
@@ -10,9 +11,38 @@ import type {
 } from './types';
 
 const APP_ROOT = path.resolve(import.meta.dir, '../../..');
-const ELECTRON_BIN = path.join(APP_ROOT, 'node_modules', '.bin', 'electron');
+function resolveElectronBinary(): string {
+  try {
+    const req = createRequire(path.join(APP_ROOT, 'package.json'));
+    const resolved = req('electron') as unknown;
+    if (typeof resolved === 'string' && fs.existsSync(resolved)) {
+      return resolved;
+    }
+  } catch {
+    // Fallback below.
+  }
+  return path.join(APP_ROOT, 'node_modules', '.bin', 'electron');
+}
+const ELECTRON_BIN = resolveElectronBinary();
 const MAX_SUN_PATH_BYTES = 107;
 const DEFAULT_READY_TIMEOUT_MS = 15_000;
+
+function killProcessGroup(child: ChildProcess, signal: NodeJS.Signals): void {
+  const pid = child.pid;
+  if (typeof pid === 'number' && pid > 0 && process.platform !== 'win32') {
+    try {
+      process.kill(-pid, signal);
+      return;
+    } catch {
+      // Fall back to direct child.kill below.
+    }
+  }
+  try {
+    child.kill(signal);
+  } catch {
+    // Ignore already-exited child.
+  }
+}
 
 function sleep(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
@@ -91,26 +121,6 @@ export async function launchElectronSession(
   }
 
   const isSmoke = opts.smoke !== false;
-  const args: string[] = ['.', '--class=iron-browser-e2e', `--user-data-dir=${userDataDir}`];
-  const hasOzoneArg = opts.extraArgs?.some((a) =>
-    a.startsWith('--ozone-platform'),
-  );
-  if (isSmoke) {
-    args.push('--smoke');
-    if (process.env.DISPLAY && !hasOzoneArg) {
-      args.push('--ozone-platform=x11');
-    }
-  }
-  if (opts.smokeExitMs !== undefined) {
-    args.push(`--smoke-exit-ms=${opts.smokeExitMs}`);
-  }
-  if (opts.extraArgs && opts.extraArgs.length > 0) {
-    args.push(...opts.extraArgs);
-  }
-  if (opts.initialUrl) {
-    args.push(opts.initialUrl);
-  }
-
   const env: NodeJS.ProcessEnv = {
     ...process.env,
     IRON_BROWSER_USER_DATA: userDataDir,
@@ -126,9 +136,38 @@ export async function launchElectronSession(
     Object.assign(env, opts.env);
   }
 
+  const args: string[] = ['.', '--class=iron-browser-e2e', `--user-data-dir=${userDataDir}`];
+  const hasOzoneArg = opts.extraArgs?.some((a) =>
+    a.startsWith('--ozone-platform'),
+  );
+  if (isSmoke) {
+    args.push('--smoke');
+  }
+  if (!hasOzoneArg) {
+    const hasDisplay = Boolean(env.DISPLAY?.trim());
+    const hasWayland = Boolean(env.WAYLAND_DISPLAY?.trim());
+    if (isSmoke && hasDisplay) {
+      args.push('--ozone-platform=x11');
+    } else if (!hasDisplay && hasWayland) {
+      args.push('--ozone-platform=wayland');
+    } else if (!hasDisplay && !hasWayland) {
+      args.push('--ozone-platform=headless', '--ozone-override-screen-size=1480,920');
+    }
+  }
+  if (opts.smokeExitMs !== undefined) {
+    args.push(`--smoke-exit-ms=${opts.smokeExitMs}`);
+  }
+  if (opts.extraArgs && opts.extraArgs.length > 0) {
+    args.push(...opts.extraArgs);
+  }
+  if (opts.initialUrl) {
+    args.push(opts.initialUrl);
+  }
+
   const child = spawn(ELECTRON_BIN, args, {
     cwd: APP_ROOT,
     env,
+    detached: process.platform !== 'win32',
     stdio: ['ignore', 'pipe', 'pipe'],
   });
 
@@ -234,8 +273,10 @@ export async function launchElectronSession(
   } catch (err) {
     ctl.close();
     if (tracker.getExit() === null) {
-      child.kill('SIGKILL');
+      killProcessGroup(child, 'SIGKILL');
       await tracker.waitForExit(2000).catch(() => {});
+    } else {
+      killProcessGroup(child, 'SIGKILL');
     }
     if (!opts.keepTempDir) {
       fs.rmSync(sessionDir, { recursive: true, force: true });
@@ -275,24 +316,17 @@ export async function launchElectronSession(
 
       ctl.close();
       if (tracker.getExit() === null) {
-        try {
-          child.kill('SIGTERM');
-        } catch {
-          // Process may have already exited.
-        }
+        killProcessGroup(child, 'SIGTERM');
         try {
           await tracker.waitForExit(3_000);
         } catch {
           if (tracker.getExit() === null) {
-            try {
-              child.kill('SIGKILL');
-            } catch {
-              // Ignore.
-            }
+            killProcessGroup(child, 'SIGKILL');
             await tracker.waitForExit(2_000).catch(() => {});
           }
         }
       }
+      killProcessGroup(child, 'SIGKILL');
 
       if (!opts.keepTempDir) {
         fs.rmSync(sessionDir, { recursive: true, force: true });

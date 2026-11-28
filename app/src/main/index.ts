@@ -19,6 +19,7 @@ import {
   StructuredLogger,
 } from './diagnostics';
 import { loadPersistedSession, savePersistedSession } from './session-file';
+import { resolveOzoneSwitchConfig } from './ozone';
 import { TabManager } from './tab-manager';
 
 const BOOT_STARTED_AT_MS = Date.now();
@@ -61,14 +62,16 @@ if (crashReporter && typeof crashReporter.start === 'function') {
   }
 }
 
-// Wayland Ozone auto-detection + lean Chromium switches.
+// Ozone platform detection (X11 / Wayland / headless) + lean Chromium switches.
+const ozoneConfig = resolveOzoneSwitchConfig(process.argv, process.env, isSmokeBoot);
+const isHeadlessOzone = ozoneConfig.isHeadlessOzone;
 if (app?.commandLine && typeof app.commandLine.appendSwitch === 'function') {
-  app.commandLine.appendSwitch('ozone-platform-hint', 'auto');
-  app.commandLine.appendSwitch('enable-features', 'UseOzonePlatform,WaylandWindowDecorations');
-  if (isSmokeBoot) {
-    app.commandLine.appendSwitch('disable-renderer-backgrounding');
-    app.commandLine.appendSwitch('disable-backgrounding-occluded-windows');
-    app.commandLine.appendSwitch('disable-background-timer-throttling');
+  for (const [sw, val] of ozoneConfig.switches) {
+    if (val !== undefined) {
+      app.commandLine.appendSwitch(sw, val);
+    } else {
+      app.commandLine.appendSwitch(sw);
+    }
   }
 }
 
@@ -150,8 +153,21 @@ function isBoundsVisibleOnAnyDisplay(bounds: PersistedWindowBounds): boolean {
 
 function parseInitialUrlFromArgv(): string | undefined {
   for (const arg of process.argv.slice(1)) {
-    if (arg.startsWith('--') || arg === '.' || arg.endsWith('.js')) continue;
-    if (/^(https?:|localhost|127\.0\.0\.1)/i.test(arg)) {
+    if (
+      arg.startsWith('--') ||
+      arg === '.' ||
+      arg.startsWith('./') ||
+      arg.startsWith('../') ||
+      arg.startsWith('/') ||
+      arg.endsWith('.js')
+    ) {
+      continue;
+    }
+    if (
+      /^(https?:|(?:[a-z0-9-]+\.)*localhost(?::\d{1,5})?(?:[/?#]|$)|\[[0-9a-f:]+\](?::\d{1,5})?(?:[/?#]|$)|(?:\d{1,3}\.){3}\d{1,3}(?::\d{1,5})?(?:[/?#]|$)|[a-z0-9-]+(?:\.[a-z0-9-]+)*:\d{1,5}(?:[/?#]|$))/i.test(
+        arg,
+      )
+    ) {
       try {
         return normalizeUrl(arg);
       } catch {
@@ -226,6 +242,11 @@ export interface ShortcutTarget {
     | 'reload'
   > & {
     toggleAgentDock?: () => unknown;
+    zoomIn?: () => unknown;
+    zoomOut?: () => unknown;
+    zoomReset?: () => unknown;
+    isFindOpen?: () => boolean;
+    closeFindBar?: () => void;
   } | null;
   mainWindow: Pick<BrowserWindowType, 'webContents'> | null;
 }
@@ -244,6 +265,43 @@ export function dispatchGlobalShortcut(
       mgr.toggleAgentDock();
       return true;
     }
+  }
+
+  if (ctrl && !input.shift && !input.alt && key === 'f') {
+    win.webContents.focus();
+    win.webContents.send('shell:open-find');
+    return true;
+  }
+  if (!ctrl && !input.shift && !input.alt && key === 'escape') {
+    if (mgr.isFindOpen?.()) {
+      mgr.closeFindBar?.();
+      return true;
+    }
+  }
+  if (
+    ctrl &&
+    !input.alt &&
+    (key === '=' || key === '+' || input.code === 'Equal' || input.code === 'NumpadAdd')
+  ) {
+    mgr.zoomIn?.();
+    return true;
+  }
+  if (
+    ctrl &&
+    !input.alt &&
+    (key === '-' || key === '_' || input.code === 'Minus' || input.code === 'NumpadSubtract')
+  ) {
+    mgr.zoomOut?.();
+    return true;
+  }
+  if (
+    ctrl &&
+    !input.shift &&
+    !input.alt &&
+    (key === '0' || input.code === 'Digit0' || input.code === 'Numpad0')
+  ) {
+    mgr.zoomReset?.();
+    return true;
   }
 
   if (ctrl && !input.shift && key === '\\') {
@@ -471,6 +529,63 @@ export function registerIpcHandlers(
     return mgr.setAgentDockWidth(asFiniteNumber(obj.width, 'width'));
   });
   handleShell('shell:send-context-to-agent', () => mgr.sendContextToAgent());
+
+  handleShell('shell:find-in-page', (raw) => {
+    const obj = asObject(raw);
+    const text = typeof obj.text === 'string' ? obj.text : '';
+    const forward = obj.forward !== undefined ? asBoolean(obj.forward, 'forward') : undefined;
+    const findNext = obj.findNext !== undefined ? asBoolean(obj.findNext, 'findNext') : undefined;
+    const matchCase = obj.matchCase !== undefined ? asBoolean(obj.matchCase, 'matchCase') : undefined;
+    const viewport =
+      obj.viewport !== undefined
+        ? asEnum<ViewportRole>(obj.viewport, ['portrait', 'landscape'], 'viewport')
+        : undefined;
+    mgr.findInPage(text, { forward, findNext, matchCase, viewport });
+  });
+
+  handleShell('shell:stop-find-in-page', (raw) => {
+    if (raw === undefined || raw === null) {
+      mgr.stopFindInPage();
+      return;
+    }
+    const obj = asObject(raw);
+    const action =
+      obj.action !== undefined
+        ? asEnum<'clearSelection' | 'keepSelection' | 'activateSelection'>(
+            obj.action,
+            ['clearSelection', 'keepSelection', 'activateSelection'],
+            'action',
+          )
+        : undefined;
+    mgr.stopFindInPage(action);
+  });
+
+  handleShell('shell:set-find-open', (raw) => {
+    const obj = asObject(raw);
+    mgr.setFindOpen(asBoolean(obj.open, 'open'));
+  });
+
+  handleShell('shell:zoom-in', () => mgr.zoomIn());
+  handleShell('shell:zoom-out', () => mgr.zoomOut());
+  handleShell('shell:zoom-reset', () => mgr.zoomReset());
+
+  handleShell('shell:retry-load', (raw) => {
+    if (raw === undefined || raw === null) {
+      return mgr.retryLoad();
+    }
+    const obj = asObject(raw);
+    const tabId = obj.tabId !== undefined ? asNonEmptyString(obj.tabId, 'tabId') : undefined;
+    return mgr.retryLoad(tabId);
+  });
+
+  handleShell('shell:dismiss-load-error', (raw) => {
+    if (raw === undefined || raw === null) {
+      return mgr.dismissLoadError();
+    }
+    const obj = asObject(raw);
+    const tabId = obj.tabId !== undefined ? asNonEmptyString(obj.tabId, 'tabId') : undefined;
+    return mgr.dismissLoadError(tabId);
+  });
 }
 
 function getPendingShutdownSummary(): Record<string, unknown> {
@@ -574,7 +689,7 @@ async function createMainWindow(): Promise<void> {
       : {}),
     minWidth: 760,
     minHeight: 520,
-    show: !isSmoke,
+    show: !isSmoke && !isHeadlessOzone,
     title: 'IronBrowser',
     icon: iconPath,
     backgroundColor: savedSession?.theme === 'light' ? '#f5f7fb' : '#060b13',
@@ -584,10 +699,11 @@ async function createMainWindow(): Promise<void> {
       contextIsolation: true,
       nodeIntegration: false,
       sandbox: true,
+      ...(isSmoke || isHeadlessOzone ? { offscreen: true } : {}),
     },
   });
   mainWindow = win;
-  if (!isSmoke && savedWin?.maximized) {
+  if (!isSmoke && !isHeadlessOzone && savedWin?.maximized) {
     win.maximize();
   }
   captureWindowBounds(win);

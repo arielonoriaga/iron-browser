@@ -6,13 +6,19 @@ import path from 'node:path';
 import { pathToFileURL } from 'node:url';
 import { promisify } from 'node:util';
 import type {
+  App,
   BrowserWindow as BrowserWindowType,
+  Clipboard,
+  Dialog,
   IpcMain,
   IpcMainInvokeEvent,
   WebContentsView as WebContentsViewType,
 } from 'electron';
 
 function loadElectronRuntime(): {
+  app?: App;
+  clipboard?: Clipboard;
+  dialog?: Dialog;
   ipcMain?: IpcMain;
   WebContentsView?: typeof WebContentsViewType;
 } {
@@ -22,13 +28,20 @@ function loadElectronRuntime(): {
         ? require('electron')
         : createRequire(path.join(__dirname, 'index.js'))('electron');
     if (mod && typeof mod === 'object') {
-      return mod as { ipcMain?: IpcMain; WebContentsView?: typeof WebContentsViewType };
+      return mod as {
+        app?: App;
+        clipboard?: Clipboard;
+        dialog?: Dialog;
+        ipcMain?: IpcMain;
+        WebContentsView?: typeof WebContentsViewType;
+      };
     }
   } catch {
     // Running outside Electron runtime (e.g. unit test VM).
   }
   return {};
 }
+import { stripAnsiAll } from '../shared/agent-markdown';
 import {
   clampAnchoredFloatBoundsUpdate,
   DEFAULT_AGENT_DOCK_WIDTH,
@@ -36,6 +49,7 @@ import {
   MIN_AGENT_FLOAT_WIDTH,
 } from '../shared/layout';
 import type {
+  AgentCliOption,
   AgentCliPreset,
   AgentDockMode,
   AgentDockState,
@@ -43,12 +57,33 @@ import type {
   Rect,
   RunningAgentInstance,
 } from '../shared/types';
-import { loadNativePtyBinding, type NativePtyBinding } from './tab-event-bus';
+import {
+  formatIronTermGridSnapshot,
+  IronTermSessionConnection,
+  listIronTermInstances,
+  resolveIronTermSocketPath,
+} from './iron-term-client';
+import { loadNativePtyBinding, reserveSafeDownloadPath, type NativePtyBinding } from './tab-event-bus';
+
+export { listIronTermInstances, resolveIronTermSocketPath };
 
 const execFileAsync = promisify(execFile);
 
+export type ExecFileFn = (
+  file: string,
+  args: string[],
+  opts: { timeout?: number; maxBuffer?: number },
+) => Promise<{ stdout: string; stderr: string }>;
+
 const MAX_TRANSCRIPT_CHARS = 180_000;
+const MAX_PTY_WRITE_CHUNK_BYTES = 32 * 1024;
+const MAX_PTY_QUEUE_BYTES = 256 * 1024;
+const PTY_SUBMIT_YIELD_MS = 20;
 const PANE_TARGET_RE = /^[A-Za-z0-9_.-]+:[0-9]+\.[0-9]+$/;
+const IRON_TERM_ID_RE = /^[A-Za-z0-9_.-]+$/;
+const CLI_TOKEN_RE = /^[A-Za-z0-9._-]+$/;
+const BUILTIN_AGENT_CLIS = ['agy', 'claude', 'codex', 'opencode'] as const;
+const BUILTIN_AGENT_CLI_SET = new Set<string>(BUILTIN_AGENT_CLIS);
 const AGENT_CMDS = new Set([
   'agy',
   'claude',
@@ -59,6 +94,92 @@ const AGENT_CMDS = new Set([
   'bun',
   'node',
 ]);
+
+export function isSafeCliToken(name: string): boolean {
+  const trimmed = name.trim();
+  return (
+    trimmed.length > 0 &&
+    trimmed.length <= 64 &&
+    trimmed !== '.' &&
+    trimmed !== '..' &&
+    CLI_TOKEN_RE.test(trimmed)
+  );
+}
+
+export function resolveExecutableOnPath(
+  cmd: string,
+  pathEnv: string | undefined = process.env.PATH,
+): string | null {
+  if (!isSafeCliToken(cmd) || !pathEnv) return null;
+  for (const rawDir of pathEnv.split(path.delimiter)) {
+    const dir = rawDir.trim();
+    if (!dir) continue;
+    const candidate = path.join(dir, cmd);
+    try {
+      const st = fs.statSync(candidate);
+      if (!st.isFile()) continue;
+      fs.accessSync(candidate, fs.constants.X_OK);
+      return candidate;
+    } catch {
+      // Try next PATH entry.
+    }
+  }
+  return null;
+}
+
+export function detectAvailableAgentClis(
+  env: NodeJS.ProcessEnv = process.env,
+): AgentCliOption[] {
+  const rawOverride = env.IRON_BROWSER_AGENT_CLIS?.trim();
+  const rawParts = rawOverride
+    ? rawOverride
+        .split(',')
+        .map((part) => part.trim())
+        .filter((part) => part.length > 0)
+    : [];
+  const candidates: Array<{ token: string; source: 'builtin' | 'env' }> = [];
+  const seen = new Set<string>();
+
+  if (rawParts.length > 0) {
+    for (const tok of rawParts) {
+      if (!isSafeCliToken(tok) || tok === 'shell' || seen.has(tok)) continue;
+      seen.add(tok);
+      candidates.push({
+        token: tok,
+        source: BUILTIN_AGENT_CLI_SET.has(tok) ? 'builtin' : 'env',
+      });
+    }
+  } else {
+    for (const tok of BUILTIN_AGENT_CLIS) {
+      seen.add(tok);
+      candidates.push({ token: tok, source: 'builtin' });
+    }
+  }
+
+  const options: AgentCliOption[] = [];
+  for (const { token, source } of candidates) {
+    if (!resolveExecutableOnPath(token, env.PATH)) continue;
+    const isBuiltin = BUILTIN_AGENT_CLI_SET.has(token);
+    options.push({
+      id: token,
+      label: token,
+      preset: isBuiltin ? (token as AgentCliPreset) : 'custom',
+      ...(isBuiltin ? {} : { command: token }),
+      available: true,
+      source,
+    });
+  }
+
+  options.push({
+    id: 'shell',
+    label: 'shell',
+    preset: 'shell',
+    available: true,
+    source: 'shell',
+  });
+
+  return options;
+}
 
 export interface AgentDockCallbacks {
   getSocketPath(): string;
@@ -108,6 +229,7 @@ export function parseTmuxListPanesOutput(stdout: string): RunningAgentInstance[]
       winLower.includes('perf') ||
       winLower.includes('iron');
     out.push({
+      kind: 'tmux',
       target,
       windowName: windowName || target,
       command: command || 'shell',
@@ -187,11 +309,25 @@ export class AgentDockManager {
   private pendingPtyWriteChunks: Buffer[] = [];
   private pendingPtyWriteBytes = 0;
   private ptyWriteFlushTimer: ReturnType<typeof setInterval> | null = null;
+  private ptyDrainWaiters: Array<(ok: boolean) => void> = [];
+  private ptyWriteChain: Promise<void> = Promise.resolve();
+  private ptyPendingOps = 0;
+  private sessionGen = 0;
+  private readonly ptyDrainTimeoutMs: number;
+  private mcpConfigPath: string | null = null;
   private readonly expectedAgentUrl: string;
+  private readonly execFileFn: ExecFileFn;
 
   private attachedPane: string | null = null;
   private lastTmuxCapture = '';
   private tmuxPollTimer: ReturnType<typeof setInterval> | null = null;
+  private tmuxWriteChain: Promise<void> = Promise.resolve();
+
+  private readonly ironTermSocketOverride?: string;
+  private ironTermConn: IronTermSessionConnection | null = null;
+  private attachedIronTermSessionId: string | null = null;
+  private lastIronTermRender = '';
+  private ironTermWriteChain: Promise<void> = Promise.resolve();
 
   private sessionMeta: AgentSessionSnapshot;
   private transcript = '';
@@ -207,8 +343,19 @@ export class AgentDockManager {
       initialMode?: AgentDockMode;
       initialFloatBounds?: Rect;
       ptyBinding?: NativePtyBinding | null;
+      execFile?: ExecFileFn;
+      ptyDrainTimeoutMs?: number;
+      ironTermSocketPath?: string;
     } = {},
   ) {
+    this.execFileFn = options.execFile ?? execFileAsync;
+    this.ironTermSocketOverride = options.ironTermSocketPath;
+    this.ptyDrainTimeoutMs =
+      typeof options.ptyDrainTimeoutMs === 'number' &&
+      Number.isFinite(options.ptyDrainTimeoutMs) &&
+      options.ptyDrainTimeoutMs > 0
+        ? Math.trunc(options.ptyDrainTimeoutMs)
+        : 5000;
     this.mode = options.initialMode ?? 'minimized';
     if (options.initialFloatBounds) {
       const fb = options.initialFloatBounds;
@@ -380,9 +527,13 @@ export class AgentDockManager {
     return this.getState();
   }
 
-  async listRunningInstances(): Promise<RunningAgentInstance[]> {
+  private getIronTermSocket(): string {
+    return this.ironTermSocketOverride ?? resolveIronTermSocketPath();
+  }
+
+  private async listTmuxInstances(): Promise<RunningAgentInstance[]> {
     try {
-      const { stdout } = await execFileAsync(
+      const { stdout } = await this.execFileFn(
         'tmux',
         [
           'list-panes',
@@ -396,6 +547,19 @@ export class AgentDockManager {
     } catch {
       return [];
     }
+  }
+
+  async listRunningInstances(): Promise<RunningAgentInstance[]> {
+    const [tmuxInstances, ironTermInstances] = await Promise.all([
+      this.listTmuxInstances(),
+      listIronTermInstances(this.getIronTermSocket()),
+    ]);
+    const combined = [...ironTermInstances, ...tmuxInstances];
+    combined.sort((a, b) => {
+      if (a.isAgentLike !== b.isAgentLike) return a.isAgentLike ? -1 : 1;
+      return a.target.localeCompare(b.target);
+    });
+    return combined;
   }
 
   private appendTranscript(chunk: string, replace = false): void {
@@ -418,6 +582,14 @@ export class AgentDockManager {
     }
   }
 
+  private resolvePtyDrainWaiters(ok: boolean): void {
+    if (this.ptyDrainWaiters.length === 0) return;
+    const waiters = this.ptyDrainWaiters.splice(0);
+    for (const resolve of waiters) {
+      resolve(ok);
+    }
+  }
+
   private clearPtyWriteQueue(): void {
     if (this.ptyWriteFlushTimer) {
       clearInterval(this.ptyWriteFlushTimer);
@@ -425,12 +597,27 @@ export class AgentDockManager {
     }
     this.pendingPtyWriteChunks = [];
     this.pendingPtyWriteBytes = 0;
+    this.resolvePtyDrainWaiters(false);
   }
 
-  private flushPendingPtyWrites(): void {
+  private cleanupMcpConfig(): void {
+    const cfgPath = this.mcpConfigPath;
+    this.mcpConfigPath = null;
+    if (!cfgPath) return;
+    try {
+      const st = fs.lstatSync(cfgPath);
+      if (st.isFile() && !st.isSymbolicLink()) {
+        fs.unlinkSync(cfgPath);
+      }
+    } catch {
+      // Ignore already-removed or inaccessible config cleanup errors.
+    }
+  }
+
+  private flushPendingPtyWrites(): boolean {
     if (this.activePtyId === null || !this.ptyBinding || this.disposed) {
       this.clearPtyWriteQueue();
-      return;
+      return false;
     }
     while (this.pendingPtyWriteChunks.length > 0) {
       const head = this.pendingPtyWriteChunks[0]!;
@@ -439,7 +626,7 @@ export class AgentDockManager {
       ) as { ok: boolean; bytesWritten?: number };
       if (!res.ok) {
         this.clearPtyWriteQueue();
-        return;
+        return false;
       }
       const written = Math.max(0, Math.min(head.length, res.bytesWritten ?? 0));
       if (written >= head.length) {
@@ -450,21 +637,98 @@ export class AgentDockManager {
           this.pendingPtyWriteChunks[0] = head.subarray(written);
           this.pendingPtyWriteBytes = Math.max(0, this.pendingPtyWriteBytes - written);
         }
-        return;
+        return true;
       }
     }
-    if (this.pendingPtyWriteChunks.length === 0 && this.ptyWriteFlushTimer) {
-      clearInterval(this.ptyWriteFlushTimer);
-      this.ptyWriteFlushTimer = null;
+    if (this.pendingPtyWriteChunks.length === 0) {
+      if (this.ptyWriteFlushTimer) {
+        clearInterval(this.ptyWriteFlushTimer);
+        this.ptyWriteFlushTimer = null;
+      }
+      this.resolvePtyDrainWaiters(true);
     }
+    return true;
+  }
+
+  private enqueueOrWritePtyBuffer(ptyId: number, buf: Buffer): boolean {
+    if (buf.length === 0) return true;
+    if (this.disposed || this.activePtyId !== ptyId || !this.ptyBinding) return false;
+
+    const chunks: Buffer[] = [];
+    for (let offset = 0; offset < buf.length; offset += MAX_PTY_WRITE_CHUNK_BYTES) {
+      chunks.push(buf.subarray(offset, Math.min(buf.length, offset + MAX_PTY_WRITE_CHUNK_BYTES)));
+    }
+
+    if (this.pendingPtyWriteChunks.length > 0) {
+      this.pendingPtyWriteChunks.push(...chunks);
+      this.pendingPtyWriteBytes += buf.length;
+      return this.flushPendingPtyWrites();
+    }
+
+    for (let i = 0; i < chunks.length; i += 1) {
+      const chunk = chunks[i]!;
+      const res = JSON.parse(
+        this.ptyBinding.ptyWrite(ptyId, chunk.toString('base64')),
+      ) as { ok: boolean; bytesWritten?: number };
+      if (!res.ok) {
+        return false;
+      }
+      const written = Math.max(0, Math.min(chunk.length, res.bytesWritten ?? chunk.length));
+      if (written < chunk.length) {
+        const rem = chunk.subarray(written);
+        this.pendingPtyWriteChunks.push(rem, ...chunks.slice(i + 1));
+        for (const c of [rem, ...chunks.slice(i + 1)]) {
+          this.pendingPtyWriteBytes += c.length;
+        }
+        if (!this.ptyWriteFlushTimer) {
+          this.ptyWriteFlushTimer = setInterval(() => {
+            this.flushPendingPtyWrites();
+          }, 15);
+          this.ptyWriteFlushTimer.unref?.();
+        }
+        return true;
+      }
+    }
+    return true;
+  }
+
+  private waitForPtyWriteDrain(
+    ptyId: number,
+    timeoutMs = this.ptyDrainTimeoutMs,
+  ): Promise<boolean> {
+    if (this.disposed || this.activePtyId !== ptyId) return Promise.resolve(false);
+    if (this.pendingPtyWriteChunks.length === 0) return Promise.resolve(true);
+    return new Promise<boolean>((resolve) => {
+      let settled = false;
+      const onDone = (ok: boolean) => {
+        if (settled) return;
+        settled = true;
+        clearTimeout(timer);
+        resolve(ok);
+      };
+      const timer = setTimeout(() => {
+        const idx = this.ptyDrainWaiters.indexOf(onDone);
+        if (idx >= 0) this.ptyDrainWaiters.splice(idx, 1);
+        this.clearPtyWriteQueue();
+        onDone(false);
+      }, timeoutMs);
+      timer.unref?.();
+      this.ptyDrainWaiters.push(onDone);
+    });
   }
 
   stopSession(): AgentDockState {
+    this.sessionGen += 1;
     if (this.ptyPollTimer) {
       clearInterval(this.ptyPollTimer);
       this.ptyPollTimer = null;
     }
     this.clearPtyWriteQueue();
+    this.ptyWriteChain = Promise.resolve();
+    this.ptyPendingOps = 0;
+    this.tmuxWriteChain = Promise.resolve();
+    this.ironTermWriteChain = Promise.resolve();
+    this.cleanupMcpConfig();
     if (this.tmuxPollTimer) {
       clearInterval(this.tmuxPollTimer);
       this.tmuxPollTimer = null;
@@ -476,6 +740,21 @@ export class AgentDockManager {
         // Ignore teardown errors.
       }
       this.activePtyId = null;
+    }
+    const prevIronConn = this.ironTermConn;
+    const prevIronSid = this.attachedIronTermSessionId;
+    this.ironTermConn = null;
+    this.attachedIronTermSessionId = null;
+    this.lastIronTermRender = '';
+    if (prevIronConn) {
+      if (!this.disposed && prevIronSid) {
+        void prevIronConn
+          .request({ type: 'detach_pty', session_id: prevIronSid }, 250)
+          .catch(() => {})
+          .finally(() => prevIronConn.close());
+      } else {
+        prevIronConn.close();
+      }
     }
     this.attachedPane = null;
     this.lastTmuxCapture = '';
@@ -490,10 +769,124 @@ export class AgentDockManager {
     return this.getState();
   }
 
+  private async attachIronTermInstance(cleanTarget: string, sessionId: string): Promise<AgentDockState> {
+    if (!IRON_TERM_ID_RE.test(sessionId)) {
+      throw new Error(`Invalid iron-term session target: ${cleanTarget}`);
+    }
+    this.stopSession();
+    const opGen = this.sessionGen;
+    const socketPath = this.getIronTermSocket();
+
+    const conn = await IronTermSessionConnection.connect(
+      socketPath,
+      (ev) => {
+        if (
+          this.disposed ||
+          this.sessionGen !== opGen ||
+          this.sessionMeta.kind !== 'iron-term' ||
+          this.attachedIronTermSessionId !== sessionId
+        ) {
+          return;
+        }
+        if (ev.event === 'grid_delta' && ev.snapshot?.session_id === sessionId) {
+          const rendered = formatIronTermGridSnapshot(ev.snapshot);
+          if (rendered !== this.lastIronTermRender) {
+            this.lastIronTermRender = rendered;
+            this.appendTranscript(rendered, true);
+          }
+        } else if (ev.event === 'fleet_delta' && Array.isArray(ev.sessions)) {
+          const match = ev.sessions.find((s) => s && s.id === sessionId);
+          if (!match || match.state === 'hibernated') {
+            this.appendTranscript(
+              `\n[IronBrowser: iron-term session ${sessionId} ended or hibernated]\n`,
+              false,
+            );
+            this.stopSession();
+          }
+        }
+      },
+      (err) => {
+        if (
+          this.disposed ||
+          this.sessionGen !== opGen ||
+          this.sessionMeta.kind !== 'iron-term' ||
+          this.attachedIronTermSessionId !== sessionId
+        ) {
+          return;
+        }
+        this.appendTranscript(
+          `\n[IronBrowser: iron-term session ${sessionId} disconnected${err ? `: ${err.message}` : ''}]\n`,
+          false,
+        );
+        this.stopSession();
+      },
+    );
+
+    if (this.disposed || this.sessionGen !== opGen) {
+      conn.close();
+      return this.getState();
+    }
+
+    try {
+      const attached = await conn.request({
+        type: 'attach_pty',
+        session_id: sessionId,
+        cols: 92,
+        rows: 30,
+      });
+      if (this.disposed || this.sessionGen !== opGen) {
+        conn.close();
+        return this.getState();
+      }
+      let title = sessionId;
+      let cwd: string | undefined;
+      try {
+        const insp = await conn.request({ type: 'inspect_session', session_id: sessionId }, 600);
+        const sess = (insp.inspection as { session?: { title?: string; worktree_path?: string } } | undefined)
+          ?.session;
+        if (sess?.title) title = sess.title;
+        if (sess?.worktree_path) cwd = sess.worktree_path;
+      } catch {
+        // Optional metadata lookup; ignore if unavailable.
+      }
+      if (this.disposed || this.sessionGen !== opGen) {
+        conn.close();
+        return this.getState();
+      }
+
+      const initialRendered =
+        attached.type === 'attached' && attached.snapshot
+          ? formatIronTermGridSnapshot(attached.snapshot)
+          : '';
+      this.ironTermConn = conn;
+      this.attachedIronTermSessionId = sessionId;
+      this.lastIronTermRender = initialRendered;
+      this.sessionMeta = {
+        active: true,
+        kind: 'iron-term',
+        label: `iron-term ${title}`,
+        targetPane: cleanTarget,
+        ...(cwd ? { cwd } : {}),
+        socketPath: this.callbacks.getSocketPath(),
+      };
+      this.transcript = '';
+      this.appendTranscript(initialRendered, true);
+      this.callbacks.onLayoutChanged();
+      this.pushStateToView();
+      return this.getState();
+    } catch (err) {
+      conn.close();
+      throw err;
+    }
+  }
+
   async attachRunningInstance(targetPane: string): Promise<AgentDockState> {
     const cleanTarget = targetPane.trim();
+    if (cleanTarget.startsWith('iron-term:')) {
+      return this.attachIronTermInstance(cleanTarget, cleanTarget.slice('iron-term:'.length));
+    }
     if (!PANE_TARGET_RE.test(cleanTarget)) {
-      throw new Error(`Invalid tmux pane target: ${cleanTarget}`);
+      throw new Error(`Invalid agent instance target: ${cleanTarget}`);
     }
     this.stopSession();
     this.attachedPane = cleanTarget;
@@ -521,7 +914,7 @@ export class AgentDockManager {
     const pane = this.attachedPane;
     if (!pane || this.disposed) return;
     try {
-      const { stdout } = await execFileAsync(
+      const { stdout } = await this.execFileFn(
         'tmux',
         ['capture-pane', '-p', '-J', '-t', pane, '-S', '-160'],
         { timeout: 1200, maxBuffer: 1024 * 1024 },
@@ -553,21 +946,7 @@ export class AgentDockManager {
     }
     this.stopSession();
 
-    const socketPath = this.callbacks.getSocketPath();
-    const mcpCfgPath = writePerWindowMcpConfig(socketPath);
-    const resolvedCwd = (() => {
-      const raw = input.cwd?.trim();
-      if (raw && fs.existsSync(raw)) {
-        try {
-          if (fs.statSync(raw).isDirectory()) return raw;
-        } catch {
-          // Fallback below.
-        }
-      }
-      return process.cwd();
-    })();
-
-    const userShell = process.env.SHELL?.trim() || '/bin/bash';
+    const userShell = process.env.SHELL?.trim() || '/bin/sh';
     let program = userShell;
     let args: string[] = [];
     let label: string = input.preset;
@@ -580,7 +959,7 @@ export class AgentDockManager {
         break;
       case 'claude':
         program = 'claude';
-        args = mcpCfgPath ? ['--mcp-config', mcpCfgPath] : [];
+        args = [];
         label = 'claude';
         break;
       case 'codex':
@@ -608,67 +987,98 @@ export class AgentDockManager {
         label = cmd.split(/\s+/)[0]?.slice(0, 24) || 'custom';
         break;
       }
+      default:
+        throw new Error(`Unsupported CLI preset: ${String(input.preset)}`);
     }
 
-    const env: Record<string, string> = {};
-    for (const [k, v] of Object.entries(process.env)) {
-      if (typeof v === 'string' && k !== 'ELECTRON_RUN_AS_NODE') {
-        env[k] = v;
+    const socketPath = this.callbacks.getSocketPath();
+    const mcpCfgPath = writePerWindowMcpConfig(socketPath);
+    this.mcpConfigPath = mcpCfgPath;
+
+    try {
+      if (input.preset === 'claude' && mcpCfgPath) {
+        args = ['--mcp-config', mcpCfgPath];
       }
-    }
-    env.IRON_BROWSER_SOCKET = socketPath;
-    const activeTabId = this.callbacks.getActiveTabId();
-    if (activeTabId) env.IRON_BROWSER_DEFAULT_TAB = activeTabId;
-    if (mcpCfgPath) env.IRON_BROWSER_MCP_CONFIG = mcpCfgPath;
 
-    const rawSpawn = this.ptyBinding.ptySpawn(
-      JSON.stringify({
-        program,
-        args,
+      const resolvedCwd = (() => {
+        const raw = input.cwd?.trim();
+        if (raw && fs.existsSync(raw)) {
+          try {
+            if (fs.statSync(raw).isDirectory()) return raw;
+          } catch {
+            // Fallback below.
+          }
+        }
+        return process.cwd();
+      })();
+
+      const env: Record<string, string> = {};
+      for (const [k, v] of Object.entries(process.env)) {
+        if (typeof v === 'string' && k !== 'ELECTRON_RUN_AS_NODE') {
+          env[k] = v;
+        }
+      }
+      env.IRON_BROWSER_SOCKET = socketPath;
+      const activeTabId = this.callbacks.getActiveTabId();
+      if (activeTabId) env.IRON_BROWSER_DEFAULT_TAB = activeTabId;
+      if (mcpCfgPath) env.IRON_BROWSER_MCP_CONFIG = mcpCfgPath;
+
+      const safeCols =
+        typeof input.cols === 'number' && Number.isFinite(input.cols) ? input.cols : 92;
+      const safeRows =
+        typeof input.rows === 'number' && Number.isFinite(input.rows) ? input.rows : 30;
+      const rawSpawn = this.ptyBinding.ptySpawn(
+        JSON.stringify({
+          program,
+          args,
+          cwd: resolvedCwd,
+          env,
+          cols: Math.max(30, Math.min(300, Math.trunc(safeCols))),
+          rows: Math.max(10, Math.min(160, Math.trunc(safeRows))),
+        }),
+      );
+      const parsed = JSON.parse(rawSpawn) as {
+        ok: boolean;
+        id?: number;
+        pid?: number;
+        error?: string;
+      };
+      if (!parsed.ok || typeof parsed.id !== 'number') {
+        throw new Error(parsed.error ?? `Failed to launch '${label}'`);
+      }
+
+      this.activePtyId = parsed.id;
+      this.activePtyDecoder = new TextDecoder('utf-8');
+      this.transcript = '';
+      this.appendTranscript(
+        `[IronBrowser Agent PTY · ${label} (pid ${parsed.pid ?? '?'}) · IRON_BROWSER_SOCKET=${socketPath}]\r\n`,
+        true,
+      );
+
+      this.sessionMeta = {
+        active: true,
+        kind: 'pty',
+        label,
+        preset: input.preset,
         cwd: resolvedCwd,
-        env,
-        cols: Math.max(30, Math.min(300, Math.trunc(input.cols ?? 92))),
-        rows: Math.max(10, Math.min(160, Math.trunc(input.rows ?? 30))),
-      }),
-    );
-    const parsed = JSON.parse(rawSpawn) as {
-      ok: boolean;
-      id?: number;
-      pid?: number;
-      error?: string;
-    };
-    if (!parsed.ok || typeof parsed.id !== 'number') {
-      throw new Error(parsed.error ?? `Failed to launch '${label}'`);
+        pid: parsed.pid ?? null,
+        exited: false,
+        exitCode: null,
+        socketPath,
+      };
+
+      this.ptyPollTimer = setInterval(() => {
+        this.pollPtyOnce();
+      }, 35);
+      this.ptyPollTimer.unref?.();
+
+      this.callbacks.onLayoutChanged();
+      this.pushStateToView();
+      return this.getState();
+    } catch (err) {
+      this.cleanupMcpConfig();
+      throw err;
     }
-
-    this.activePtyId = parsed.id;
-    this.activePtyDecoder = new TextDecoder('utf-8');
-    this.transcript = '';
-    this.appendTranscript(
-      `[IronBrowser Agent PTY · ${label} (pid ${parsed.pid ?? '?'}) · IRON_BROWSER_SOCKET=${socketPath}]\r\n`,
-      true,
-    );
-
-    this.sessionMeta = {
-      active: true,
-      kind: 'pty',
-      label,
-      preset: input.preset,
-      cwd: resolvedCwd,
-      pid: parsed.pid ?? null,
-      exited: false,
-      exitCode: null,
-      socketPath,
-    };
-
-    this.ptyPollTimer = setInterval(() => {
-      this.pollPtyOnce();
-    }, 35);
-    this.ptyPollTimer.unref?.();
-
-    this.callbacks.onLayoutChanged();
-    this.pushStateToView();
-    return this.getState();
   }
 
   private pollPtyOnce(): void {
@@ -689,8 +1099,12 @@ export class AgentDockManager {
       }
       if (polled.exited && !this.sessionMeta.exited) {
         const finishedId = this.activePtyId;
+        this.sessionGen += 1;
         this.activePtyId = null;
         this.clearPtyWriteQueue();
+        this.ptyWriteChain = Promise.resolve();
+        this.ptyPendingOps = 0;
+        this.cleanupMcpConfig();
         try {
           this.ptyBinding.ptyKill(finishedId);
         } catch {
@@ -718,48 +1132,188 @@ export class AgentDockManager {
   async writeInput(data: string, submitEnter = false): Promise<boolean> {
     if (!data && !submitEnter) return false;
     if (this.sessionMeta.kind === 'pty' && this.activePtyId !== null && this.ptyBinding) {
-      const payload = Buffer.from(submitEnter ? `${data}\r` : data, 'utf8');
-      if (this.pendingPtyWriteBytes + payload.length > 256 * 1024) {
+      const ptyId = this.activePtyId;
+      const opGen = this.sessionGen;
+      const dataBuf = Buffer.from(data, 'utf8');
+      const extraEnterBytes = submitEnter ? 1 : 0;
+      if (this.pendingPtyWriteBytes + dataBuf.length + extraEnterBytes > MAX_PTY_QUEUE_BYTES) {
         return false;
       }
-      if (this.pendingPtyWriteChunks.length > 0) {
-        this.pendingPtyWriteChunks.push(payload);
-        this.pendingPtyWriteBytes += payload.length;
-        this.flushPendingPtyWrites();
-        return true;
+
+      if (!submitEnter && this.ptyPendingOps === 0 && this.pendingPtyWriteChunks.length === 0) {
+        return this.enqueueOrWritePtyBuffer(ptyId, dataBuf);
       }
-      const res = JSON.parse(
-        this.ptyBinding.ptyWrite(this.activePtyId, payload.toString('base64')),
-      ) as { ok: boolean; bytesWritten?: number };
-      if (!res.ok) return false;
-      const written = Math.max(0, Math.min(payload.length, res.bytesWritten ?? payload.length));
-      if (written < payload.length) {
-        const rem = payload.subarray(written);
-        this.pendingPtyWriteChunks.push(rem);
-        this.pendingPtyWriteBytes += rem.length;
-        if (!this.ptyWriteFlushTimer) {
-          this.ptyWriteFlushTimer = setInterval(() => this.flushPendingPtyWrites(), 15);
-          this.ptyWriteFlushTimer.unref?.();
+
+      this.ptyPendingOps += 1;
+      let result = false;
+      const run = async () => {
+        try {
+          if (
+            this.disposed ||
+            this.sessionGen !== opGen ||
+            this.sessionMeta.kind !== 'pty' ||
+            this.activePtyId !== ptyId ||
+            !this.ptyBinding
+          ) {
+            return;
+          }
+          if (this.pendingPtyWriteBytes + dataBuf.length + extraEnterBytes > MAX_PTY_QUEUE_BYTES) {
+            return;
+          }
+          if (!submitEnter) {
+            result = this.enqueueOrWritePtyBuffer(ptyId, dataBuf);
+            return;
+          }
+          if (dataBuf.length > 0) {
+            if (!this.enqueueOrWritePtyBuffer(ptyId, dataBuf)) return;
+            if (!(await this.waitForPtyWriteDrain(ptyId))) {
+              if (this.sessionGen === opGen && this.activePtyId === ptyId) {
+                this.clearPtyWriteQueue();
+              }
+              return;
+            }
+            await new Promise((r) => setTimeout(r, PTY_SUBMIT_YIELD_MS));
+            if (
+              this.disposed ||
+              this.sessionGen !== opGen ||
+              this.sessionMeta.kind !== 'pty' ||
+              this.activePtyId !== ptyId ||
+              !this.ptyBinding
+            ) {
+              return;
+            }
+          }
+          if (!this.enqueueOrWritePtyBuffer(ptyId, Buffer.from('\r', 'utf8'))) return;
+          if (this.pendingPtyWriteChunks.length > 0) {
+            const drained = await this.waitForPtyWriteDrain(ptyId);
+            if (!drained) {
+              if (this.sessionGen === opGen && this.activePtyId === ptyId) {
+                this.clearPtyWriteQueue();
+              }
+              return;
+            }
+            result = true;
+          } else {
+            result = true;
+          }
+        } finally {
+          if (this.sessionGen === opGen) {
+            this.ptyPendingOps = Math.max(0, this.ptyPendingOps - 1);
+          }
         }
-      }
-      return true;
+      };
+
+      const chained = this.ptyWriteChain.then(run, run);
+      this.ptyWriteChain = chained.catch(() => {});
+      await chained;
+      return result;
     }
 
     if (this.sessionMeta.kind === 'tmux' && this.attachedPane) {
       const pane = this.attachedPane;
-      try {
-        if (data.length > 0) {
-          await execFileAsync('tmux', ['send-keys', '-t', pane, '-l', data], { timeout: 1500 });
+      const opGen = this.sessionGen;
+      let result = false;
+      const run = async () => {
+        if (
+          this.disposed ||
+          this.sessionGen !== opGen ||
+          this.sessionMeta.kind !== 'tmux' ||
+          this.attachedPane !== pane
+        ) {
+          return;
         }
-        if (submitEnter) {
-          await new Promise((r) => setTimeout(r, 60));
-          await execFileAsync('tmux', ['send-keys', '-t', pane, 'C-m'], { timeout: 1500 });
+        try {
+          if (data.length > 0) {
+            const sendTimeoutMs = Math.min(4000, Math.max(1500, 1500 + Math.ceil(data.length / 20)));
+            await this.execFileFn('tmux', ['send-keys', '-t', pane, '-l', '--', data], {
+              timeout: sendTimeoutMs,
+            });
+          }
+          if (submitEnter) {
+            if (data.length > 0) {
+              const delayMs = Math.min(500, Math.max(80, 60 + Math.ceil(data.length / 32)));
+              await new Promise((r) => setTimeout(r, delayMs));
+            }
+            if (
+              this.disposed ||
+              this.sessionGen !== opGen ||
+              this.sessionMeta.kind !== 'tmux' ||
+              this.attachedPane !== pane
+            ) {
+              return;
+            }
+            await this.execFileFn('tmux', ['send-keys', '-t', pane, 'C-m'], { timeout: 1500 });
+          }
+          const timer = setTimeout(() => void this.captureAttachedPaneOnce(false), 120);
+          timer.unref?.();
+          result = true;
+        } catch {
+          result = false;
         }
-        setTimeout(() => void this.captureAttachedPaneOnce(false), 120);
-        return true;
-      } catch {
-        return false;
-      }
+      };
+
+      const chained = this.tmuxWriteChain.then(run, run);
+      this.tmuxWriteChain = chained.catch(() => {});
+      await chained;
+      return result;
+    }
+
+    if (
+      this.sessionMeta.kind === 'iron-term' &&
+      this.ironTermConn &&
+      this.attachedIronTermSessionId
+    ) {
+      const conn = this.ironTermConn;
+      const sid = this.attachedIronTermSessionId;
+      const opGen = this.sessionGen;
+      let result = false;
+      const run = async () => {
+        if (
+          this.disposed ||
+          this.sessionGen !== opGen ||
+          this.sessionMeta.kind !== 'iron-term' ||
+          this.ironTermConn !== conn ||
+          this.attachedIronTermSessionId !== sid
+        ) {
+          return;
+        }
+        try {
+          if (data.length > 0) {
+            await conn.request({
+              type: 'pty_input',
+              session_id: sid,
+              bytes: Array.from(Buffer.from(data, 'utf8')),
+            });
+          }
+          if (submitEnter) {
+            if (data.length > 0) {
+              await new Promise((r) => setTimeout(r, PTY_SUBMIT_YIELD_MS));
+            }
+            if (
+              this.disposed ||
+              this.sessionGen !== opGen ||
+              this.sessionMeta.kind !== 'iron-term' ||
+              this.ironTermConn !== conn ||
+              this.attachedIronTermSessionId !== sid
+            ) {
+              return;
+            }
+            await conn.request({
+              type: 'pty_input',
+              session_id: sid,
+              bytes: [13],
+            });
+          }
+          result = true;
+        } catch {
+          result = false;
+        }
+      };
+
+      const chained = this.ironTermWriteChain.then(run, run);
+      this.ironTermWriteChain = chained.catch(() => {});
+      await chained;
+      return result;
     }
     return false;
   }
@@ -788,30 +1342,66 @@ export class AgentDockManager {
       '3': '3',
     };
 
-    if (this.sessionMeta.kind === 'pty' && ptyMap[key]) {
+    if ((this.sessionMeta.kind === 'pty' || this.sessionMeta.kind === 'iron-term') && ptyMap[key]) {
       return this.writeInput(ptyMap[key]!, false);
     }
     if (this.sessionMeta.kind === 'tmux' && this.attachedPane && allowedTmuxKeys[key]) {
-      try {
-        await execFileAsync('tmux', ['send-keys', '-t', this.attachedPane, allowedTmuxKeys[key]!], {
-          timeout: 1500,
-        });
-        setTimeout(() => void this.captureAttachedPaneOnce(false), 120);
-        return true;
-      } catch {
-        return false;
-      }
+      const pane = this.attachedPane;
+      const opGen = this.sessionGen;
+      const tmuxKey = allowedTmuxKeys[key]!;
+      let result = false;
+      const run = async () => {
+        if (
+          this.disposed ||
+          this.sessionGen !== opGen ||
+          this.sessionMeta.kind !== 'tmux' ||
+          this.attachedPane !== pane
+        ) {
+          return;
+        }
+        try {
+          await this.execFileFn('tmux', ['send-keys', '-t', pane, tmuxKey], {
+            timeout: 1500,
+          });
+          const timer = setTimeout(() => void this.captureAttachedPaneOnce(false), 120);
+          timer.unref?.();
+          result = true;
+        } catch {
+          result = false;
+        }
+      };
+
+      const chained = this.tmuxWriteChain.then(run, run);
+      this.tmuxWriteChain = chained.catch(() => {});
+      await chained;
+      return result;
     }
     return false;
   }
 
   resizePty(cols: number, rows: number): boolean {
+    if (!Number.isFinite(cols) || !Number.isFinite(rows)) {
+      return false;
+    }
+    const clampedCols = Math.max(20, Math.min(400, Math.trunc(cols)));
+    const clampedRows = Math.max(8, Math.min(200, Math.trunc(rows)));
+    if (
+      this.sessionMeta.kind === 'iron-term' &&
+      this.ironTermConn &&
+      this.attachedIronTermSessionId
+    ) {
+      void this.ironTermConn
+        .request({
+          type: 'pty_resize',
+          session_id: this.attachedIronTermSessionId,
+          cols: clampedCols,
+          rows: clampedRows,
+        })
+        .catch(() => {});
+      return true;
+    }
     if (this.activePtyId === null || !this.ptyBinding) return false;
-    return this.ptyBinding.ptyResize(
-      this.activePtyId,
-      Math.max(20, Math.min(400, Math.trunc(cols))),
-      Math.max(8, Math.min(200, Math.trunc(rows))),
-    );
+    return this.ptyBinding.ptyResize(this.activePtyId, clampedCols, clampedRows);
   }
 
   injectBrowserContextToView(): boolean {
@@ -824,6 +1414,89 @@ export class AgentDockManager {
       return true;
     }
     return false;
+  }
+
+  clearTranscript(): boolean {
+    this.transcript = '';
+    if (this.view && !this.view.webContents.isDestroyed()) {
+      this.view.webContents.send('agent:output', { chunk: '', replace: true });
+    }
+    return true;
+  }
+
+  copyTranscript(): boolean {
+    const clean = stripAnsiAll(this.transcript);
+    try {
+      loadElectronRuntime().clipboard?.writeText(clean);
+      return true;
+    } catch {
+      return false;
+    }
+  }
+
+  async exportTranscript(): Promise<{
+    ok: boolean;
+    path?: string;
+    canceled?: boolean;
+    error?: string;
+  }> {
+    const clean = stripAnsiAll(this.transcript);
+    const stamp = new Date().toISOString().replace(/[:.]/g, '-').slice(0, 19);
+    const defaultFilename = `iron-agent-transcript-${stamp}.md`;
+    const runtime = loadElectronRuntime();
+    const isSmoke = process.env.IRON_BROWSER_SMOKE === '1' || process.argv.includes('--smoke');
+    const envDir = process.env.IRON_BROWSER_DOWNLOAD_DIR?.trim();
+
+    if (
+      envDir ||
+      isSmoke ||
+      !runtime.dialog ||
+      typeof runtime.dialog.showSaveDialog !== 'function'
+    ) {
+      let fallbackDir = envDir;
+      if (!fallbackDir) {
+        try {
+          fallbackDir =
+            typeof runtime.app?.getPath === 'function'
+              ? path.join(runtime.app.getPath('userData'), 'downloads')
+              : path.join(os.homedir(), 'Downloads');
+        } catch {
+          fallbackDir = path.join(os.homedir(), 'Downloads');
+        }
+      }
+      const savePath = reserveSafeDownloadPath(fallbackDir, defaultFilename);
+      if (!savePath) {
+        return { ok: false, error: 'Failed to reserve safe transcript export path' };
+      }
+      fs.writeFileSync(savePath, clean, { encoding: 'utf8', mode: 0o600 });
+      return { ok: true, path: savePath };
+    }
+
+    let defaultDir = process.cwd();
+    try {
+      if (typeof runtime.app?.getPath === 'function') {
+        defaultDir = runtime.app.getPath('downloads');
+      }
+    } catch {
+      // Fallback to process.cwd().
+    }
+
+    const res = await runtime.dialog.showSaveDialog(this.win, {
+      defaultPath: path.join(defaultDir, defaultFilename),
+      filters: [{ name: 'Markdown', extensions: ['md', 'txt'] }],
+    });
+    if (res.canceled || !res.filePath) {
+      return { ok: false, canceled: true };
+    }
+    const savePath = reserveSafeDownloadPath(
+      path.dirname(res.filePath),
+      path.basename(res.filePath),
+    );
+    if (!savePath) {
+      return { ok: false, error: 'Refused unsafe transcript export path' };
+    }
+    fs.writeFileSync(savePath, clean, { encoding: 'utf8', mode: 0o600 });
+    return { ok: true, path: savePath };
   }
 
   registerIpcHandlers(ipc?: Pick<IpcMain, 'handle'>): void {
@@ -845,20 +1518,35 @@ export class AgentDockManager {
       instances: await this.listRunningInstances(),
       defaultCwd: process.cwd(),
       contextSnippet: this.callbacks.getBrowserContextSnippet(),
+      availableClis: detectAvailableAgentClis(),
     }));
+
+    handleAgent('agent:list-clis', () => detectAvailableAgentClis());
 
     handleAgent('agent:list-instances', () => this.listRunningInstances());
 
     handleAgent('agent:start-cli', (raw) => {
       const obj = (raw && typeof raw === 'object' ? raw : {}) as Record<string, unknown>;
-      const preset = String(obj.preset ?? 'agy') as AgentCliPreset;
+      const rawPreset = String(obj.preset ?? 'shell').trim();
       const allowed: AgentCliPreset[] = ['agy', 'claude', 'codex', 'opencode', 'shell', 'custom'];
-      if (!allowed.includes(preset)) {
-        throw new Error(`Unsupported CLI preset: ${preset}`);
+      let preset: AgentCliPreset;
+      let customCommand = typeof obj.customCommand === 'string' ? obj.customCommand : undefined;
+
+      if (allowed.includes(rawPreset as AgentCliPreset)) {
+        preset = rawPreset as AgentCliPreset;
+      } else if (
+        isSafeCliToken(rawPreset) &&
+        detectAvailableAgentClis().some((c) => c.id === rawPreset)
+      ) {
+        preset = 'custom';
+        customCommand = customCommand && customCommand.trim() ? customCommand : rawPreset;
+      } else {
+        throw new Error(`Unsupported CLI preset: ${rawPreset}`);
       }
+
       return this.startCliAgent({
         preset,
-        customCommand: typeof obj.customCommand === 'string' ? obj.customCommand : undefined,
+        customCommand,
         cwd: typeof obj.cwd === 'string' ? obj.cwd : undefined,
         cols: typeof obj.cols === 'number' ? obj.cols : undefined,
         rows: typeof obj.rows === 'number' ? obj.rows : undefined,
@@ -909,6 +1597,9 @@ export class AgentDockManager {
     });
 
     handleAgent('agent:get-context', () => this.callbacks.getBrowserContextSnippet());
+    handleAgent('agent:clear-transcript', () => this.clearTranscript());
+    handleAgent('agent:copy-transcript', () => this.copyTranscript());
+    handleAgent('agent:export-transcript', () => this.exportTranscript());
   }
 
   dispose(): void {

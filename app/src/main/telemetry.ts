@@ -104,6 +104,11 @@ export class TelemetryService {
     string,
     { startMonoSec: number | null; decodedBytes: number }
   >();
+  private readonly inFlightReqsByWcId = new Map<
+    number,
+    Map<string, { startedAtMs: number; resourceType?: string }>
+  >();
+  private readonly lastNetworkActivityByWcId = new Map<number, number>();
   private readonly collectorUnsubs = new Map<number, () => void>();
   private readonly now: () => number;
   private readonly rafTtlMs: number;
@@ -207,6 +212,8 @@ export class TelemetryService {
     this.collectorUnsubs.clear();
     this.webglByWcId.clear();
     this.reqTimingByReqId.clear();
+    this.inFlightReqsByWcId.clear();
+    this.lastNetworkActivityByWcId.clear();
   }
 
   setThrottled(throttled: boolean): void {
@@ -375,6 +382,17 @@ export class TelemetryService {
         typeof params.timestamp === 'number' && Number.isFinite(params.timestamp)
           ? params.timestamp
           : null;
+      const resourceType = typeof params.type === 'string' ? params.type : undefined;
+      if (resourceType !== 'WebSocket' && resourceType !== 'EventSource') {
+        const nowMs = this.now();
+        let wcMap = this.inFlightReqsByWcId.get(wcId);
+        if (!wcMap) {
+          wcMap = new Map();
+          this.inFlightReqsByWcId.set(wcId, wcMap);
+        }
+        wcMap.set(requestId, { startedAtMs: nowMs, resourceType });
+        this.lastNetworkActivityByWcId.set(wcId, nowMs);
+      }
       const initiator = extractNetworkInitiator(params.initiator);
       const existing = this.networkByReqId.get(requestId);
       if (existing) {
@@ -475,6 +493,8 @@ export class TelemetryService {
         }
       }
       this.reqTimingByReqId.delete(requestId);
+      this.inFlightReqsByWcId.get(wcId)?.delete(requestId);
+      this.lastNetworkActivityByWcId.set(wcId, this.now());
     } else if (method === 'Network.loadingFailed') {
       const requestId = `${wcId}:${String(params.requestId ?? '')}`;
       const existing = this.networkByReqId.get(requestId);
@@ -500,6 +520,8 @@ export class TelemetryService {
         });
       }
       this.reqTimingByReqId.delete(requestId);
+      this.inFlightReqsByWcId.get(wcId)?.delete(requestId);
+      this.lastNetworkActivityByWcId.set(wcId, this.now());
     }
   }
 
@@ -516,6 +538,8 @@ export class TelemetryService {
         this.rafByWcId.delete(wc.id);
         this.cdpPerfByWcId.delete(wc.id);
         this.webglByWcId.delete(wc.id);
+        this.inFlightReqsByWcId.delete(wc.id);
+        this.lastNetworkActivityByWcId.delete(wc.id);
         this.collectorUnsubs.delete(wc.id);
       },
     });
@@ -643,6 +667,9 @@ export class TelemetryService {
         this.networkEntries.splice(i, 1);
         this.networkByReqId.delete(entry.id);
         this.reqTimingByReqId.delete(entry.id);
+        for (const wcMap of this.inFlightReqsByWcId.values()) {
+          wcMap.delete(entry.id);
+        }
       }
     }
   }
@@ -660,8 +687,29 @@ export class TelemetryService {
         this.networkEntries.splice(i, 1);
         this.networkByReqId.delete(entry.id);
         this.reqTimingByReqId.delete(entry.id);
+        for (const wcMap of this.inFlightReqsByWcId.values()) {
+          wcMap.delete(entry.id);
+        }
       }
     }
+  }
+
+  getNetworkIdleState(
+    wcId: number,
+    nowMs = this.now(),
+  ): { inFlightCount: number; idleForMs: number } {
+    const wcMap = this.inFlightReqsByWcId.get(wcId);
+    if (wcMap) {
+      for (const [reqKey, meta] of wcMap.entries()) {
+        if (nowMs - meta.startedAtMs > 60_000) {
+          wcMap.delete(reqKey);
+        }
+      }
+    }
+    const inFlightCount = wcMap?.size ?? 0;
+    const lastActivity = this.lastNetworkActivityByWcId.get(wcId) ?? 0;
+    const idleForMs = inFlightCount === 0 ? Math.max(0, nowMs - lastActivity) : 0;
+    return { inFlightCount, idleForMs };
   }
 
   private async pollCdpPerformance(wc: WebContents | null): Promise<void> {
@@ -762,10 +810,20 @@ export class TelemetryService {
     return run;
   }
 
+  sampleTargetOnce(target: ActiveTabTarget): Promise<TelemetrySnapshot> {
+    return this.doSampleTarget(target, false);
+  }
+
   private async doSampleOnce(): Promise<TelemetrySnapshot> {
+    return this.doSampleTarget(this.getActiveTarget(), true);
+  }
+
+  private async doSampleTarget(
+    target: ActiveTabTarget | null,
+    emitShellUpdate: boolean,
+  ): Promise<TelemetrySnapshot> {
     const nowMs = this.now();
     this.pruneStaleRafStats(nowMs);
-    const target = this.getActiveTarget();
     await Promise.all([
       this.pollCdpPerformance(target?.portraitWc ?? null),
       this.pollCdpPerformance(target?.landscapeWc ?? null),
@@ -833,8 +891,10 @@ export class TelemetryService {
       emulation: target?.emulation ?? null,
     };
 
-    this.lastSnapshot = snapshot;
-    this.onSnapshot(snapshot);
+    if (emitShellUpdate) {
+      this.lastSnapshot = snapshot;
+      this.onSnapshot(snapshot);
+    }
     return snapshot;
   }
 }

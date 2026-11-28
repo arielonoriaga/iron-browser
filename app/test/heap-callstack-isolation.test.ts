@@ -411,14 +411,14 @@ describe('browser_network Initiator Call Stacks & browser_profile Inclusive Call
     delete process.env.IRON_BROWSER_USER_DATA;
     try {
       expect(
-        resolveStateLogDir({ isSmoke: false, userDataDir: '/home/exo/.cache/iron-browser-ezc' }),
-      ).toBe('/home/exo/.cache/iron-browser-ezc/logs');
+        resolveStateLogDir({ isSmoke: false, userDataDir: '/home/dev/.cache/iron-browser-ezc' }),
+      ).toBe('/home/dev/.cache/iron-browser-ezc/logs');
       expect(
-        resolveStateLogDir({ isSmoke: false, userDataDir: '/home/exo/.config/iron-browser-app' }),
+        resolveStateLogDir({ isSmoke: false, userDataDir: '/home/dev/.config/iron-browser-app' }),
       ).toContain(path.join('iron-browser'));
       expect(
-        resolveStateLogDir({ isSmoke: false, userDataDir: '/home/exo/.config/iron-browser-app' }),
-      ).not.toBe('/home/exo/.config/iron-browser-app/logs');
+        resolveStateLogDir({ isSmoke: false, userDataDir: '/home/dev/.config/iron-browser-app' }),
+      ).not.toBe('/home/dev/.config/iron-browser-app/logs');
     } finally {
       if (prevLogDir !== undefined) process.env.IRON_BROWSER_LOG_DIR = prevLogDir;
       if (prevUserData !== undefined) process.env.IRON_BROWSER_USER_DATA = prevUserData;

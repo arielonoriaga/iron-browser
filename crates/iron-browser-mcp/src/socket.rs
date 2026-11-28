@@ -16,6 +16,7 @@ use crate::frame::{read_frame_sync, write_frame_sync};
 
 pub const DEFAULT_SOCKET_IO_TIMEOUT: Duration = Duration::from_secs(15);
 pub const LONG_SOCKET_IO_TIMEOUT: Duration = Duration::from_secs(35);
+pub const HEAP_SOCKET_IO_TIMEOUT: Duration = Duration::from_secs(50);
 pub const HEALTH_SOCKET_IO_TIMEOUT: Duration = Duration::from_secs(3);
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

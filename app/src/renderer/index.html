@@ -66,6 +66,22 @@
       </div>
     </header>
 
+    <!-- Navigation Load Error Banner (34px when active) -->
+    <div id="load-error-banner" class="error-banner hidden" role="alert">
+      <span id="load-error-text" class="error-banner-text">Failed to load page</span>
+      <button id="btn-retry-load" class="error-banner-btn" type="button">Retry</button>
+      <button id="btn-dismiss-error" class="find-btn" type="button" aria-label="Dismiss error" title="Dismiss">×</button>
+    </div>
+
+    <!-- Find-in-Page Bar (34px when active, Ctrl+F) -->
+    <div id="find-bar" class="find-bar hidden" data-testid="find-bar">
+      <input id="find-input" class="find-input" type="text" placeholder="Find in page..." aria-label="Find in page" spellcheck="false" />
+      <span id="find-count" class="find-count">0 / 0</span>
+      <button id="find-prev" class="find-btn" type="button" aria-label="Previous match" title="Previous match (Shift+Enter)">▲</button>
+      <button id="find-next" class="find-btn" type="button" aria-label="Next match" title="Next match (Enter)">▼</button>
+      <button id="find-close" class="find-btn" type="button" aria-label="Close find bar" title="Close (Esc)">×</button>
+    </div>
+
     <!-- Collapsible Zen Vertical Tab Rail -->
     <aside id="zen-rail" class="zen-rail">
       <div class="rail-header">
@@ -111,6 +127,11 @@
     <div id="landscape-header" class="vp-header">
       <span id="landscape-tag" class="vp-tag">LANDSCAPE</span>
       <select id="select-landscape-preset" class="preset-select" aria-label="Landscape preset"></select>
+      <div id="zoom-controls" class="zoom-controls">
+        <button id="btn-zoom-out" class="vp-zoom-btn" type="button" title="Zoom out (Ctrl+-)" aria-label="Zoom out">−</button>
+        <button id="btn-zoom-reset" class="vp-zoom-reset" type="button" title="Reset zoom (Ctrl+0)" aria-label="Reset zoom">100%</button>
+        <button id="btn-zoom-in" class="vp-zoom-btn" type="button" title="Zoom in (Ctrl+=)" aria-label="Zoom in">+</button>
+      </div>
       <button id="btn-audio-landscape" class="vp-audio-btn" title="Toggle Landscape Audio" aria-label="Toggle Landscape Audio"></button>
       <span id="landscape-fps" class="vp-stat">-- fps</span>
     </div>
@@ -140,6 +161,7 @@
       </div>
 
       <div class="telemetry-pills">
+        <span id="download-toast" class="telemetry-stat-pill download-toast hidden" role="status" aria-live="polite"></span>
         <span id="pill-dedup-count" class="telemetry-stat-pill" title="Deduplicated mutations in active tab">
           Dedup <span id="m-dedup">0</span>
         </span>

@@ -36,6 +36,32 @@ export interface ControlSocketDiagnostics {
   startedAtMs?: number;
 }
 
+const BROWSER_OPEN_ALLOWED_KEYS = new Set([
+  'url',
+  'mode',
+  'session',
+  'portrait_preset',
+  'landscape_preset',
+  'portrait_size',
+  'landscape_size',
+  'background',
+]);
+const VIEWPORT_SIZE_ALLOWED_KEYS = new Set(['width', 'height', 'dpr']);
+const BROWSER_METRICS_ALLOWED_KEYS = new Set(['tab_id']);
+const BROWSER_CLOSE_TAB_ALLOWED_KEYS = new Set(['tab_id', 'session', 'all']);
+
+function assertAllowedKeys(
+  obj: Record<string, unknown>,
+  allowed: Set<string>,
+  label: string,
+): void {
+  for (const key of Object.keys(obj)) {
+    if (!allowed.has(key)) {
+      throw new Error(`unknown property '${key}' for ${label}`);
+    }
+  }
+}
+
 /**
  * Exact path parity with `crates/iron-browser-mcp/src/socket.rs`:
  * 1. `IRON_BROWSER_SOCKET` override
@@ -332,10 +358,38 @@ export class ControlSocketServer {
       }
 
       case 'browser_open': {
+        assertAllowedKeys(params, BROWSER_OPEN_ALLOWED_KEYS, 'browser_open');
+        if (
+          params.portrait_size !== undefined &&
+          params.portrait_size !== null &&
+          typeof params.portrait_size === 'object' &&
+          !Array.isArray(params.portrait_size)
+        ) {
+          assertAllowedKeys(
+            params.portrait_size as Record<string, unknown>,
+            VIEWPORT_SIZE_ALLOWED_KEYS,
+            'browser_open.portrait_size',
+          );
+        }
+        if (
+          params.landscape_size !== undefined &&
+          params.landscape_size !== null &&
+          typeof params.landscape_size === 'object' &&
+          !Array.isArray(params.landscape_size)
+        ) {
+          assertAllowedKeys(
+            params.landscape_size as Record<string, unknown>,
+            VIEWPORT_SIZE_ALLOWED_KEYS,
+            'browser_open.landscape_size',
+          );
+        }
         const rawUrl = typeof params.url === 'string' ? params.url : '';
         if (!rawUrl.trim()) throw new Error('url is required');
+        if (params.background !== undefined && typeof params.background !== 'boolean') {
+          throw new Error('background must be a boolean');
+        }
         const validatedUrl = normalizeUrl(rawUrl);
-        const state = this.tabManager.createTab({
+        const opened = this.tabManager.openTab({
           url: validatedUrl,
           mode: params.mode === 'single' || params.mode === 'dual' ? (params.mode as ViewMode) : 'dual',
           session:
@@ -348,15 +402,15 @@ export class ControlSocketServer {
             typeof params.landscape_preset === 'string' ? params.landscape_preset : undefined,
           portraitSize: validateViewportSizeInput(params.portrait_size, 'portrait_size'),
           landscapeSize: validateViewportSizeInput(params.landscape_size, 'landscape_size'),
+          activate: params.background !== true,
         });
-        const activeTabId = state.activeTabId;
-        const viewportReport = activeTabId
-          ? await this.tabManager.refreshTabViewportReport(activeTabId, 200).catch(() => ({}))
-          : {};
+        const viewportReport = await this.tabManager
+          .refreshTabViewportReport(opened.tabId, 200)
+          .catch(() => ({}));
         const refreshedState = this.tabManager.getShellState();
         return {
           activeTabId: refreshedState.activeTabId,
-          tab: refreshedState.tabs.find((t) => t.id === refreshedState.activeTabId) ?? null,
+          tab: refreshedState.tabs.find((t) => t.id === opened.tabId) ?? null,
           viewportReport,
         };
       }
@@ -377,6 +431,189 @@ export class ControlSocketServer {
           tab: refreshedState.tabs.find((t) => t.id === (tabId ?? refreshedState.activeTabId)) ?? null,
           viewportReport,
         };
+      }
+
+      case 'browser_close_tab': {
+        assertAllowedKeys(params, BROWSER_CLOSE_TAB_ALLOWED_KEYS, 'browser_close_tab');
+        let validatedTabId: string | undefined;
+        if (params.tab_id !== undefined) {
+          if (typeof params.tab_id !== 'string' || params.tab_id.trim().length === 0) {
+            throw new Error('tab_id must be a non-empty string');
+          }
+          validatedTabId = params.tab_id.trim();
+        }
+        let validatedSession: SessionMode | undefined;
+        if (params.session !== undefined) {
+          if (params.session !== 'isolated' && params.session !== 'shared') {
+            throw new Error("session must be 'isolated' or 'shared'");
+          }
+          validatedSession = params.session;
+        }
+        if (params.all !== undefined && typeof params.all !== 'boolean') {
+          throw new Error('all must be a boolean');
+        }
+        if (
+          validatedTabId !== undefined &&
+          (params.all !== undefined || validatedSession !== undefined)
+        ) {
+          throw new Error('tab_id cannot be combined with all or session');
+        }
+        if (validatedSession !== undefined && params.all !== true) {
+          throw new Error('session filter requires all=true');
+        }
+
+        if (params.all === true) {
+          const { closedTabIds, state } = this.tabManager.closeTabs({
+            session: validatedSession,
+            all: true,
+          });
+          return {
+            ok: true,
+            closedTabId: closedTabIds.length === 1 ? closedTabIds[0]! : null,
+            closedTabIds,
+            closedCount: closedTabIds.length,
+            activeTabId: state.activeTabId,
+            tabs: state.tabs,
+          };
+        }
+
+        const rawTabId = validatedTabId ?? this.tabManager.getActiveTab()?.id;
+        if (!rawTabId || !this.tabManager.getTab(rawTabId)) {
+          throw new Error(`tab '${rawTabId ?? ''}' not found`);
+        }
+        const state = this.tabManager.closeTab(rawTabId);
+        return {
+          ok: true,
+          closedTabId: rawTabId,
+          closedTabIds: [rawTabId],
+          closedCount: 1,
+          activeTabId: state.activeTabId,
+          tabs: state.tabs,
+        };
+      }
+
+      case 'browser_select_tab': {
+        const rawTabId = typeof params.tab_id === 'string' ? params.tab_id.trim() : '';
+        if (!rawTabId) {
+          throw new Error('tab_id is required');
+        }
+        if (!this.tabManager.getTab(rawTabId)) {
+          throw new Error(`tab '${rawTabId}' not found`);
+        }
+        const state = this.tabManager.selectTab(rawTabId);
+        return {
+          ok: true,
+          activeTabId: state.activeTabId,
+          tab: state.tabs.find((t) => t.id === rawTabId) ?? null,
+          tabs: state.tabs,
+        };
+      }
+
+      case 'browser_reload': {
+        const tabId =
+          typeof params.tab_id === 'string' && params.tab_id.trim().length > 0
+            ? params.tab_id.trim()
+            : undefined;
+        const ignoreCache =
+          typeof params.ignore_cache === 'boolean' ? params.ignore_cache : true;
+        const targetTab = tabId
+          ? this.tabManager.getTab(tabId)
+          : this.tabManager.getActiveTab();
+        if (tabId && !targetTab) {
+          throw new Error(`tab '${tabId}' not found`);
+        }
+        if (!targetTab) {
+          throw new Error('no active tab');
+        }
+        await this.tabManager.reloadTab({ tabId: targetTab.id, ignoreCache });
+        const state = this.tabManager.getShellState();
+        return {
+          ok: true,
+          tabId: targetTab.id,
+          tab: state.tabs.find((t) => t.id === targetTab.id) ?? null,
+        };
+      }
+
+      case 'browser_navigate_history': {
+        const direction = params.direction;
+        if (direction !== 'back' && direction !== 'forward') {
+          throw new Error("direction must be 'back' or 'forward'");
+        }
+        const tabId =
+          typeof params.tab_id === 'string' && params.tab_id.trim().length > 0
+            ? params.tab_id.trim()
+            : undefined;
+        const res = this.tabManager.navigateHistory(direction, tabId);
+        const state = this.tabManager.getShellState();
+        return {
+          ...res,
+          tab: state.tabs.find((t) => t.id === res.tabId) ?? null,
+        };
+      }
+
+      case 'browser_wait_for': {
+        const tabId =
+          typeof params.tab_id === 'string' && params.tab_id.trim().length > 0
+            ? params.tab_id.trim()
+            : undefined;
+        let viewport: ViewportRole | undefined;
+        if (params.viewport !== undefined) {
+          if (params.viewport !== 'portrait' && params.viewport !== 'landscape') {
+            throw new Error("viewport must be 'portrait' or 'landscape'");
+          }
+          viewport = params.viewport;
+        }
+        return await this.tabManager.waitFor({
+          tabId,
+          viewport,
+          selector: typeof params.selector === 'string' ? params.selector : undefined,
+          text: typeof params.text === 'string' ? params.text : undefined,
+          urlIncludes: typeof params.url_includes === 'string' ? params.url_includes : undefined,
+          networkIdleMs:
+            typeof params.network_idle_ms === 'number' && Number.isFinite(params.network_idle_ms)
+              ? params.network_idle_ms
+              : undefined,
+          timeoutMs:
+            typeof params.timeout_ms === 'number' && Number.isFinite(params.timeout_ms)
+              ? params.timeout_ms
+              : undefined,
+        });
+      }
+
+      case 'browser_storage': {
+        const action = params.action;
+        if (
+          action !== 'get' &&
+          action !== 'set' &&
+          action !== 'remove' &&
+          action !== 'clear'
+        ) {
+          throw new Error("browser_storage action must be 'get', 'set', 'remove', or 'clear'");
+        }
+        const tabId =
+          typeof params.tab_id === 'string' && params.tab_id.trim().length > 0
+            ? params.tab_id.trim()
+            : undefined;
+        let viewport: ViewportRole | undefined;
+        if (params.viewport !== undefined) {
+          if (params.viewport !== 'portrait' && params.viewport !== 'landscape') {
+            throw new Error("viewport must be 'portrait' or 'landscape'");
+          }
+          viewport = params.viewport;
+        }
+        if (params.scope !== undefined && typeof params.scope !== 'string') {
+          throw new Error('browser_storage scope must be a string');
+        }
+        return await this.tabManager.manageStorage({
+          action,
+          scope: params.scope as 'cookies' | 'localStorage' | 'sessionStorage' | 'all' | undefined,
+          tabId,
+          viewport,
+          key: typeof params.key === 'string' ? params.key : undefined,
+          name: typeof params.name === 'string' ? params.name : undefined,
+          value: typeof params.value === 'string' ? params.value : undefined,
+          url: typeof params.url === 'string' ? params.url : undefined,
+        });
       }
 
       case 'browser_screenshot': {
@@ -401,7 +638,15 @@ export class ControlSocketServer {
       }
 
       case 'browser_metrics': {
-        return await this.tabManager.telemetry.sampleOnce();
+        assertAllowedKeys(params, BROWSER_METRICS_ALLOWED_KEYS, 'browser_metrics');
+        let tabId: string | undefined;
+        if (params.tab_id !== undefined) {
+          if (typeof params.tab_id !== 'string' || params.tab_id.trim().length === 0) {
+            throw new Error('tab_id must be a non-empty string');
+          }
+          tabId = params.tab_id.trim();
+        }
+        return await this.tabManager.sampleTabMetrics(tabId);
       }
 
       case 'browser_interact': {

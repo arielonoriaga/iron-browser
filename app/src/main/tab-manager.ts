@@ -38,6 +38,7 @@ import {
 } from '../shared/presets';
 import type {
   CalibrationResult,
+  DownloadProgressInfo,
   ElementFingerprint,
   HistoryEntry,
   LayoutResult,
@@ -46,6 +47,7 @@ import type {
   SessionMode,
   ShellState,
   TabEmulationSummary,
+  TabLoadError,
   TabSnapshot,
   TelemetrySnapshot,
   ThemeMode,
@@ -153,6 +155,9 @@ interface ManagedTab {
   launchConvergence: LaunchRedirectConvergence | null;
   lastActiveAt: number;
   skipNextRestoreHistoryCommit: boolean;
+  zoomFactor: number;
+  loadErrors: Partial<Record<ViewportRole, TabLoadError>>;
+  lastFocusedViewport: ViewportRole;
   landscapeView: WebContentsView | null;
   portraitView: WebContentsView | null;
 }
@@ -203,6 +208,9 @@ const MAX_CLOSED_TABS = 10;
 const DEFAULT_AUTO_SLEEP_AFTER_MS = 10 * 60 * 1000;
 const DEFAULT_AUTO_SLEEP_CHECK_MS = 60 * 1000;
 const DEFAULT_INSPECT_TIMEOUT_MS = 1500;
+const ZOOM_STEPS = [
+  0.25, 0.33, 0.5, 0.67, 0.75, 0.8, 0.9, 1.0, 1.1, 1.25, 1.5, 1.75, 2.0, 2.5, 3.0, 4.0, 5.0,
+] as const;
 
 export function computeEffectiveDpr(
   presetDpr: number,
@@ -254,9 +262,14 @@ export class TabManager implements MirrorViewportLookup {
   private lastLayout: LayoutResult | null = null;
   private latestTelemetry: TelemetrySnapshot | null = null;
   private disposed = false;
+  private findOpen = false;
+  private lastFindReqId = 0;
+  private nextDownloadSeq = 1;
   private readonly mirrorMissByTab = new Map<string, MirrorMissInfo>();
   private readonly pendingEmulations = new Map<number, Promise<void>>();
   private readonly primedWcIds = new Set<number>();
+  private readonly primedBlankHistoryWcIds = new Set<number>();
+  private readonly pendingErrorFinishWcIds = new Set<number>();
   private readonly pendingSurfacePrimes = new Map<number, Promise<void>>();
   private readonly muxOrDedupTouchedWcIds = new Set<number>();
   private readonly wcLoadStates = new Map<
@@ -678,11 +691,69 @@ export class TabManager implements MirrorViewportLookup {
         }
       }
 
+      const dlId = `dl-${this.nextDownloadSeq++}`;
+      const emitDownloadEvent = (payload: DownloadProgressInfo) => {
+        if (!this.disposed && !this.win.isDestroyed()) {
+          this.win.webContents.send('shell:download-event', payload);
+        }
+      };
+      const totalBytesInit = typeof item.getTotalBytes === 'function' ? item.getTotalBytes() : 0;
+      emitDownloadEvent({
+        id: dlId,
+        tabId: hit.tab.id,
+        viewport: hit.role,
+        filename,
+        receivedBytes: 0,
+        totalBytes: totalBytesInit,
+        state: 'progressing',
+        savePath: reservedPath,
+      });
+
+      let lastProgressAt = 0;
+      if (typeof item.on === 'function') {
+        item.on('updated', (_updEv, state) => {
+          const nowMs = Date.now();
+          if (state === 'progressing' && nowMs - lastProgressAt < 100) return;
+          lastProgressAt = nowMs;
+          const receivedBytes =
+            typeof item.getReceivedBytes === 'function' ? item.getReceivedBytes() : 0;
+          const totalBytes = typeof item.getTotalBytes === 'function' ? item.getTotalBytes() : 0;
+          emitDownloadEvent({
+            id: dlId,
+            tabId: hit.tab.id,
+            viewport: hit.role,
+            filename,
+            receivedBytes,
+            totalBytes,
+            state: state === 'interrupted' ? 'interrupted' : 'progressing',
+            savePath: reservedPath,
+          });
+        });
+      }
+
       if (typeof item.once === 'function') {
         item.once('done', (_doneEv, state) => {
           if (state !== 'completed') {
             cleanupEmptyReservedDownload(reservedPath);
           }
+          const receivedBytes =
+            typeof item.getReceivedBytes === 'function' ? item.getReceivedBytes() : 0;
+          const totalBytes = typeof item.getTotalBytes === 'function' ? item.getTotalBytes() : 0;
+          emitDownloadEvent({
+            id: dlId,
+            tabId: hit.tab.id,
+            viewport: hit.role,
+            filename,
+            receivedBytes,
+            totalBytes,
+            state:
+              state === 'completed'
+                ? 'completed'
+                : state === 'cancelled'
+                  ? 'cancelled'
+                  : 'interrupted',
+            savePath: reservedPath,
+          });
           this.tabEventBus.publish({
             tabId: hit.tab.id,
             viewport: hit.role,
@@ -769,25 +840,157 @@ export class TabManager implements MirrorViewportLookup {
       }
     });
 
-    // Native right-click developer context menu: Inspect Element + Copy Selector / OuterHTML / Mirror Debug Info
+    // Native right-click context menu: Navigation, Edit, Link/Image actions, DevTools & Mirror Debug
     wc.on('context-menu', (_ev, params) => {
       const tab = this.getTab(tabId);
       if (!tab) return;
+      const px = params?.x ?? 0;
+      const py = params?.y ?? 0;
       const scale =
         role === 'portrait'
           ? tab.portraitScale
           : tab.landscapeScale * (wc.isDestroyed() ? 1 : wc.getZoomFactor());
-      const cssX = Math.round(params.x / Math.max(scale, 0.1));
-      const cssY = Math.round(params.y / Math.max(scale, 0.1));
+      const cssX = Math.round(px / Math.max(scale, 0.1));
+      const cssY = Math.round(py / Math.max(scale, 0.1));
 
-      const menu = Menu.buildFromTemplate([
+      const template: Electron.MenuItemConstructorOptions[] = [
         {
-          label: `Inspect Element (${role})`,
+          label: 'Back',
+          enabled: !wc.isDestroyed() && wc.navigationHistory.canGoBack(),
+          click: () => this.goBack(),
+        },
+        {
+          label: 'Forward',
+          enabled: !wc.isDestroyed() && wc.navigationHistory.canGoForward(),
+          click: () => this.goForward(),
+        },
+        {
+          label: 'Reload',
           click: () => {
-            void this.inspectElementAt(wc, role, params.x, params.y);
+            void this.reload();
           },
         },
         { type: 'separator' },
+      ];
+
+      if (params?.isEditable) {
+        template.push({
+          label: 'Cut',
+          enabled: Boolean(params.editFlags?.canCut),
+          click: () => {
+            if (!wc.isDestroyed() && typeof wc.cut === 'function') wc.cut();
+          },
+        });
+      }
+      if (params?.isEditable || params?.selectionText) {
+        template.push({
+          label: 'Copy',
+          enabled: Boolean(params.editFlags?.canCopy || params.selectionText),
+          click: () => {
+            if (!wc.isDestroyed() && typeof wc.copy === 'function') wc.copy();
+          },
+        });
+      }
+      if (params?.isEditable) {
+        template.push({
+          label: 'Paste',
+          enabled: Boolean(params.editFlags?.canPaste),
+          click: () => {
+            if (!wc.isDestroyed() && typeof wc.paste === 'function') wc.paste();
+          },
+        });
+      }
+      template.push({
+        label: 'Select All',
+        enabled: params?.editFlags?.canSelectAll ?? true,
+        click: () => {
+          if (!wc.isDestroyed() && typeof wc.selectAll === 'function') wc.selectAll();
+        },
+      });
+
+      const rawLinkUrl = typeof params?.linkURL === 'string' ? params.linkURL.trim() : '';
+      if (rawLinkUrl) {
+        let safeLinkUrl: string | null = null;
+        try {
+          const normalized = normalizeUrl(rawLinkUrl);
+          if (normalized.startsWith('http://') || normalized.startsWith('https://')) {
+            safeLinkUrl = normalized;
+          }
+        } catch {
+          safeLinkUrl = null;
+        }
+        if (safeLinkUrl) {
+          template.push(
+            { type: 'separator' },
+            {
+              label: 'Open Link in New Tab',
+              click: () => {
+                this.createTab({
+                  url: safeLinkUrl,
+                  mode: tab.mode,
+                  session: tab.session,
+                  activate: true,
+                });
+              },
+            },
+            {
+              label: 'Copy Link Address',
+              click: () => {
+                clipboard.writeText(rawLinkUrl);
+              },
+            },
+          );
+        }
+      }
+
+      const rawSrcUrl = typeof params?.srcURL === 'string' ? params.srcURL.trim() : '';
+      if (params?.mediaType === 'image' && rawSrcUrl) {
+        let safeImageUrl: string | null = null;
+        try {
+          const normalized = normalizeUrl(rawSrcUrl);
+          if (normalized.startsWith('http://') || normalized.startsWith('https://')) {
+            safeImageUrl = normalized;
+          }
+        } catch {
+          safeImageUrl = null;
+        }
+        template.push({ type: 'separator' });
+        if (safeImageUrl) {
+          template.push({
+            label: 'Save Image',
+            click: () => {
+              if (!wc.isDestroyed() && typeof wc.downloadURL === 'function') {
+                wc.downloadURL(safeImageUrl);
+              }
+            },
+          });
+        }
+        template.push(
+          {
+            label: 'Copy Image',
+            click: () => {
+              if (!wc.isDestroyed() && typeof wc.copyImageAt === 'function') {
+                wc.copyImageAt(px, py);
+              }
+            },
+          },
+          {
+            label: 'Copy Image Address',
+            click: () => {
+              clipboard.writeText(rawSrcUrl);
+            },
+          },
+        );
+      }
+
+      template.push(
+        { type: 'separator' },
+        {
+          label: `Inspect Element (${role})`,
+          click: () => {
+            void this.inspectElementAt(wc, role, px, py);
+          },
+        },
         {
           label: 'Copy CSS Selector',
           click: () => {
@@ -856,13 +1059,9 @@ export class TabManager implements MirrorViewportLookup {
           label: tab.audioSource === role ? `Mute ${role}` : `Switch Audio to ${role}`,
           click: () => this.toggleAudio(role),
         },
-        {
-          label: 'Reload',
-          click: () => {
-            void this.reload();
-          },
-        },
-      ]);
+      );
+
+      const menu = Menu.buildFromTemplate(template);
       menu.popup({ window: this.win });
     });
 
@@ -886,19 +1085,70 @@ export class TabManager implements MirrorViewportLookup {
       }
     });
 
+    wc.on('focus', () => {
+      const tab = this.getTab(tabId);
+      if (tab) {
+        tab.lastFocusedViewport = role;
+      }
+    });
+
+    wc.on('found-in-page', (_ev, result) => {
+      if (this.disposed || this.win.isDestroyed()) return;
+      if (this.getActiveTab()?.id !== tabId) return;
+      if (!result || result.requestId !== this.lastFindReqId) return;
+      this.win.webContents.send('shell:find-result', {
+        activeMatchOrdinal: result.activeMatchOrdinal ?? 0,
+        matches: result.matches ?? 0,
+        finalUpdate: Boolean(result.finalUpdate),
+        viewport: role,
+      });
+    });
+
+    wc.on('did-fail-load', (_ev, errorCode, errorDescription, validatedURL, isMainFrame) => {
+      if (this.disposed || isMainFrame === false) return;
+      if (errorCode === -3) return; // ERR_ABORTED
+      if (this.wcLoadStates.get(wc.id)?.primingAboutBlank) return;
+      if (typeof validatedURL === 'string' && validatedURL.startsWith('chrome-error://')) return;
+      const tab = this.getTab(tabId);
+      if (!tab) return;
+      this.pendingErrorFinishWcIds.add(wc.id);
+      tab.loadErrors[role] = {
+        viewport: role,
+        errorCode: typeof errorCode === 'number' ? errorCode : -1,
+        errorDescription: errorDescription || 'Failed to load',
+        url: validatedURL || tab.url,
+        timestampMs: Date.now(),
+      };
+      this.applyLayout();
+      this.emitState(false);
+    });
+
     wc.on('did-start-loading', () => {
+      this.pendingErrorFinishWcIds.delete(wc.id);
       this.emitState(false);
     });
 
     wc.on('did-finish-load', () => {
       this.primedWcIds.delete(wc.id);
+      if (!this.wcLoadStates.get(wc.id)?.primingAboutBlank) {
+        this.prunePrimedAboutBlankHistory(wc);
+      }
+      const isErrorPageFinish = this.pendingErrorFinishWcIds.delete(wc.id);
       const tab = this.getTab(tabId);
       if (!tab) return;
+      const curUrl = !wc.isDestroyed() ? wc.getURL() : '';
+      if (!isErrorPageFinish && curUrl && !curUrl.startsWith('chrome-error://') && tab.loadErrors[role]) {
+        delete tab.loadErrors[role];
+        this.applyLayout();
+        this.emitState(false);
+      }
       void this.applyViewportEmulation(tab, role);
     });
 
     wc.once('destroyed', () => {
       this.primedWcIds.delete(wc.id);
+      this.primedBlankHistoryWcIds.delete(wc.id);
+      this.pendingErrorFinishWcIds.delete(wc.id);
       this.pendingSurfacePrimes.delete(wc.id);
       this.rendererHealthByWcId.delete(wc.id);
     });
@@ -994,6 +1244,7 @@ export class TabManager implements MirrorViewportLookup {
 
     const handleNavSync = (navUrl: string, isInPage: boolean) => {
       if (this.wcLoadStates.get(wc.id)?.primingAboutBlank) return;
+      if (navUrl.startsWith('chrome-error://')) return;
       const tab = this.getTab(tabId);
       if (!tab) return;
       if (role === 'landscape' || tab.mode === 'single') {
@@ -1287,7 +1538,12 @@ export class TabManager implements MirrorViewportLookup {
       this.setInPageSyncTimer(tab.id, timer);
     };
 
-    wc.on('did-navigate', (_ev, navUrl) => handleNavSync(navUrl, false));
+    wc.on('did-navigate', (_ev, navUrl) => {
+      if (!this.wcLoadStates.get(wc.id)?.primingAboutBlank) {
+        this.prunePrimedAboutBlankHistory(wc);
+      }
+      handleNavSync(navUrl, false);
+    });
     wc.on('did-navigate-in-page', (_ev, navUrl, isMainFrame) => {
       if (isMainFrame === false) return;
       handleNavSync(navUrl, true);
@@ -1347,7 +1603,7 @@ export class TabManager implements MirrorViewportLookup {
                   this.getHostScaleFactor(),
                   this.ecoMode && !slowState.active,
                 );
-                wc.setZoomFactor(1);
+                wc.setZoomFactor(tab.zoomFactor);
                 await this.debuggerCoordinator.sendCommand(wc, 'Emulation.setDeviceMetricsOverride', {
                   width: size.width,
                   height: size.height,
@@ -1358,10 +1614,10 @@ export class TabManager implements MirrorViewportLookup {
                   screenHeight: size.height,
                 });
               } else if (tab.mode === 'dual') {
-                // Keep zoomFactor at 1 so Chromium never divides CSS innerWidth/dpr by zoomFactor
-                // (e.g. 1440 / 0.577 = 2495), while DeviceMetricsOverride sets exact preset geometry & DPR.
+                // Keep zoomFactor synced to tab.zoomFactor (default 1) so Chromium never divides
+                // CSS innerWidth/dpr by an unintended fit scale, while preserving user zoom.
                 tab.landscapeScale = 1;
-                wc.setZoomFactor(1);
+                wc.setZoomFactor(tab.zoomFactor);
                 await this.debuggerCoordinator.sendCommand(wc, 'Emulation.setDeviceMetricsOverride', {
                   width: size.width,
                   height: size.height,
@@ -1388,7 +1644,7 @@ export class TabManager implements MirrorViewportLookup {
                   this.ecoMode && !slowState.active,
                 );
                 tab.landscapeScale = singleScale;
-                wc.setZoomFactor(1);
+                wc.setZoomFactor(tab.zoomFactor);
                 await this.debuggerCoordinator.sendCommand(wc, 'Emulation.setDeviceMetricsOverride', {
                   width: singlePreset.width,
                   height: singlePreset.height,
@@ -1399,9 +1655,35 @@ export class TabManager implements MirrorViewportLookup {
                   screenHeight: singlePreset.height,
                 });
               } else {
+                const isTabActive = this.getActiveTab()?.id === tab.id && !tab.sleeping;
                 tab.landscapeScale = 1;
-                wc.setZoomFactor(1);
-                await this.debuggerCoordinator.sendCommand(wc, 'Emulation.clearDeviceMetricsOverride');
+                wc.setZoomFactor(tab.zoomFactor);
+                if (!isTabActive && !tab.sleeping) {
+                  const width = bounds.width > 0 ? bounds.width : tab.landscapeSize.width;
+                  const height = bounds.height > 0 ? bounds.height : tab.landscapeSize.height;
+                  const dpr =
+                    bounds.width > 0 && bounds.height > 0
+                      ? this.getHostScaleFactor()
+                      : tab.landscapeSize.dpr;
+                  await this.debuggerCoordinator.sendCommand(
+                    wc,
+                    'Emulation.setDeviceMetricsOverride',
+                    {
+                      width,
+                      height,
+                      deviceScaleFactor: dpr,
+                      mobile: false,
+                      scale: 1,
+                      screenWidth: width,
+                      screenHeight: height,
+                    },
+                  );
+                } else {
+                  await this.debuggerCoordinator.sendCommand(
+                    wc,
+                    'Emulation.clearDeviceMetricsOverride',
+                  );
+                }
               }
 
               await this.slowDeviceEmulation.syncViewport(tab.id, role, wc);
@@ -1831,11 +2113,55 @@ export class TabManager implements MirrorViewportLookup {
     return this.getTab(this.activeTabId) ?? this.tabs[0];
   }
 
+  private clearPendingErrorFinishForTab(tab: ManagedTab): void {
+    if (tab.landscapeView && !tab.landscapeView.webContents.isDestroyed()) {
+      this.pendingErrorFinishWcIds.delete(tab.landscapeView.webContents.id);
+    }
+    if (tab.portraitView && !tab.portraitView.webContents.isDestroyed()) {
+      this.pendingErrorFinishWcIds.delete(tab.portraitView.webContents.id);
+    }
+  }
+
+  private prunePrimedAboutBlankHistory(wc: WebContents): void {
+    if (!this.primedBlankHistoryWcIds.has(wc.id) || wc.isDestroyed()) return;
+    const navHistory = (wc as {
+      navigationHistory?: {
+        getActiveIndex?: () => number;
+        getEntryAtIndex?: (index: number) => { url?: string } | null | undefined;
+        removeEntryAtIndex?: (index: number) => boolean;
+      };
+    }).navigationHistory;
+    if (
+      !navHistory ||
+      typeof navHistory.getActiveIndex !== 'function' ||
+      typeof navHistory.getEntryAtIndex !== 'function' ||
+      typeof navHistory.removeEntryAtIndex !== 'function'
+    ) {
+      this.primedBlankHistoryWcIds.delete(wc.id);
+      return;
+    }
+    try {
+      const activeIndex = navHistory.getActiveIndex();
+      if (activeIndex < 1) return;
+      const firstEntry = navHistory.getEntryAtIndex(0);
+      if (firstEntry?.url === 'about:blank') {
+        if (navHistory.removeEntryAtIndex(0)) {
+          this.primedBlankHistoryWcIds.delete(wc.id);
+        }
+      } else {
+        this.primedBlankHistoryWcIds.delete(wc.id);
+      }
+    } catch {
+      this.primedBlankHistoryWcIds.delete(wc.id);
+    }
+  }
+
   private beginViewportLoad(
     wc: WebContents,
     opts: { attachedMidLoad?: boolean; armedForStop?: boolean } = {},
   ): Promise<boolean> {
     if (wc.isDestroyed()) return Promise.resolve(false);
+    this.pendingErrorFinishWcIds.delete(wc.id);
     const prev = this.wcLoadStates.get(wc.id);
     if (prev) {
       prev.settle(false, true);
@@ -1953,6 +2279,9 @@ export class TabManager implements MirrorViewportLookup {
     };
 
     if (!needsRendererPrime && !active && !emuActive && !this.muxOrDedupTouchedWcIds.has(wc.id)) {
+      if (url === 'about:blank') {
+        this.primedBlankHistoryWcIds.delete(wc.id);
+      }
       void this.wsSseMux.syncViewport(wc, false);
       void this.requestDedup.setViewportEnabled(wc, false);
       if (this.disposed || wc.isDestroyed() || entryRef?.superseded) {
@@ -1962,12 +2291,18 @@ export class TabManager implements MirrorViewportLookup {
         entryRef.armedForStop = true;
       }
       markLaunchEpochStarted();
-      void Promise.resolve(wc.loadURL(url)).catch(() => {
-        const current = this.wcLoadStates.get(wc.id);
-        if (current && current.promise === loadPromise) {
-          current.settle(false);
-        }
-      });
+      void Promise.resolve(wc.loadURL(url))
+        .catch(() => {
+          const current = this.wcLoadStates.get(wc.id);
+          if (current && current.promise === loadPromise) {
+            current.settle(false);
+          }
+        })
+        .finally(() => {
+          if (!this.disposed && !wc.isDestroyed() && !entryRef?.superseded) {
+            this.prunePrimedAboutBlankHistory(wc);
+          }
+        });
       return;
     }
 
@@ -1978,6 +2313,7 @@ export class TabManager implements MirrorViewportLookup {
       try {
         if (needsRendererPrime) {
           if (url === 'about:blank') {
+            this.primedBlankHistoryWcIds.delete(wc.id);
             if (entryRef && this.wcLoadStates.get(wc.id) === entryRef) {
               entryRef.armedForStop = true;
             }
@@ -1993,6 +2329,7 @@ export class TabManager implements MirrorViewportLookup {
           }
           // Electron 35 WebContentsView has no RenderFrameHost until an initial navigation starts;
           // prime about:blank so CDP Page.addScriptToEvaluateOnNewDocument & Fetch.enable never hang.
+          this.primedBlankHistoryWcIds.add(wc.id);
           if (entryRef && this.wcLoadStates.get(wc.id) === entryRef) {
             entryRef.primingAboutBlank = true;
           }
@@ -2006,6 +2343,8 @@ export class TabManager implements MirrorViewportLookup {
           if (this.disposed || wc.isDestroyed() || entryRef?.superseded) {
             return;
           }
+        } else if (url === 'about:blank') {
+          this.primedBlankHistoryWcIds.delete(wc.id);
         }
 
         let syncTimer: ReturnType<typeof setTimeout> | null = null;
@@ -2033,7 +2372,13 @@ export class TabManager implements MirrorViewportLookup {
           entryRef.armedForStop = true;
         }
         markLaunchEpochStarted();
-        await wc.loadURL(url);
+        try {
+          await wc.loadURL(url);
+        } finally {
+          if (!this.disposed && !wc.isDestroyed() && !entryRef?.superseded) {
+            this.prunePrimedAboutBlankHistory(wc);
+          }
+        }
       } catch {
         const current = this.wcLoadStates.get(wc.id);
         if (current && current.promise === loadPromise) {
@@ -2339,7 +2684,7 @@ export class TabManager implements MirrorViewportLookup {
     return this.emitState();
   }
 
-  createTab(opts: CreateTabOptions = {}): ShellState {
+  openTab(opts: CreateTabOptions = {}): { tabId: string; state: ShellState } {
     const id = `tab-${this.nextTabSeq++}`;
     const url = opts.url ? normalizeUrl(opts.url) : getDefaultWelcomeUrl();
     const mode: ViewMode = opts.mode ?? 'dual';
@@ -2412,6 +2757,9 @@ export class TabManager implements MirrorViewportLookup {
       launchConvergence: null,
       lastActiveAt: now,
       skipNextRestoreHistoryCommit: opts.recordHistory === false,
+      zoomFactor: 1,
+      loadErrors: {},
+      lastFocusedViewport: 'landscape',
       landscapeView: null,
       portraitView: null,
     };
@@ -2438,7 +2786,48 @@ export class TabManager implements MirrorViewportLookup {
 
     this.syncVisibilityAndLayout();
     this.syncDevToolsAttachment();
-    return this.emitState();
+    return { tabId: id, state: this.emitState() };
+  }
+
+  createTab(opts: CreateTabOptions = {}): ShellState {
+    return this.openTab(opts).state;
+  }
+
+  private teardownTab(tab: ManagedTab): void {
+    if (isPersistableHttpUrl(tab.url)) {
+      this.closedTabs.unshift({
+        url: tab.url,
+        title: truncatePersistedTitle(tab.title, formatHistorySubtitle(tab.url)),
+        mode: tab.mode,
+        mirror: tab.mirror,
+        dedup: tab.dedup,
+        session: tab.session,
+        sleeping: false,
+        portraitPresetId: tab.portraitPresetId,
+        landscapePresetId: tab.landscapePresetId,
+        devtoolsTarget: tab.devtoolsTarget,
+        audioSource: tab.audioSource,
+      });
+      if (this.closedTabs.length > MAX_CLOSED_TABS) {
+        this.closedTabs.length = MAX_CLOSED_TABS;
+      }
+    }
+    this.clearInPageSyncTimer(tab.id);
+    this.clearTabReconcileCooldowns(tab.id);
+    this.destroyTabViews(tab);
+    if (tab.session === 'isolated') {
+      this.clearIsolatedPartition(tab.id);
+    }
+    this.slowDeviceEmulation.clearTab(tab.id);
+    this.cpuProfiler.clearTab(tab.id);
+    this.heapProfiler.clearTab(tab.id);
+    this.requestDedup.clearTab(tab.id);
+    this.wsSseMux.clearTab(tab.id);
+    this.activeTracesByTab.delete(tab.id);
+    this.clearTabMirrorMiss(tab.id);
+    this.mirrorRelay.clearTab(tab.id);
+    this.telemetry.clearTabEntries(tab.id);
+    this.tabEventBus.clearTab(tab.id);
   }
 
   closeTab(tabId: string): ShellState {
@@ -2446,40 +2835,7 @@ export class TabManager implements MirrorViewportLookup {
     if (idx === -1) return this.getShellState();
     const [tab] = this.tabs.splice(idx, 1);
     if (tab) {
-      if (isPersistableHttpUrl(tab.url)) {
-        this.closedTabs.unshift({
-          url: tab.url,
-          title: truncatePersistedTitle(tab.title, formatHistorySubtitle(tab.url)),
-          mode: tab.mode,
-          mirror: tab.mirror,
-          dedup: tab.dedup,
-          session: tab.session,
-          sleeping: false,
-          portraitPresetId: tab.portraitPresetId,
-          landscapePresetId: tab.landscapePresetId,
-          devtoolsTarget: tab.devtoolsTarget,
-          audioSource: tab.audioSource,
-        });
-        if (this.closedTabs.length > MAX_CLOSED_TABS) {
-          this.closedTabs.length = MAX_CLOSED_TABS;
-        }
-      }
-      this.clearInPageSyncTimer(tab.id);
-      this.clearTabReconcileCooldowns(tab.id);
-      this.destroyTabViews(tab);
-      if (tab.session === 'isolated') {
-        this.clearIsolatedPartition(tab.id);
-      }
-      this.slowDeviceEmulation.clearTab(tab.id);
-      this.cpuProfiler.clearTab(tab.id);
-      this.heapProfiler.clearTab(tab.id);
-      this.requestDedup.clearTab(tab.id);
-      this.wsSseMux.clearTab(tab.id);
-      this.activeTracesByTab.delete(tab.id);
-      this.clearTabMirrorMiss(tab.id);
-      this.mirrorRelay.clearTab(tab.id);
-      this.telemetry.clearTabEntries(tab.id);
-      this.tabEventBus.clearTab(tab.id);
+      this.teardownTab(tab);
     }
 
     if (this.tabs.length === 0) {
@@ -2498,6 +2854,61 @@ export class TabManager implements MirrorViewportLookup {
     this.syncVisibilityAndLayout();
     this.syncDevToolsAttachment();
     return this.emitState();
+  }
+
+  closeTabs(opts: { session?: SessionMode; all?: boolean } = {}): {
+    closedTabIds: string[];
+    state: ShellState;
+  } {
+    if (opts.session !== undefined && opts.all !== true) {
+      throw new Error('session filter requires all=true');
+    }
+    if (opts.all !== true) {
+      return { closedTabIds: [], state: this.getShellState() };
+    }
+
+    const prevActiveId = this.activeTabId;
+    const prevActiveIdx = prevActiveId
+      ? this.tabs.findIndex((t) => t.id === prevActiveId)
+      : -1;
+    const matched = this.tabs.filter((t) =>
+      opts.session !== undefined ? t.session === opts.session : true,
+    );
+    if (matched.length === 0) {
+      return { closedTabIds: [], state: this.getShellState() };
+    }
+
+    const closedTabIds = matched.map((t) => t.id);
+    const closedSet = new Set(closedTabIds);
+    for (let i = this.tabs.length - 1; i >= 0; i -= 1) {
+      if (closedSet.has(this.tabs[i]!.id)) {
+        this.tabs.splice(i, 1);
+      }
+    }
+    for (const tab of matched) {
+      this.teardownTab(tab);
+    }
+
+    if (this.tabs.length === 0) {
+      this.activeTabId = null;
+      const state = this.createTab({ mode: 'dual' });
+      return { closedTabIds, state };
+    }
+
+    if (prevActiveId !== null && closedSet.has(prevActiveId)) {
+      const fallbackIdx =
+        prevActiveIdx >= 0 ? Math.min(prevActiveIdx, this.tabs.length - 1) : 0;
+      const next = this.tabs[fallbackIdx]!;
+      this.activeTabId = next.id;
+      next.sleeping = false;
+      next.lastActiveAt = Date.now();
+      this.materializeTabViews(next);
+    }
+
+    this.syncVisibilityAndLayout();
+    this.syncDevToolsAttachment();
+    const state = this.emitState();
+    return { closedTabIds, state };
   }
 
   reopenClosedTab(): ShellState {
@@ -2570,6 +2981,9 @@ export class TabManager implements MirrorViewportLookup {
     const tab = tabId ? this.getTab(tabId) : this.getActiveTab();
     if (!tab) return this.getShellState();
     const url = normalizeUrl(rawUrl);
+    const hadLoadError = Boolean(tab.loadErrors.landscape || tab.loadErrors.portrait);
+    tab.loadErrors = {};
+    this.clearPendingErrorFinishForTab(tab);
     tab.skipNextRestoreHistoryCommit = false;
     tab.url = url;
     tab.titleUrl = '';
@@ -2604,6 +3018,9 @@ export class TabManager implements MirrorViewportLookup {
       this.syncVisibilityAndLayout();
       this.syncDevToolsAttachment();
     } else {
+      if (hadLoadError) {
+        this.applyLayout();
+      }
       let launchEpoch: number | undefined;
       if (tab.mode === 'dual' && tab.mirror && tab.session === 'shared' && isHttpTarget) {
         launchEpoch = this.nextLaunchConvergenceEpoch++;
@@ -2626,70 +3043,130 @@ export class TabManager implements MirrorViewportLookup {
     return this.emitState();
   }
 
-  goBack(): void {
-    const tab = this.getActiveTab();
-    if (!tab) return;
+  navigateHistory(
+    direction: 'back' | 'forward',
+    tabId?: string,
+  ): {
+    ok: boolean;
+    direction: 'back' | 'forward';
+    tabId: string;
+    url: string;
+    canGoBack: boolean;
+    canGoForward: boolean;
+    reason?: string;
+  } {
+    const tab = tabId ? this.getTab(tabId) : this.getActiveTab();
+    if (tabId && !tab) {
+      throw new Error(`tab '${tabId}' not found`);
+    }
+    if (!tab) {
+      throw new Error('no active tab');
+    }
+    if (tab.sleeping) {
+      throw new Error(`tab '${tab.id}' is sleeping`);
+    }
+
+    const lWc =
+      tab.landscapeView && !tab.landscapeView.webContents.isDestroyed()
+        ? tab.landscapeView.webContents
+        : null;
+    const pWc =
+      tab.mode === 'dual' &&
+      tab.mirror &&
+      tab.portraitView &&
+      !tab.portraitView.webContents.isDestroyed()
+        ? tab.portraitView.webContents
+        : null;
+
+    const canGoBack = lWc ? lWc.navigationHistory.canGoBack() : false;
+    const canGoForward = lWc ? lWc.navigationHistory.canGoForward() : false;
+    const curUrl = lWc ? lWc.getURL() : tab.url;
+
+    if ((direction === 'back' && !canGoBack) || (direction === 'forward' && !canGoForward)) {
+      return {
+        ok: false,
+        direction,
+        tabId: tab.id,
+        url: curUrl,
+        canGoBack,
+        canGoForward,
+        reason: `cannot navigate ${direction}`,
+      };
+    }
+
+    const hadLoadError = Boolean(tab.loadErrors.landscape || tab.loadErrors.portrait);
+    tab.loadErrors = {};
+    this.clearPendingErrorFinishForTab(tab);
     this.clearInPageSyncTimer(tab.id);
     this.clearTabReconcileCooldowns(tab.id);
     this.resetSpaSyncChain(tab);
     tab.skipNextRestoreHistoryCommit = false;
     tab.launchConvergence = null;
     tab.lastActiveAt = Date.now();
-    if (!tab.landscapeView || tab.landscapeView.webContents.isDestroyed()) return;
+    tab.titleUrl = '';
+    if (hadLoadError) {
+      this.applyLayout();
+      this.emitState(false);
+    }
+
     const now = Date.now();
-    if (tab.landscapeView.webContents.navigationHistory.canGoBack()) {
-      tab.titleUrl = '';
+    if (lWc) {
       tab.navSuppressUntil.landscape = now + NAV_MIRROR_SUPPRESS_MS;
       tab.navSuppressUrl.landscape = null;
-      tab.landscapeView.webContents.navigationHistory.goBack();
+      if (direction === 'back') {
+        lWc.navigationHistory.goBack();
+      } else {
+        lWc.navigationHistory.goForward();
+      }
     }
     if (
-      tab.mode === 'dual' &&
-      tab.mirror &&
-      tab.portraitView &&
-      !tab.portraitView.webContents.isDestroyed() &&
-      tab.portraitView.webContents.navigationHistory.canGoBack()
+      pWc &&
+      (direction === 'back'
+        ? pWc.navigationHistory.canGoBack()
+        : pWc.navigationHistory.canGoForward())
     ) {
       tab.navSuppressUntil.portrait = now + NAV_MIRROR_SUPPRESS_MS;
       tab.navSuppressUrl.portrait = null;
-      tab.portraitView.webContents.navigationHistory.goBack();
+      if (direction === 'back') {
+        pWc.navigationHistory.goBack();
+      } else {
+        pWc.navigationHistory.goForward();
+      }
     }
+
+    return {
+      ok: true,
+      direction,
+      tabId: tab.id,
+      url: lWc ? lWc.getURL() : tab.url,
+      canGoBack: lWc ? lWc.navigationHistory.canGoBack() : false,
+      canGoForward: lWc ? lWc.navigationHistory.canGoForward() : false,
+    };
+  }
+
+  goBack(): void {
+    const tab = this.getActiveTab();
+    if (!tab || tab.sleeping) return;
+    this.navigateHistory('back', tab.id);
   }
 
   goForward(): void {
     const tab = this.getActiveTab();
-    if (!tab) return;
-    this.clearInPageSyncTimer(tab.id);
-    this.clearTabReconcileCooldowns(tab.id);
-    this.resetSpaSyncChain(tab);
-    tab.skipNextRestoreHistoryCommit = false;
-    tab.launchConvergence = null;
-    tab.lastActiveAt = Date.now();
-    if (!tab.landscapeView || tab.landscapeView.webContents.isDestroyed()) return;
-    const now = Date.now();
-    if (tab.landscapeView.webContents.navigationHistory.canGoForward()) {
-      tab.titleUrl = '';
-      tab.navSuppressUntil.landscape = now + NAV_MIRROR_SUPPRESS_MS;
-      tab.navSuppressUrl.landscape = null;
-      tab.landscapeView.webContents.navigationHistory.goForward();
-    }
-    if (
-      tab.mode === 'dual' &&
-      tab.mirror &&
-      tab.portraitView &&
-      !tab.portraitView.webContents.isDestroyed() &&
-      tab.portraitView.webContents.navigationHistory.canGoForward()
-    ) {
-      tab.navSuppressUntil.portrait = now + NAV_MIRROR_SUPPRESS_MS;
-      tab.navSuppressUrl.portrait = null;
-      tab.portraitView.webContents.navigationHistory.goForward();
-    }
+    if (!tab || tab.sleeping) return;
+    this.navigateHistory('forward', tab.id);
   }
 
   async reload(): Promise<void> {
     if (this.disposed || this.win.isDestroyed()) return;
     const tab = this.getActiveTab();
     if (!tab) return;
+    const hadLoadError = Boolean(tab.loadErrors.landscape || tab.loadErrors.portrait);
+    tab.loadErrors = {};
+    this.clearPendingErrorFinishForTab(tab);
+    if (hadLoadError) {
+      this.applyLayout();
+      this.emitState(false);
+    }
     this.clearInPageSyncTimer(tab.id);
     this.clearTabReconcileCooldowns(tab.id);
     this.resetSpaSyncChain(tab);
@@ -2815,6 +3292,172 @@ export class TabManager implements MirrorViewportLookup {
       if (pWc && !pWc.isDestroyed() && pLoad && this.wcLoadStates.get(pWc.id)?.promise === pLoad) {
         if (pEntry) pEntry.armedForStop = true;
         pWc.reloadIgnoringCache();
+      }
+    })();
+
+    this.pendingReloads.set(tab.id, run);
+    try {
+      await run;
+    } finally {
+      if (this.pendingReloads.get(tab.id) === run) {
+        this.pendingReloads.delete(tab.id);
+      }
+    }
+  }
+
+  async reloadTab(opts?: { tabId?: string; ignoreCache?: boolean }): Promise<void> {
+    if (this.disposed || this.win.isDestroyed()) return;
+    const tab = opts?.tabId ? this.getTab(opts.tabId) : this.getActiveTab();
+    if (opts?.tabId && !tab) {
+      throw new Error(`tab '${opts.tabId}' not found`);
+    }
+    if (!tab) return;
+    const ignoreCache = opts?.ignoreCache !== false;
+    if (ignoreCache && tab === this.getActiveTab()) {
+      return this.reload();
+    }
+    const hadLoadError = Boolean(tab.loadErrors.landscape || tab.loadErrors.portrait);
+    tab.loadErrors = {};
+    this.clearPendingErrorFinishForTab(tab);
+    if (hadLoadError) {
+      this.applyLayout();
+      this.emitState(false);
+    }
+    this.clearInPageSyncTimer(tab.id);
+    this.clearTabReconcileCooldowns(tab.id);
+    this.resetSpaSyncChain(tab);
+
+    const run = (async () => {
+      const wasSleeping = tab.sleeping;
+      tab.lastActiveAt = Date.now();
+
+      for (const hook of this.beforeReloadHooks) {
+        try {
+          hook(tab.id);
+        } catch {
+          // Isolate reload hooks so cache clear and reload still run.
+        }
+      }
+
+      if (ignoreCache) {
+        const sessions = new Set<Session>();
+        try {
+          if (session.defaultSession) sessions.add(session.defaultSession);
+        } catch {
+          // Ignore defaultSession lookup errors in stubbed test VMs.
+        }
+        if (tab.landscapeView && !tab.landscapeView.webContents.isDestroyed()) {
+          if (tab.landscapeView.webContents.session) {
+            sessions.add(tab.landscapeView.webContents.session);
+          }
+        }
+        if (tab.portraitView && !tab.portraitView.webContents.isDestroyed()) {
+          if (tab.portraitView.webContents.session) {
+            sessions.add(tab.portraitView.webContents.session);
+          }
+        }
+        if (tab.session === 'isolated') {
+          try {
+            const pSess = session.fromPartition(`iron-iso-${tab.id}`);
+            if (pSess) sessions.add(pSess);
+            const lSess = session.fromPartition(`iron-iso-${tab.id}-landscape`);
+            if (lSess) sessions.add(lSess);
+          } catch {
+            // Ignore session lookup fallback failures.
+          }
+        }
+
+        await Promise.all(
+          Array.from(sessions).map((sess) => Promise.resolve(sess.clearCache()).catch(() => {})),
+        );
+      }
+
+      if (
+        this.disposed ||
+        this.win.isDestroyed() ||
+        !this.tabs.includes(tab) ||
+        (!wasSleeping && tab.sleeping)
+      ) {
+        return;
+      }
+
+      const now = Date.now();
+      this.clearInPageSyncTimer(tab.id);
+      tab.launchConvergence = null;
+      tab.navSuppressUntil.landscape = now + NAV_MIRROR_SUPPRESS_MS;
+      tab.navSuppressUntil.portrait = now + NAV_MIRROR_SUPPRESS_MS;
+      tab.navSuppressUrl.landscape = null;
+      tab.navSuppressUrl.portrait = null;
+
+      if (!tab.landscapeView || tab.landscapeView.webContents.isDestroyed()) {
+        tab.sleeping = false;
+        this.clearTabMirrorMiss(tab.id);
+        this.materializeTabViews(tab);
+        this.syncVisibilityAndLayout();
+        this.syncDevToolsAttachment();
+        this.emitState();
+        return;
+      }
+
+      this.clearTabMirrorMiss(tab.id);
+      const lWc = tab.landscapeView.webContents;
+      const pWc =
+        tab.mode === 'dual' && tab.portraitView && !tab.portraitView.webContents.isDestroyed()
+          ? tab.portraitView.webContents
+          : null;
+
+      this.wsSseMux.handleViewportTeardown(lWc.id, 'reload');
+      const lLoad = this.beginViewportLoad(lWc);
+      const lEntry = this.wcLoadStates.get(lWc.id);
+
+      let pLoad: Promise<boolean> | null = null;
+      let pEntry: ReturnType<typeof this.wcLoadStates.get> | undefined;
+      if (pWc) {
+        this.wsSseMux.handleViewportTeardown(pWc.id, 'reload');
+        pLoad = this.beginViewportLoad(pWc);
+        pEntry = this.wcLoadStates.get(pWc.id);
+      }
+
+      const active = this.isTabDedupActive(tab);
+      await Promise.all([
+        this.wsSseMux.syncViewport(lWc, active),
+        this.requestDedup.setViewportEnabled(lWc, active),
+        this.webGlInspector.syncViewport(lWc),
+        this.slowDeviceEmulation.syncViewport(tab.id, 'landscape', lWc),
+        ...(pWc
+          ? [
+              this.wsSseMux.syncViewport(pWc, active),
+              this.requestDedup.setViewportEnabled(pWc, active),
+              this.webGlInspector.syncViewport(pWc),
+              this.slowDeviceEmulation.syncViewport(tab.id, 'portrait', pWc),
+            ]
+          : []),
+      ]);
+
+      if (
+        this.disposed ||
+        this.win.isDestroyed() ||
+        !this.tabs.includes(tab) ||
+        (!wasSleeping && tab.sleeping)
+      ) {
+        return;
+      }
+
+      if (!lWc.isDestroyed() && this.wcLoadStates.get(lWc.id)?.promise === lLoad) {
+        if (lEntry) lEntry.armedForStop = true;
+        if (!ignoreCache && typeof lWc.reload === 'function') {
+          lWc.reload();
+        } else {
+          lWc.reloadIgnoringCache();
+        }
+      }
+      if (pWc && !pWc.isDestroyed() && pLoad && this.wcLoadStates.get(pWc.id)?.promise === pLoad) {
+        if (pEntry) pEntry.armedForStop = true;
+        if (!ignoreCache && typeof pWc.reload === 'function') {
+          pWc.reload();
+        } else {
+          pWc.reloadIgnoringCache();
+        }
       }
     })();
 
@@ -3119,6 +3762,9 @@ export class TabManager implements MirrorViewportLookup {
     const mode: ViewMode = active?.mode ?? 'single';
 
     const agentState = this.agentDock?.getState();
+    const activeErrorBannerOpen = Boolean(
+      active && (active.loadErrors.landscape || active.loadErrors.portrait),
+    );
     const layout = computeLayout({
       windowWidth,
       windowHeight,
@@ -3127,6 +3773,8 @@ export class TabManager implements MirrorViewportLookup {
       dockOpen: this.dockOpen,
       dockHeight: this.dockHeight,
       splitRatio: this.splitRatio,
+      findBarOpen: this.findOpen,
+      errorBannerOpen: activeErrorBannerOpen,
       agentDockMode: agentState?.mode,
       agentDockWidth: agentState?.width,
       agentFloatBounds: agentState?.floatBounds,
@@ -3166,12 +3814,15 @@ export class TabManager implements MirrorViewportLookup {
         dockOpen: this.dockOpen,
         dockHeight: this.dockHeight,
         splitRatio: this.splitRatio,
+        findBarOpen: this.findOpen,
+        errorBannerOpen: Boolean(tab.loadErrors.landscape || tab.loadErrors.portrait),
         agentDockMode: agentState?.mode,
         agentDockWidth: agentState?.width,
         agentFloatBounds: agentState?.floatBounds,
       });
       if (tab.landscapeView && !tab.landscapeView.webContents.isDestroyed()) {
         tab.landscapeView.setBounds(tabLayout.landscapeView);
+        void this.applyViewportEmulation(tab, 'landscape');
       }
       if (
         tab.mode === 'dual' &&
@@ -3180,6 +3831,7 @@ export class TabManager implements MirrorViewportLookup {
         tabLayout.portraitView
       ) {
         tab.portraitView.setBounds(tabLayout.portraitView);
+        void this.applyViewportEmulation(tab, 'portrait');
       }
     }
 
@@ -3690,12 +4342,14 @@ export class TabManager implements MirrorViewportLookup {
                 }
               : undefined;
 
-            const tryCapturePageOnce = async (): Promise<{
+            const tryCapturePageOnce = async (
+              timeoutCapMs = 2500,
+            ): Promise<{
               png: Buffer | null;
               failureMsg: string | null;
             }> => {
               let capTimer: ReturnType<typeof setTimeout> | null = null;
-              const capTimeoutMs = remMs(2500);
+              const capTimeoutMs = remMs(timeoutCapMs);
               try {
                 const capRes = await Promise.race([
                   (rectArg ? wc.capturePage(rectArg) : wc.capturePage()).then((image) => ({
@@ -3730,7 +4384,10 @@ export class TabManager implements MirrorViewportLookup {
               }
             };
 
-            const firstTry = await tryCapturePageOnce();
+            const cdpFailedThisPane = errors.some(
+              (e) => e.stage === 'cdp_capture' && e.viewport === role,
+            );
+            const firstTry = await tryCapturePageOnce(cdpFailedThisPane ? 900 : 2500);
             let capturePageFailureMsg = firstTry.failureMsg;
             if (firstTry.png) {
               pngBuf = firstTry.png;
@@ -3856,6 +4513,7 @@ export class TabManager implements MirrorViewportLookup {
           });
           viewportReport[role] = sizingReport;
 
+          this.primedWcIds.add(wc.id);
           captures[role] = {
             mimeType: 'image/png',
             width,
@@ -5209,6 +5867,478 @@ export class TabManager implements MirrorViewportLookup {
     };
   }
 
+  setFindOpen(open: boolean): void {
+    this.findOpen = open;
+    this.applyLayout();
+  }
+
+  isFindOpen(): boolean {
+    return this.findOpen;
+  }
+
+  closeFindBar(): void {
+    this.findOpen = false;
+    this.stopFindInPage('clearSelection');
+    this.applyLayout();
+    if (!this.disposed && !this.win.isDestroyed()) {
+      this.win.webContents.send('shell:close-find');
+    }
+  }
+
+  findInPage(
+    text: string,
+    opts?: {
+      forward?: boolean;
+      findNext?: boolean;
+      matchCase?: boolean;
+      viewport?: ViewportRole;
+    },
+  ): void {
+    const tab = this.getActiveTab();
+    if (!tab || tab.sleeping) return;
+    if (!text) {
+      this.stopFindInPage('clearSelection');
+      if (!this.disposed && !this.win.isDestroyed()) {
+        this.win.webContents.send('shell:find-result', {
+          activeMatchOrdinal: 0,
+          matches: 0,
+          finalUpdate: true,
+          viewport: 'landscape',
+        });
+      }
+      return;
+    }
+
+    const targetRole: ViewportRole =
+      tab.mode === 'single'
+        ? 'landscape'
+        : (opts?.viewport ?? tab.lastFocusedViewport ?? 'landscape');
+    const primaryView = targetRole === 'portrait' ? tab.portraitView : tab.landscapeView;
+    const wc =
+      primaryView && !primaryView.webContents.isDestroyed()
+        ? primaryView.webContents
+        : tab.landscapeView && !tab.landscapeView.webContents.isDestroyed()
+          ? tab.landscapeView.webContents
+          : null;
+    if (!wc || typeof wc.findInPage !== 'function') return;
+
+    // Electron FindInPageOptions.findNext: true for initial/new search, false for Next/Prev follow-ups.
+    this.lastFindReqId = wc.findInPage(text, {
+      forward: opts?.forward ?? true,
+      findNext: opts?.findNext ?? true,
+      matchCase: opts?.matchCase ?? false,
+    });
+  }
+
+  stopFindInPage(
+    action: 'clearSelection' | 'keepSelection' | 'activateSelection' = 'clearSelection',
+  ): void {
+    const tab = this.getActiveTab();
+    if (!tab) return;
+    for (const view of [tab.landscapeView, tab.portraitView]) {
+      const wc = view?.webContents;
+      if (wc && !wc.isDestroyed() && typeof wc.stopFindInPage === 'function') {
+        wc.stopFindInPage(action);
+      }
+    }
+  }
+
+  private applyTabZoom(tab: ManagedTab): void {
+    for (const view of [tab.landscapeView, tab.portraitView]) {
+      const wc = view?.webContents;
+      if (wc && !wc.isDestroyed() && typeof wc.setZoomFactor === 'function') {
+        wc.setZoomFactor(tab.zoomFactor);
+      }
+    }
+  }
+
+  zoomIn(tabId?: string): ShellState {
+    const tab = tabId ? this.getTab(tabId) : this.getActiveTab();
+    if (!tab) return this.getShellState();
+    const next =
+      ZOOM_STEPS.find((s) => s > tab.zoomFactor + 0.001) ??
+      ZOOM_STEPS[ZOOM_STEPS.length - 1] ??
+      5.0;
+    tab.zoomFactor = next;
+    this.applyTabZoom(tab);
+    return this.emitState(false);
+  }
+
+  zoomOut(tabId?: string): ShellState {
+    const tab = tabId ? this.getTab(tabId) : this.getActiveTab();
+    if (!tab) return this.getShellState();
+    let prev: number = ZOOM_STEPS[0];
+    for (let i = ZOOM_STEPS.length - 1; i >= 0; i -= 1) {
+      if (ZOOM_STEPS[i]! < tab.zoomFactor - 0.001) {
+        prev = ZOOM_STEPS[i]!;
+        break;
+      }
+    }
+    tab.zoomFactor = prev;
+    this.applyTabZoom(tab);
+    return this.emitState(false);
+  }
+
+  zoomReset(tabId?: string): ShellState {
+    const tab = tabId ? this.getTab(tabId) : this.getActiveTab();
+    if (!tab) return this.getShellState();
+    tab.zoomFactor = 1.0;
+    this.applyTabZoom(tab);
+    return this.emitState(false);
+  }
+
+  retryLoad(tabId?: string): ShellState {
+    const tab = tabId ? this.getTab(tabId) : this.getActiveTab();
+    if (!tab) return this.getShellState();
+    const retryUrl = tab.loadErrors.landscape?.url ?? tab.loadErrors.portrait?.url ?? tab.url;
+    tab.loadErrors = {};
+    this.clearPendingErrorFinishForTab(tab);
+    this.applyLayout();
+    return this.navigate(retryUrl, tab.id);
+  }
+
+  dismissLoadError(tabId?: string): ShellState {
+    const tab = tabId ? this.getTab(tabId) : this.getActiveTab();
+    if (!tab) return this.getShellState();
+    if (tab.loadErrors.landscape || tab.loadErrors.portrait) {
+      tab.loadErrors = {};
+      this.clearPendingErrorFinishForTab(tab);
+      this.applyLayout();
+      return this.emitState(false);
+    }
+    return this.getShellState();
+  }
+
+  async waitFor(params: {
+    tabId?: string;
+    viewport?: ViewportRole;
+    selector?: string;
+    text?: string;
+    urlIncludes?: string;
+    networkIdleMs?: number;
+    timeoutMs?: number;
+  }): Promise<{
+    ok: boolean;
+    tabId: string;
+    viewport: ViewportRole;
+    matched: boolean;
+    elapsedMs: number;
+    text?: string;
+  }> {
+    const hasSelector = typeof params.selector === 'string' && params.selector.length > 0;
+    const hasText = typeof params.text === 'string' && params.text.length > 0;
+    const hasUrlIncludes = typeof params.urlIncludes === 'string' && params.urlIncludes.length > 0;
+    const hasNetworkIdle =
+      typeof params.networkIdleMs === 'number' && Number.isFinite(params.networkIdleMs);
+    if (!hasSelector && !hasText && !hasUrlIncludes && !hasNetworkIdle) {
+      throw new Error(
+        'browser_wait_for requires at least one of selector, text, url_includes, or network_idle_ms',
+      );
+    }
+
+    const tab = params.tabId ? this.getTab(params.tabId) : this.getActiveTab();
+    if (params.tabId && !tab) throw new Error(`tab '${params.tabId}' not found`);
+    if (!tab) throw new Error('no active tab');
+    if (tab.sleeping) throw new Error(`tab '${tab.id}' is sleeping`);
+
+    const role: ViewportRole =
+      params.viewport ?? (tab.mode === 'dual' ? 'portrait' : 'landscape');
+    if (tab.mode === 'single' && role === 'portrait') {
+      throw new Error(`viewport 'portrait' is not active in single mode for tab '${tab.id}'`);
+    }
+
+    const needsLandscape = !tab.landscapeView || tab.landscapeView.webContents.isDestroyed();
+    const needsPortrait =
+      tab.mode === 'dual' && (!tab.portraitView || tab.portraitView.webContents.isDestroyed());
+    if (needsLandscape || needsPortrait) {
+      this.materializeTabViews(tab);
+      this.syncVisibilityAndLayout();
+    }
+
+    const timeoutMs = Math.min(Math.max(Math.round(params.timeoutMs ?? 10_000), 50), 30_000);
+    const startedAt = Date.now();
+    const deadline = startedAt + timeoutMs;
+
+    while (true) {
+      if (this.disposed || this.win.isDestroyed() || !this.tabs.includes(tab) || tab.sleeping) {
+        throw new Error(`tab '${tab.id}' is no longer available`);
+      }
+      const view = role === 'portrait' ? tab.portraitView : tab.landscapeView;
+      const wc = view?.webContents;
+      if (!wc || wc.isDestroyed()) {
+        throw new Error(`viewport '${role}' is not active in tab '${tab.id}'`);
+      }
+
+      let allPassed = true;
+      if (hasUrlIncludes && !wc.getURL().includes(params.urlIncludes!)) {
+        allPassed = false;
+      }
+
+      if (allPassed && hasNetworkIdle) {
+        const idle = this.telemetry.getNetworkIdleState(wc.id);
+        if (
+          wc.isLoading() ||
+          this.wcLoadStates.has(wc.id) ||
+          idle.inFlightCount > 0 ||
+          idle.idleForMs < Math.max(0, params.networkIdleMs!)
+        ) {
+          allPassed = false;
+        }
+      }
+
+      if (allPassed && (hasSelector || hasText)) {
+        const remainingForJs = Math.max(50, deadline - Date.now());
+        const script = `(() => {
+          const sel = ${JSON.stringify(hasSelector ? params.selector : null)};
+          const txt = ${JSON.stringify(hasText ? params.text : null)};
+          if (sel && !document.querySelector(sel)) return false;
+          if (txt) {
+            const bodyText = document.body
+              ? (document.body.innerText || document.body.textContent || '')
+              : (document.documentElement?.textContent || '');
+            if (!bodyText.includes(txt)) return false;
+          }
+          return true;
+        })()`;
+        let jsTimer: ReturnType<typeof setTimeout> | null = null;
+        try {
+          const matched = await Promise.race([
+            wc.executeJavaScript(script, true),
+            new Promise<boolean>((resolve) => {
+              jsTimer = setTimeout(() => resolve(false), remainingForJs);
+            }),
+          ]);
+          if (matched !== true) {
+            allPassed = false;
+          }
+        } catch {
+          allPassed = false;
+        } finally {
+          if (jsTimer) clearTimeout(jsTimer);
+        }
+      }
+
+      if (allPassed) {
+        return {
+          ok: true,
+          tabId: tab.id,
+          viewport: role,
+          matched: true,
+          elapsedMs: Date.now() - startedAt,
+          ...(hasText ? { text: params.text } : {}),
+        };
+      }
+
+      const remaining = deadline - Date.now();
+      if (remaining <= 0) {
+        break;
+      }
+      await new Promise<void>((resolve) => setTimeout(resolve, Math.min(50, remaining)));
+    }
+
+    const targets: string[] = [];
+    if (hasSelector) targets.push(`selector=${params.selector}`);
+    if (hasText) targets.push(`text=${params.text}`);
+    if (hasUrlIncludes) targets.push(`url_includes=${params.urlIncludes}`);
+    if (hasNetworkIdle) targets.push(`network_idle_ms=${params.networkIdleMs}`);
+    throw new Error(`Timed out after ${timeoutMs}ms waiting for ${targets.join(', ')}`);
+  }
+
+  async manageStorage(params: {
+    action: 'get' | 'set' | 'remove' | 'clear';
+    scope?: 'cookies' | 'localStorage' | 'sessionStorage' | 'all';
+    tabId?: string;
+    viewport?: ViewportRole;
+    key?: string;
+    name?: string;
+    value?: string;
+    url?: string;
+  }): Promise<Record<string, unknown>> {
+    const action = params.action;
+    if (action !== 'get' && action !== 'set' && action !== 'remove' && action !== 'clear') {
+      throw new Error("browser_storage action must be 'get', 'set', 'remove', or 'clear'");
+    }
+    const scope = params.scope ?? 'all';
+    if (
+      scope !== 'cookies' &&
+      scope !== 'localStorage' &&
+      scope !== 'sessionStorage' &&
+      scope !== 'all'
+    ) {
+      throw new Error(
+        "browser_storage scope must be 'cookies', 'localStorage', 'sessionStorage', or 'all'",
+      );
+    }
+    if ((action === 'set' || action === 'remove') && scope === 'all') {
+      throw new Error(
+        `browser_storage scope must be 'cookies', 'localStorage', or 'sessionStorage' for '${action}'`,
+      );
+    }
+
+    const tab = params.tabId ? this.getTab(params.tabId) : this.getActiveTab();
+    if (params.tabId && !tab) throw new Error(`tab '${params.tabId}' not found`);
+    if (!tab) throw new Error('no active tab');
+    if (tab.sleeping) throw new Error(`tab '${tab.id}' is sleeping`);
+
+    await this.ensureTabMaterializedAndLoaded(tab, 5000);
+    if (this.disposed || this.win.isDestroyed() || !this.tabs.includes(tab) || tab.sleeping) {
+      throw new Error(`tab '${tab.id}' is no longer available`);
+    }
+
+    const role: ViewportRole =
+      params.viewport ?? (tab.mode === 'dual' ? 'portrait' : 'landscape');
+    if (tab.mode === 'single' && role === 'portrait') {
+      throw new Error(`viewport 'portrait' is not active in single mode for tab '${tab.id}'`);
+    }
+    const wc = role === 'portrait' ? tab.portraitView?.webContents : tab.landscapeView?.webContents;
+    if (!wc || wc.isDestroyed()) {
+      throw new Error(`viewport '${role}' is not active in tab '${tab.id}'`);
+    }
+
+    const out: Record<string, unknown> = {
+      ok: true,
+      tabId: tab.id,
+      viewport: role,
+      scope,
+      action,
+    };
+
+    const rawUrl = wc.getURL();
+    const httpCurrentUrl =
+      rawUrl.startsWith('http://') || rawUrl.startsWith('https://') ? rawUrl : '';
+    const cookieUrl = params.url?.trim() || httpCurrentUrl;
+    const itemName = (params.name ?? params.key)?.trim();
+
+    if (scope === 'cookies' || scope === 'all') {
+      const cookiesApi = wc.session?.cookies;
+      if (!cookiesApi) {
+        if (scope === 'cookies') {
+          throw new Error('session cookies API is unavailable');
+        }
+        out.cookies = [];
+      } else if (action === 'get') {
+        const filter: Electron.CookiesGetFilter = {};
+        if (cookieUrl) filter.url = cookieUrl;
+        if (itemName) filter.name = itemName;
+        const cookies = await cookiesApi.get(filter);
+        out.cookies = cookies;
+        if (scope === 'cookies' && itemName) {
+          out.value = cookies[0]?.value ?? null;
+        }
+      } else if (action === 'set') {
+        if (!itemName) throw new Error('name or key is required for setting a cookie');
+        if (!cookieUrl || (!cookieUrl.startsWith('http://') && !cookieUrl.startsWith('https://'))) {
+          throw new Error('an http/https url is required for setting a cookie');
+        }
+        await cookiesApi.set({
+          url: cookieUrl,
+          name: itemName,
+          value: params.value ?? '',
+        });
+        out.value = params.value ?? '';
+      } else if (action === 'remove') {
+        if (!itemName) throw new Error('name or key is required for removing a cookie');
+        if (!cookieUrl || (!cookieUrl.startsWith('http://') && !cookieUrl.startsWith('https://'))) {
+          throw new Error('an http/https url is required for removing a cookie');
+        }
+        await cookiesApi.remove(cookieUrl, itemName);
+      } else if (action === 'clear') {
+        if (cookieUrl && (cookieUrl.startsWith('http://') || cookieUrl.startsWith('https://'))) {
+          const existing = await cookiesApi.get({ url: cookieUrl });
+          for (const c of existing) {
+            await cookiesApi.remove(cookieUrl, c.name);
+          }
+        } else if (typeof wc.session?.clearStorageData === 'function') {
+          await wc.session.clearStorageData({ storages: ['cookies'] });
+        }
+      }
+    }
+
+    const runWebStorage = async (
+      kind: 'localStorage' | 'sessionStorage',
+    ): Promise<{ data: Record<string, string>; value?: string | null; opaque?: boolean }> => {
+      const keyArg = params.key ?? params.name ?? null;
+      if ((action === 'set' || action === 'remove') && !keyArg) {
+        throw new Error(`key is required for ${action} on ${kind}`);
+      }
+      const script = `(() => {
+        try {
+          if (window.location.origin === 'null') {
+            return { opaque: true, data: {} };
+          }
+          const store = window[${JSON.stringify(kind)}];
+          const act = ${JSON.stringify(action)};
+          const key = ${JSON.stringify(keyArg)};
+          const val = ${JSON.stringify(params.value ?? '')};
+          if (act === 'get') {
+            if (key !== null) {
+              const v = store.getItem(key);
+              return { data: v !== null ? { [key]: v } : {}, value: v };
+            }
+            const data = {};
+            for (let i = 0; i < store.length; i += 1) {
+              const k = store.key(i);
+              if (k !== null) data[k] = store.getItem(k) ?? '';
+            }
+            return { data };
+          }
+          if (act === 'set') {
+            store.setItem(key, val);
+            return { data: { [key]: val }, value: val };
+          }
+          if (act === 'remove') {
+            store.removeItem(key);
+            return { data: {} };
+          }
+          if (act === 'clear') {
+            store.clear();
+            return { data: {} };
+          }
+          return { data: {} };
+        } catch (err) {
+          return { error: err && err.message ? String(err.message) : String(err) };
+        }
+      })()`;
+      const res = (await wc.executeJavaScript(script, true)) as {
+        data?: Record<string, string>;
+        value?: string | null;
+        opaque?: boolean;
+        error?: string;
+      };
+      if (res?.opaque) {
+        if (action === 'set' || action === 'remove') {
+          throw new Error(`Cannot ${action} ${kind} on opaque origin (${rawUrl || 'about:blank'})`);
+        }
+        return { data: {}, opaque: true };
+      }
+      if (res?.error) {
+        if (scope === 'all' && (action === 'get' || action === 'clear')) {
+          return { data: {} };
+        }
+        throw new Error(res.error);
+      }
+      return { data: res?.data ?? {}, value: res?.value };
+    };
+
+    if (scope === 'localStorage' || scope === 'all') {
+      const localRes = await runWebStorage('localStorage');
+      out.localStorage = localRes.data;
+      if (scope === 'localStorage' && (params.key ?? params.name)) {
+        out.value = localRes.value ?? null;
+      }
+    }
+
+    if (scope === 'sessionStorage' || scope === 'all') {
+      const sessRes = await runWebStorage('sessionStorage');
+      out.sessionStorage = sessRes.data;
+      if (scope === 'sessionStorage' && (params.key ?? params.name)) {
+        out.value = sessRes.value ?? null;
+      }
+    }
+
+    return out;
+  }
+
   getShellState(): ShellState {
     const tabs: TabSnapshot[] = this.tabs.map((tab) => {
       const landscapeWc =
@@ -5241,6 +6371,8 @@ export class TabManager implements MirrorViewportLookup {
         devtoolsTarget: tab.devtoolsTarget,
         audioSource: tab.audioSource,
         dedupCount: tab.dedupCount,
+        zoomFactor: tab.zoomFactor,
+        loadError: tab.loadErrors.landscape ?? tab.loadErrors.portrait ?? null,
         viewportReport: this.buildTabViewportReport(tab),
         emulation: this.slowDeviceEmulation.getTabSummary(tab.id),
       };
@@ -5384,6 +6516,47 @@ export class TabManager implements MirrorViewportLookup {
     return state;
   }
 
+  async sampleTabMetrics(tabId?: string): Promise<TelemetrySnapshot & { tabId?: string }> {
+    if (tabId === undefined) {
+      return await this.telemetry.sampleOnce();
+    }
+    const tab = this.getTab(tabId);
+    if (!tab) {
+      throw new Error(`tab '${tabId}' not found`);
+    }
+    if (tab.sleeping) {
+      throw new Error(`tab '${tab.id}' is sleeping`);
+    }
+    const active = this.getActiveTab();
+    if (active && tab.id === active.id) {
+      const snap = await this.telemetry.sampleOnce();
+      return { ...snap, tabId: tab.id };
+    }
+    const portraitWc =
+      tab.mode === 'dual' &&
+      tab.portraitView &&
+      !tab.portraitView.webContents.isDestroyed()
+        ? tab.portraitView.webContents
+        : null;
+    const landscapeWc =
+      tab.landscapeView && !tab.landscapeView.webContents.isDestroyed()
+        ? tab.landscapeView.webContents
+        : null;
+    await Promise.all([
+      portraitWc ? this.debuggerCoordinator.ensureAttached(portraitWc).catch(() => false) : Promise.resolve(false),
+      landscapeWc ? this.debuggerCoordinator.ensureAttached(landscapeWc).catch(() => false) : Promise.resolve(false),
+    ]);
+    const snapshot = await this.telemetry.sampleTargetOnce({
+      tabId: tab.id,
+      portraitWc,
+      landscapeWc,
+      emulation: this.slowDeviceEmulation.getTabSummary(tab.id),
+    });
+    snapshot.mirrorMiss = this.mirrorMissByTab.get(tab.id) ?? null;
+    snapshot.emulation = this.slowDeviceEmulation.getTabSummary(tab.id);
+    return { ...snapshot, tabId: tab.id };
+  }
+
   getLastLayout(): LayoutResult | null {
     return this.lastLayout;
   }
@@ -5403,6 +6576,9 @@ export class TabManager implements MirrorViewportLookup {
       entry.settle(false);
     }
     this.wcLoadStates.clear();
+    this.primedWcIds.clear();
+    this.primedBlankHistoryWcIds.clear();
+    this.pendingErrorFinishWcIds.clear();
     this.pendingReloads.clear();
     for (const t of this.pendingInPageSyncTimers.values()) {
       clearTimeout(t);

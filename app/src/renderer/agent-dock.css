@@ -738,6 +738,26 @@ html, body, .dock-root {
   color: var(--danger);
 }
 
+.composer-status {
+  padding: 4px 8px;
+  font-size: 11px;
+  line-height: 1.3;
+  color: var(--muted);
+  background: #0a1220;
+  border-top: 1px solid var(--border);
+  flex-shrink: 0;
+}
+
+.composer-status.error {
+  color: var(--danger);
+  background: rgba(248, 113, 113, 0.08);
+  border-top-color: rgba(248, 113, 113, 0.35);
+}
+
+.composer-status.hidden {
+  display: none;
+}
+
 .chat-composer {
   display: flex;
   gap: 6px;
@@ -774,4 +794,52 @@ html, body, .dock-root {
   color: var(--muted);
   font-size: 11px;
   padding: 4px 2px;
+}
+
+.transcript-toolbar {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 6px;
+  padding: 4px 8px;
+  background: #0a1220;
+  border-bottom: 1px solid var(--border);
+  flex-shrink: 0;
+}
+
+.transcript-label {
+  font: 600 10.5px/1 "JetBrains Mono", ui-monospace, monospace;
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+  color: var(--muted);
+}
+
+.transcript-actions {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+}
+
+.transcript-btn {
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  background: var(--raised);
+  color: var(--text);
+  font: 600 10.5px/1 "JetBrains Mono", ui-monospace, monospace;
+  padding: 3px 7px;
+  cursor: pointer;
+}
+
+.transcript-btn:hover {
+  border-color: var(--teal);
+  color: #fff;
+}
+
+.transcript-btn.danger {
+  border-color: rgba(248, 113, 113, 0.45);
+  color: var(--danger);
+}
+
+.transcript-btn.danger:hover {
+  border-color: var(--danger);
 }

@@ -1,5 +1,6 @@
 import { contextBridge, ipcRenderer } from 'electron';
 import type {
+  AgentCliOption,
   AgentCliPreset,
   AgentDockMode,
   AgentDockState,
@@ -14,7 +15,9 @@ export interface IronAgentDockApi {
     instances: RunningAgentInstance[];
     defaultCwd: string;
     contextSnippet: string;
+    availableClis?: AgentCliOption[];
   }>;
+  listClis?: () => Promise<AgentCliOption[]>;
   listInstances(): Promise<RunningAgentInstance[]>;
   startCli(opts: {
     preset: AgentCliPreset;
@@ -31,6 +34,14 @@ export interface IronAgentDockApi {
   setMode(mode: AgentDockMode): Promise<AgentDockState>;
   setFloatBounds(bounds: Partial<Rect>): Promise<AgentDockState>;
   getContext(): Promise<string>;
+  clearTranscript?(): Promise<boolean>;
+  copyTranscript?(): Promise<boolean>;
+  exportTranscript?(): Promise<{
+    ok: boolean;
+    path?: string;
+    canceled?: boolean;
+    error?: string;
+  }>;
   onState(cb: (state: AgentDockState) => void): () => void;
   onOutput(cb: (payload: { chunk: string; replace: boolean }) => void): () => void;
   onInjectContext(cb: (snippet: string) => void): () => void;
@@ -38,6 +49,7 @@ export interface IronAgentDockApi {
 
 const api: IronAgentDockApi = {
   getInitial: () => ipcRenderer.invoke('agent:get-initial'),
+  listClis: () => ipcRenderer.invoke('agent:list-clis'),
   listInstances: () => ipcRenderer.invoke('agent:list-instances'),
   startCli: (opts) => ipcRenderer.invoke('agent:start-cli', opts),
   attachInstance: (target) => ipcRenderer.invoke('agent:attach-instance', { target }),
@@ -48,6 +60,9 @@ const api: IronAgentDockApi = {
   setMode: (mode) => ipcRenderer.invoke('agent:set-mode', { mode }),
   setFloatBounds: (bounds) => ipcRenderer.invoke('agent:set-float-bounds', bounds),
   getContext: () => ipcRenderer.invoke('agent:get-context'),
+  clearTranscript: () => ipcRenderer.invoke('agent:clear-transcript'),
+  copyTranscript: () => ipcRenderer.invoke('agent:copy-transcript'),
+  exportTranscript: () => ipcRenderer.invoke('agent:export-transcript'),
   onState: (cb) => {
     const fn = (_ev: Electron.IpcRendererEvent, st: AgentDockState) => cb(st);
     ipcRenderer.on('agent:state', fn);

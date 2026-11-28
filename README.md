@@ -1,3 +1,7 @@
+> [!IMPORTANT]
+> **This repository has moved into [The Iron Stack monorepo](https://github.com/arielonoriaga/iron-stack) under [`packages/iron-browser`](https://github.com/arielonoriaga/iron-stack/tree/main/packages/iron-browser) with full git history preserved.**
+> Please open new issues, PRs, and install commands against [`https://github.com/arielonoriaga/iron-stack`](https://github.com/arielonoriaga/iron-stack) (or visit [iron.huggian.com](https://iron.huggian.com)). This repository is archived as a read-only historical mirror.
+
 <p align="center">
   <img src="assets/iron-browser-cover.png" alt="IronBrowser — Dual-viewport Chromium developer browser and 26-tool Rust MCP server for The Iron Stack" width="100%" />
 </p>
